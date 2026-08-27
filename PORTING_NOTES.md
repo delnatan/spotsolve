@@ -213,3 +213,53 @@ Three layers, all worth reproducing:
   the scaled condition number can be estimated far more cheaply from the
   Cholesky factor already computed.
 
+## 13. A geometric partition bounds double counting, not loss
+
+The box solver tiles the image into cores that partition it exactly, and each
+box commits only the emitters inside its own core. The docstring claimed this
+gives every emitter "exactly one owner". It does not. Ownership is tested on
+**each box's own fitted position**, and the two boxes sharing a seam estimate
+that position from different data (different window, different halo, different
+free neighbours). They routinely disagree by ~0.1 px. An emitter that close to
+a seam is placed on the far side of it by *both*, each concludes it belongs to
+the other, and both discard it:
+
+    core x [12.5, 19.5)   fitted the emitter at x = 19.53   -> discarded
+    core x [19.5, 25.5)   fitted the same one at x = 19.45  -> discarded
+
+The partition is a statement about points. The commit rule is applied to
+*estimates of a point*, and estimates from different fits are different points.
+The invariant that actually holds is **at most one owner** — no double
+counting, no guarantee against loss.
+
+It cost a bright bead on each of the two bead frames: a score-test peak of
+z = +70 on FOV1, which `refine` (fixed N) then smeared into four positive and
+one negative audit finding by dragging the surrounding emitters up to 5 px,
+one of them onto its patch bound. Closing the gap took FOV1 to a **clean**
+audit and left FOV2 with rim findings only.
+
+Two things worth carrying over:
+
+- **Widening the ownership test by an epsilon does not fix it.** Whatever
+  boundary the test uses, it is still compared against two different position
+  estimates, so the crack just moves to the new boundary.
+- The repair is a **reconciliation at the end of the pass**: collect every
+  discarded emitter, group the near-duplicates, and adopt a group only when
+  (a) no committed emitter is within `sigma` of it and (b) at least two
+  different boxes fitted it. Condition (b) is what keeps it from inventing
+  emitters — a box's pad ring is truncated and can hold spurious ones, and the
+  box that owns that ground had the untruncated view and is entitled to say
+  there is nothing there. Mutual agreement separates "each thought it was the
+  other's" from "one of them was wrong".
+
+**In Rust:** if the tiling is expressed as a type, make the type's contract say
+`at_most_one_owner`, and make the pass return `(committed, discarded)` rather
+than dropping the discards on the floor — the reconciliation needs them, and a
+`Vec` that is silently truncated is exactly where this bug lived.
+
+**How it was found, and why it appeared when it did:** the defect is as old as
+the box solver, but it was invisible while `lmga.fit` stalled every fit near
+its integer seed (§1). Seeds sit on pixel centres, which are never within
+0.1 px of a seam. Fixing the optimizer let positions actually move, and the
+first thing they did was straddle a seam. **Expect a class of latent bugs to
+surface the first time a solver in a pipeline starts genuinely converging.**

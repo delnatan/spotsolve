@@ -22,11 +22,18 @@ make each box's answer its own:
      will explain it with a spurious core emitter instead.
 
   2. A box COMMITS only the emitters in its core. Cores partition the image, so
-     every emitter has exactly one owner. An emitter the box puts in the pad
+     every emitter has AT MOST one owner. An emitter the box puts in the pad
      ring is truncated by an artificial boundary -- at the box edge it loses
      half its support -- so this box is not entitled to an opinion about it. It
      is discarded when the box finishes, and the box that owns that ring
      decides for itself with a truncation-free view.
+
+     "At most one" is the whole guarantee: the partition rules out double
+     counting, but NOT loss. Ownership is tested on each box's own fitted
+     position, and the two boxes sharing a seam estimate that position from
+     different data. An emitter within their disagreement of a seam is placed
+     just past it by both, and both discard it. `_adopt_orphans` closes that
+     gap at the end of each pass.
 
   3. The box's residual is built FROM SCRATCH: the committed emitters inside
      the fit region are re-fit as free parameters (initialized from their
@@ -176,7 +183,9 @@ def solve(
 
         prev_pos, prev_amp = positions, amplitudes
         n_commit = n_discard = 0
+        n_adopt = 0
         bg_hat = []
+        dropped = []
 
         for ib, b in enumerate(bxs):
             tracer.set_context(patch=ib, y0=b.y0, x0=b.x0, y1=b.y1, x1=b.x1,
@@ -228,6 +237,9 @@ def solve(
             keep = b.owns(gpos) if len(gpos) else np.zeros(0, bool)
             n_commit += int(keep.sum())
             n_discard += int((~keep).sum())
+            for q in np.nonzero(~keep)[0]:
+                dropped.append((gpos[q, 0], gpos[q, 1], res.amplitudes[q], ib,
+                                _view_margin(b, gpos[q])))
 
             stay = ~b.owns(positions) if len(positions) else np.zeros(0, bool)
             positions = (np.vstack([positions[stay], gpos[keep]])
@@ -241,6 +253,24 @@ def solve(
                             amplitudes=tracer.snap(amplitudes),
                             background=background, accepted=list(res.accepted))
 
+        # An emitter within the two boxes' disagreement of a shared core seam
+        # can be placed on the far side of it by BOTH and so discarded twice.
+        # Cores partitioning the image prevents double counting; it does not
+        # prevent loss. See `_adopt_orphans`.
+        positions, amplitudes, n_adopt = _adopt_orphans(
+            positions, amplitudes, dropped, sigma)
+        n_commit += n_adopt
+        n_discard -= n_adopt
+        if tracer.active() and n_adopt:
+            # Whole-frame context: this decision belongs to the pass, not to
+            # whichever box happened to run last.
+            tracer.set_context(patch=-1, y0=0, x0=0, y1=H, x1=W,
+                               cy0=0, cx0=0, cy1=H, cx1=W)
+            tracer.emit("adopt", positions=tracer.snap(positions),
+                        amplitudes=tracer.snap(amplitudes),
+                        adopted=tracer.snap(positions[-n_adopt:]),
+                        background=background)
+
         # Background from the pixels no emitter reaches, not from the median of
         # the boxes' free `b`: a box in a dense region has no such pixels, and
         # its `b` has absorbed whatever the model did not explain.
@@ -249,12 +279,14 @@ def solve(
         moved = _max_shift(prev_pos, positions)
         rec = dict(pass_=p, N=len(positions), committed=n_commit,
                    discarded=n_discard, background=background, max_shift=moved,
-                   dN=len(positions) - len(prev_pos), n_boxes=len(bxs))
+                   dN=len(positions) - len(prev_pos), n_boxes=len(bxs),
+                   adopted=n_adopt)
         history.append(rec)
         if verbose >= 1:
             shift_txt = "n/a (N changed)" if not np.isfinite(moved) else f"{moved:.3f} px"
+            adopt_txt = f" adopted={n_adopt}" if n_adopt else ""
             print(f"  [box pass {p}] N={len(positions):3d} (dN={rec['dN']:+d})  "
-                  f"committed={n_commit} discarded={n_discard}  "
+                  f"committed={n_commit} discarded={n_discard}{adopt_txt}  "
                   f"bg={background:.3f}  shift={shift_txt}")
         if tracer.active():
             tracer.emit("sweep_end", positions=tracer.snap(positions),
@@ -303,6 +335,96 @@ def solve(
                   f"trajectory {[h['N'] for h in history]}")
 
     return positions, amplitudes, background, history
+
+
+def _view_margin(b, gpos):
+    """How far inside `b`'s FIT region the point `gpos` (global) sits, in px.
+
+    Pixel i covers [i-0.5, i+0.5), so the fit region spans [y0-0.5, y1-0.5).
+    Larger is better: it is the amount of the emitter's support the box can
+    actually see, and it is what decides whose estimate to keep when two boxes
+    both fitted the same emitter (see `_adopt_orphans`).
+    """
+    return float(min(gpos[0] - (b.y0 - 0.5), (b.y1 - 0.5) - gpos[0],
+                     gpos[1] - (b.x0 - 0.5), (b.x1 - 0.5) - gpos[1]))
+
+
+def _adopt_orphans(positions, amplitudes, dropped, sigma, min_sep_factor=1.0):
+    """Recover emitters that fell through a core seam. Returns
+    (positions, amplitudes, n_adopted).
+
+    Cores partition the image, so an emitter has at most one owner -- that is
+    what makes double counting impossible. It does NOT make loss impossible,
+    because ownership is tested on each box's OWN fitted position and the two
+    boxes sharing a seam estimate that position from different data. They
+    routinely disagree by ~0.1 px. An emitter that close to a seam is therefore
+    placed just past it by BOTH boxes, each concludes it belongs to the other,
+    and both discard it:
+
+        box core x [12.5, 19.5)   fitted the emitter at x = 19.53  -> discarded
+        box core x [19.5, 25.5)   fitted the same one at x = 19.45  -> discarded
+
+    Nothing else in the pass can recover it. Traced on beads_60x_still.tif this
+    lost one bead of A = 987 at (34.1, 19.5), which is the whole of that frame's
+    remaining interior residual: a score-test peak of z = +70 before `refine`,
+    which `refine` then smears into four positive and one negative finding by
+    dragging the surrounding emitters at fixed N -- one of them 5 px, onto its
+    patch bound. FOV2 lost a bead of A = 1386 the same way. The defect was
+    masked until the optimizer was fixed (see lmga._to_interior): while every
+    fit stalled near its integer seed, positions never moved close enough to a
+    seam for the two boxes to straddle it.
+
+    A discarded emitter is adopted only when the discard was an ownership
+    artifact and not a judgement:
+
+      1. no committed emitter within `min_sep_factor * sigma` of it -- if the
+         owning box committed one there, nothing was lost;
+      2. at least two DIFFERENT boxes fitted it. A box's pad ring is truncated
+         and can hold spurious emitters, and the box that owns that ground had
+         a truncation-free view and is entitled to say there is nothing there.
+         Mutual agreement between the neighbours is what separates "both
+         thought it was the other's" from "one of them was wrong".
+
+    The estimate kept is the one from the box that saw the emitter with the
+    largest `_view_margin`, i.e. the least truncated view of it.
+    """
+    if not dropped:
+        return positions, amplitudes, 0
+    min_sep = min_sep_factor * sigma
+    d = np.asarray([(y, x) for y, x, _, _, _ in dropped], dtype=float)
+
+    # Greedy single-link grouping at min_sep; the groups are pairs or triples of
+    # near-identical estimates of one emitter, so nothing subtler is warranted.
+    order = np.argsort([-a for _, _, a, _, _ in dropped])
+    label = np.full(len(dropped), -1, dtype=int)
+    n_groups = 0
+    for i in order:
+        if label[i] >= 0:
+            continue
+        near = np.nonzero((np.linalg.norm(d - d[i], axis=1) <= min_sep)
+                          & (label < 0))[0]
+        label[near] = n_groups
+        n_groups += 1
+
+    add_pos, add_amp = [], []
+    committed = np.atleast_2d(np.asarray(positions, float))
+    for g in range(n_groups):
+        members = np.nonzero(label == g)[0]
+        if len({dropped[i][3] for i in members}) < 2:
+            continue                       # only one box ever saw it
+        c = d[members].mean(axis=0)
+        if len(committed) and np.min(np.linalg.norm(committed - c, axis=1)) <= min_sep:
+            continue                       # the owner committed one after all
+        best = max(members, key=lambda i: dropped[i][4])
+        add_pos.append([dropped[best][0], dropped[best][1]])
+        add_amp.append(dropped[best][2])
+
+    if not add_pos:
+        return positions, amplitudes, 0
+    positions = np.vstack([positions, np.asarray(add_pos, float)]) \
+        if len(positions) else np.asarray(add_pos, float)
+    amplitudes = np.concatenate([amplitudes, np.asarray(add_amp, float)])
+    return positions, amplitudes, len(add_pos)
 
 
 def _max_shift(a, b):

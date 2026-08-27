@@ -178,6 +178,18 @@ class Timeline:
                 ))
                 continue
 
+            if k == "adopt":
+                # Emitters recovered from a core seam after every box has run;
+                # see boxsolve._adopt_orphans.
+                pos, amp = e["positions"], e["amplitudes"]
+                base_pos, base_amp = pos, amp
+                self.frames.append(dict(
+                    kind="adopt", ev=e, d_e=d_e,
+                    model=calibrate.render_model(pos, amp, self.sigma, self.shape, bg),
+                    pos=pos, amp=amp, patches=patches, active=None, bg=bg,
+                ))
+                continue
+
             if k == "sweep_end":
                 pos, amp, bg = e["positions"], e["amplitudes"], e["background"]
                 base_pos, base_amp = pos, amp
@@ -608,6 +620,10 @@ def write_log(rec, path):
             out.append(f"{c}  patch {e.get('patch')} @({e['y0']},{e['x0']})  STOP "
                        f"best={e.get('chosen')} logBF={e.get('log_bf', float('nan')):+.2f}"
                        f"{tail}")
+        elif k == "adopt":
+            pts = ", ".join(f"({y:.2f},{x:.2f})" for y, x in e["adopted"])
+            out.append(f"{c}  ADOPT {len(e['adopted'])} from core seams: {pts}"
+                       f"   N -> {len(e['positions'])}")
         elif k == "sweep_end":
             out.append(f"{c}  SWEEP end    N={len(e['positions'])} "
                        f"changed={e['changed']} bg={e['background']:.3f}")
