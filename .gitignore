@@ -1,0 +1,39 @@
+# Regenerable trace output: movie frames, storyboards, pickled event lists.
+# ~125 MB. Rebuild with `python trace_run.py --crop ...`.
+trace_beads/
+trace_box/
+trace_probe/
+
+# Python / Jupyter scratch
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+.DS_Store
+
+# Third-party reference implementation, not this project's source
+aguet_matlab/
+
+# Papers and other binary reference material (the .md writeup IS tracked)
+*.pdf
+
+# Image data and run artifacts. The pipeline's inputs (beads_60x_still*.tif)
+# and outputs (box_fov*.png/.log) are deliberately untracked: this repo is the
+# source, not the dataset. Regenerate results with
+#     python run_box.py --image beads_60x_still.tif --gain 4.23
+*.tif
+*.tiff
+*.png
+*.log
+*.npz
+*.pkl
+*.mp4
+*.txt
+*.out
+*.bak
+
+# Superseded implementations kept on disk for reference only
+attic/
+backup_pre_msearch/
+
+# Notebooks: tracked source here is .py and .md only
+*.ipynb
