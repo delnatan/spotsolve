@@ -62,20 +62,6 @@ class FitResult:
 
 
 @dataclass
-class SearchResult:
-    """Outcome of a model search over emitter count for one patch."""
-
-    positions: np.ndarray      # (K,2) local (y,x), brightest first
-    amplitudes: np.ndarray     # (K,) total flux
-    background: float
-    theta: np.ndarray
-    I: float
-    F: np.ndarray
-    accepted: list = field(default_factory=list)   # move names, in order
-    rejected_best: float = -np.inf                 # best log BF that was refused
-
-
-@dataclass
 class DetectResult:
     """Outcome of a full detection run over one image."""
 
@@ -85,7 +71,7 @@ class DetectResult:
     lam: float                 # emitters per px^2 (empirical-Bayes)
     A_s: float                 # amplitude prior scale (empirical-Bayes)
     gain: float                # g_eff used, ADU per photoelectron
-    background: float          # photoelectrons per pixel
+    background: np.ndarray     # (H,W) background surface, photoelectrons/px
     n_outer_passes: int
     model_image: np.ndarray
     residual: np.ndarray

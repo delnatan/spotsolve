@@ -4,12 +4,12 @@ Implementation practices this Python learned the hard way, which should be
 designed in from the start rather than rediscovered. [`README.md`](README.md)
 describes *what the algorithm does*; this file is *how to build it*.
 
-**Port target is `gsolve`.** [`BOXSOLVE.md`](BOXSOLVE.md) documents the
-superseded box-sequential solver; nothing in it about box tiling, core seams,
-`_adopt_orphans` or the BIRTH/DEATH/SPLIT/MERGE move loop should be carried
-over. Where a note below was originally measured on `boxsolve`, it is because
-the affected layer (`psf`, `lmga`, `evidence`, `patches`) is shared and
-unchanged.
+**Port target is `gsolve`.** It replaced an earlier box-sequential solver,
+`boxsolve`, whose code was removed from this repository; nothing about box
+tiling, core seams, `_adopt_orphans` or the BIRTH/DEATH/SPLIT/MERGE move loop
+should be carried over. Where a note below was originally measured on
+`boxsolve`, it is because the affected layer (`psf`, `lmga`, `evidence`,
+`patches`) is shared and unchanged.
 
 Each item says what the lesson is, what it cost here, and what it looks like in
 Rust.
@@ -286,8 +286,8 @@ type level where it can be, and a workspace (§5) where it cannot.
 
 ## 14. Parallelism
 
-`gsolve` has no box lattice to colour, so the `boxsolve` colouring scheme does
-not apply. What it has instead:
+`gsolve` has no box lattice to colour, so the old `boxsolve` colouring scheme
+does not apply. What it has instead:
 
 - **The round loop is inherently sequential.** ADD is Gauss–Seidel by design —
   each acceptance writes back its window's refit, and the next candidate is
@@ -344,12 +344,12 @@ to nothing.
 | `01_psf` | model and Jacobian | relative 1e-13. **Not** bit-exact — every libm's `erf` differs, and that sets the floor for everything above |
 | `02_lmga` | the bounded optimizer | `I` to 1e-8 **absolute** (nats). Do not assert on `n_iter`: the gain-ratio accept/reject branch is sensitive to the last ulp |
 | `03_evidence` | Bayes factor and guards | 1e-10. `antisymmetry_residual` must be **exactly** 0.0 — if it is not, the add and remove paths have diverged |
-| `06_end_to_end` | whole pipeline, **built from `gsolve`** | deliberately **not** bit-exact; accept on `N` ±1, precision/recall ±0.03, RMSE ±0.02 px, audit counts ±1 |
+| `04_end_to_end` | whole pipeline, **built from `gsolve`** | deliberately **not** bit-exact; accept on `N` ±1, precision/recall ±0.03, RMSE ±0.02 px, audit counts ±1 |
 
-`04_score` and `05_boxes` cover `score.py` and the box tiling. **Neither is on
-the `gsolve` path** — `05_boxes` can be dropped outright, and `04_score` only
-matters if the projected score is revived for SPLIT ranking (README §7). If it
-is, the two traps it exists to catch still apply:
+Two earlier fixtures, `04_score` and `05_boxes`, covered the projected score and
+the box tiling. Neither was on the `gsolve` path and both were dropped with
+`boxsolve`. The score only matters again if it is revived for SPLIT ranking
+(README §7); if it is, the two traps it exists to catch still apply:
 
 - **The score denominator is marginal, not conditional.** `den = g'Wg - u'F^-1u`;
   dropping the `u'F^-1u` term leaves something that still looks like a score

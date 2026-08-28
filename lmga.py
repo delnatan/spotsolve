@@ -15,8 +15,9 @@ under 1e-13 on ordinary fits and by 0.007 on the hardest close-pair fits at
 0.5 sigma separation (below the identifiability limit anyway), while
 costing 133 model/Jacobian evaluations per fit instead of 18 -- 94 ms
 against 0.7 ms. The curvature term needs a nested jvp per inner lambda
-trial, which dominates everything else on 81-pixel patches. It is in
-backup_pre_msearch/lmga_geodesic.py.bak if a harder problem ever wants it.
+trial, which dominates everything else on 81-pixel patches. The
+implementation is not kept in this repository; the reference is Transtrum &
+Sethna if a harder problem ever wants it.
 
 Coleman-Li scaling keeps iterates strictly inside [lower, upper] without
 active-set logic: define v_i = (upper_i - theta_i) if grad_i < 0 else
@@ -118,7 +119,8 @@ def _to_interior(theta, lower, upper, frac=_INTERIOR_FRAC):
     floor, and 73.2% of all fits exhausted max_iter=100 with lambda at ~1e4 and
     max|grad| still ~13. Keeping the iterate interior instead: fits that reach
     a convergence test rise from 24% to 64%, the frame solves 2.5x faster, and
-    N stops depending on the lattice phase (see boxsolve.solve).
+    N stops depending on the lattice phase (measured on the superseded
+    box-sequential solver, whose count was phase-dependent because of it).
 
     `frac` is RELATIVE to each parameter's own range, because the ranges are
     not comparable -- a position is bounded over ~20 px and an amplitude over

@@ -46,8 +46,8 @@ the negative log posterior is the Fisher information exactly: H = F.
 import numpy as np
 from scipy.linalg import cho_factor, LinAlgError
 
-__all__ = ["COND_GUARD", "RESOLVED_TAU", "logdet", "logdet_cond",
-           "amplitudes_resolved", "log_bf_add", "log_bf_remove"]
+__all__ = ["COND_GUARD", "logdet", "logdet_cond",
+           "log_bf_add", "log_bf_remove"]
 
 
 COND_GUARD = 1e3
@@ -104,8 +104,8 @@ def logdet_cond(F):
     invariance this function exists to provide.
 
     That pathology is therefore prevented at its source, where the flux scale
-    is actually known: see `msearch._bounds`, which floors the amplitude
-    relative to the patch rather than at an absolute constant.
+    is actually known: see `gsolve._bounds`, which floors the amplitude
+    relative to the window rather than at an absolute constant.
     """
     try:
         c, _ = cho_factor(F)
@@ -121,76 +121,6 @@ def logdet_cond(F):
     except np.linalg.LinAlgError:
         cond = np.inf
     return logdet, cond, True
-
-
-RESOLVED_TAU = 3.0
-# Minimum A / SE(A) for the Laplace approximation to be VALID for an emitter.
-#
-# This is a validity condition on the approximation, not a significance test.
-# The distinction matters, because a significance screen on A/SE was removed
-# from msearch for good reason -- it was a frequentist test smuggled in beside
-# the Bayes factor. This is a different claim: the Laplace form integrates the
-# added dimensions against an UNBOUNDED Gaussian of width SE(A), but the true
-# posterior is truncated at A >= 0. When the mode sits less than a few SE from
-# that boundary the Gaussian spills across it and the posterior volume -- hence
-# the evidence -- is overstated.
-#
-# The overstatement is not a bounded nuisance, it diverges. The added emitter's
-# 3x3 block of F has F_AA = O(1) but F_yy, F_xx proportional to A^2, so
-# |F| ~ A^4 and the Laplace volume |F|^-1/2 ~ A^-2. Holding a second emitter at
-# a fixed amplitude and shrinking it (one real emitter, 11x11 patch, bg 4 e-):
-#
-#     A_2      dI      -0.5 dlog|F|    log BF for ADDING it
-#    30.0    3.771         2.042             -2.77
-#     3.0    0.727         6.237             -1.60
-#     1.0    0.045        10.302             +1.78
-#     0.1    0.025        13.191             +4.65
-#     0.01   0.003        17.699             +9.14
-#
-# dI goes to zero -- the emitter explains nothing -- while the Occam term,
-# whose whole job is to charge for complexity, PAYS about 4.5 nats per decade
-# for making it fainter. Any greedy search with an honest optimizer will walk
-# straight into that.
-#
-# Calibrated against exact 4-D numerical integration of the same posterior,
-# binned by A/SE(A) (mean signed error of the Laplace log BF, and the largest
-# absolute error in the bin):
-#
-#     A/SE(A)     n     mean err    max |err|
-#       0-1       9      -0.59        3.22
-#       1-2      11      -0.80        1.70
-#       2-3       7      -0.74        1.22
-#       3-4       4      -0.26        0.61
-#       4-6       4      -0.22        0.28
-#       6-10      4      +0.01        0.06
-#      10+       31      -0.14        1.70
-#
-# The approximation is trustworthy from about 3 SE outward and degrades below
-# it, which is also where a Gaussian keeps under 0.2% of its mass on the wrong
-# side of the boundary. Hence 3.0.
-
-
-def amplitudes_resolved(theta, F, tau=RESOLVED_TAU):
-    """True if every emitter's amplitude is at least `tau` standard errors
-    clear of the A >= 0 boundary, so the Laplace approximation is usable.
-
-    `theta` is the packed parameter vector (see structs.py) and `F` the Fisher
-    information at that point. Returns False if F cannot be inverted, which is
-    itself a reason not to trust the evidence.
-    """
-    theta = np.asarray(theta, dtype=float)
-    K = (len(theta) - 1) // 3
-    if K == 0:
-        return True
-    try:
-        C = np.linalg.inv(F)
-    except np.linalg.LinAlgError:
-        return False
-    var = np.diag(C)[1::3]
-    if np.any(var <= 0) or not np.all(np.isfinite(var)):
-        return False
-    A = theta[1::3]
-    return bool(np.all(A >= tau * np.sqrt(var)))
 
 
 def _d_log_amplitude_prior(sumA_before, sumA_after, A_s):

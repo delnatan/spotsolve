@@ -2,7 +2,7 @@
 accuracy of the Laplace approximation against exact numerical integration."""
 
 import numpy as np, sys
-import psf, lmga, evidence, moves, msearch
+import psf, lmga, evidence, moves
 rng=np.random.default_rng(4); fail=0
 def chk(name, ok, detail=""):
     global fail

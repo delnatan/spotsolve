@@ -2,8 +2,8 @@
 
 The Python verification scripts (`verify_*.py`) check this implementation
 against analytic truth. They cannot check a *second* implementation against
-*this* one, which is what a port needs, and eyeballing `run_box.py` is not a
-regression test. This writes JSON the Rust side can read and assert against,
+*this* one, which is what a port needs, and eyeballing one solved frame is not
+a regression test. This writes JSON the Rust side can read and assert against,
 layer by layer, so a port can be validated incrementally rather than only at
 the end -- where "the count is different" localizes to nothing.
 
@@ -20,15 +20,11 @@ import os
 
 import numpy as np
 
-import boxes as box_mod
-import boxsolve
 import gsolve
 import calibrate
 import evidence
 import lmga
-import msearch
 import psf
-import score
 import simulate
 
 OUT = "fixtures"
@@ -168,145 +164,18 @@ def fx_evidence():
             sumA_after=1500.0, lam=0.02, A_s=950.0,
             log_bf_add=bf, cond_reported=c, log_bf_remove=rem,
             antisymmetry_residual=float(bf + rem),
-            theta=theta,
-            amplitudes_resolved=evidence.amplitudes_resolved(theta, Fb)))
+            theta=theta))
     return dict(
         what="evidence.logdet_cond / log_bf_add / log_bf_remove",
         invariant="log_bf_remove is the EXACT negation of log_bf_add on the "
                   "same pair; antisymmetry_residual must be 0.0 exactly, not "
                   "small. If it is not, the two paths have diverged.",
-        constants=dict(COND_GUARD=evidence.COND_GUARD,
-                       RESOLVED_TAU=evidence.RESOLVED_TAU),
+        constants=dict(COND_GUARD=evidence.COND_GUARD),
         compare="log BF to 1e-10 absolute; logdet to 1e-12 relative.",
         cases=cases)
 
 
 # ---------------------------------------------------------------- layer 4
-def fx_score():
-    """The projected score test and its warm start -- the part of the
-    algorithm most likely to be got subtly wrong in a port, because a
-    CONDITIONAL rather than MARGINAL denominator still looks plausible and
-    still produces peaks in roughly the right places."""
-    # The three scenarios that matter, and they must be built so the model
-    # handed to `add_context` is NOT the model the data came from -- otherwise
-    # the residual is pure noise, no site clears z_min, and the fixture
-    # exercises nothing.
-    #
-    #   "null"  : model == truth. Expect NO candidates. This is the false
-    #             -positive check, and the only one of the three that a broken
-    #             conditional denominator would still pass.
-    #   "missed": data has one emitter the model does not. Expect a candidate
-    #             on it -- the BIRTH case.
-    #   "pair"  : data has two emitters 1.3 sigma apart, model has one at their
-    #             midpoint carrying the combined flux. Expect a candidate --
-    #             the SPLIT case, and the one that only works because the
-    #             denominator is marginal.
-    cases = []
-    specs = [("null", 3, 41), ("missed", 3, 42), ("pair", 1, 43)]
-    for kind, K, seed in specs:
-        r = np.random.default_rng(seed)
-        h = w = 15
-        yy, xx = np.mgrid[0:h, 0:w] * 1.0
-        ay, ax = psf.axes(yy, xx)
-        # Draw the model's emitters in the upper-left quadrant only, so the
-        # "missed" one at (11.5, 11.5) is guaranteed well separated from all
-        # of them. Drawing over the whole patch put it 0.45 px from a
-        # neighbour on the first attempt -- an unresolved pair below the
-        # identifiability limit, which is a different question entirely and
-        # correctly scored z = 1.5.
-        th = psf.pack(4.0, r.uniform(600, 1600, K), r.uniform(3.0, 7.5, K),
-                      r.uniform(3.0, 7.5, K))
-        if kind == "null":
-            th_true = th
-        elif kind == "missed":
-            th_true = psf.pack(4.0, list(th[1::3]) + [1100.0],
-                               list(th[2::3]) + [11.5],
-                               list(th[3::3]) + [11.5])
-        else:                       # "pair"
-            cy0, cx0 = 7.5, 7.5
-            dsep = 1.3 * SIGMA
-            th = psf.pack(4.0, [2200.0], [cy0], [cx0])
-            th_true = psf.pack(4.0, [1100.0, 1100.0],
-                               [cy0 - dsep / 2, cy0 + dsep / 2],
-                               [cx0 - dsep / 2, cx0 + dsep / 2])
-        d = r.poisson(np.maximum(psf.model(th_true, yy, xx, SIGMA),
-                                 1e-9)).astype(float)
-        halo = 0.0
-        # The incumbent must be AT its optimum for q = J'Wr to vanish, which
-        # is the state `score` is always called in. Fit it first, exactly as
-        # `search_patch` does, or the fixture tests a state that never occurs.
-        Kf = (len(th) - 1) // 3
-        lo, hi = msearch._bounds(Kf, h, w, max(float(d.max()) * 4, 10.0),
-                                 8.0 * max(float(d.max()), 1.0)
-                                 / psf.peak_factor(SIGMA))
-        fit = lmga.fit(np.clip(th, lo + 1e-9, hi - 1e-9), yy, xx, SIGMA, d,
-                       lo, hi, max_iter=100)
-        th = fit.theta
-        ctx = score.add_context(th, ay, ax, SIGMA, d, halo)
-        probes = [(3.0, 4.0), (7.5, 7.5), (float(th[2]), float(th[3])),
-                  (10.25, 2.75), (11.5, 11.5)]
-        zs, ahs = [], []
-        for (cy, cx) in probes:
-            num, den, _ = score._terms(ctx, [cy], [cx])
-            zs.append(float(num[0, 0] / np.sqrt(den[0, 0])))
-            ahs.append(float(num[0, 0] / den[0, 0]))
-        cand = score.candidates(ctx, z_min=msearch.Z_ADD_MIN, n_max=3,
-                                step=0.5)
-        ws, A_hat, zw = score.warm_start(ctx, probes[0][0], probes[0][1])
-        cases.append(dict(kind=kind, K=(len(th) - 1) // 3, h=h, w=w,
-                          sigma=SIGMA, theta=th, theta_true=th_true, data=d,
-                          probe_positions=probes, z=zs, A_hat=ahs,
-                          candidates=[dict(z=c[0], y=c[1], x=c[2], A_hat=c[3])
-                                      for c in cand],
-                          warm_start_theta=ws, warm_start_A_hat=A_hat,
-                          warm_start_z=zw))
-    return dict(
-        what="score.py: z = num/sqrt(den), den = g'Wg - u'F^-1 u",
-        trap="den is the MARGINAL precision (the Schur complement against the "
-             "whole incumbent), not the conditional g'Wg. Dropping the "
-             "u'F^-1u term still yields a plausible-looking map, still peaks "
-             "near real emitters, and silently destroys the screen -- the raw "
-             "conditional score was measured to be exceeded by the post-fit "
-             "A/SE in 79% of cases. If only one fixture is ported carefully, "
-             "make it this one.",
-        constants=dict(Z_ADD_MIN=msearch.Z_ADD_MIN),
-        compare="z and A_hat to 1e-9 relative; candidate positions exactly "
-                "(they are grid points); warm_start_theta to 1e-9 relative.",
-        cases=cases)
-
-
-# ---------------------------------------------------------------- layer 5
-def fx_boxes():
-    """The tiling. Pure integer geometry -- assert this EXACTLY. The cores
-    must partition the image with no gap and no overlap, and the jitter shift
-    must move the boundaries themselves (see README section 6: re-spacing the
-    same interval was a rounding no-op that left three seams fixed in both
-    phases)."""
-    cases = []
-    for shape in ((39, 39), (62, 62), (37, 53)):
-        for shift in (0, 3):
-            bxs = box_mod.tile(shape, SIGMA, offset=(shift, shift))
-            cover = np.zeros(shape, dtype=int)
-            for b in bxs:
-                cover[b.cy0:b.cy1, b.cx0:b.cx1] += 1
-            cases.append(dict(
-                shape=list(shape), shift=shift, n_boxes=len(bxs),
-                core_default=box_mod.default_geometry(SIGMA)[0],
-                pad_default=box_mod.default_geometry(SIGMA)[1],
-                partition_ok=bool(np.all(cover == 1)),
-                boxes=[dict(y0=b.y0, x0=b.x0, y1=b.y1, x1=b.x1, cy0=b.cy0,
-                            cx0=b.cx0, cy1=b.cy1, cx1=b.cx1) for b in bxs]))
-    return dict(
-        what="boxes.tile: fit regions, cores, and the jitter offset",
-        invariant="cores partition the image exactly once: partition_ok must "
-                  "be true for every case. NOTE this bounds double counting "
-                  "only -- see PORTING_NOTES section 13 for why it does not "
-                  "bound LOSS.",
-        compare="exact integer equality.",
-        cases=cases)
-
-
-# ---------------------------------------------------------------- layer 6
 def fx_end_to_end():
     """Whole-pipeline results on deterministic synthetic fields.
 
@@ -363,13 +232,7 @@ def main():
     write("01_psf", fx_psf())
     write("02_lmga", fx_lmga())
     write("03_evidence", fx_evidence())
-    # 04 and 05 cover score.py and the box tiling. NEITHER is on the gsolve
-    # path -- they are kept only for boxsolve (see BOXSOLVE.md) and because
-    # 04_score matters again if the projected score is revived for SPLIT
-    # ranking. A gsolve port does not need to pass them.
-    write("04_score", fx_score())
-    write("05_boxes", fx_boxes())
-    write("06_end_to_end", fx_end_to_end())
+    write("04_end_to_end", fx_end_to_end())
     print("\nport in this order; each layer is meaningless until the one "
           "below it passes.")
 

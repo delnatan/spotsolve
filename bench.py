@@ -1,5 +1,5 @@
-"""One benchmark, both solvers, identical fields: count, isolation-resolved
-recall, CRLB efficiency, false positives, runtime.
+"""One benchmark for `gsolve`: count, isolation-resolved recall, CRLB
+efficiency, false positives, runtime.
 
 The columns are chosen so that no single number can hide a failure behind a
 success. In particular recall is reported PER ISOLATION BIN, because a
@@ -15,7 +15,6 @@ import time
 import numpy as np
 import scipy.ndimage as ndi
 
-import boxsolve
 import gsolve
 import simulate
 
@@ -32,8 +31,8 @@ def background_surface(shape, kind, seed):
     `flat` is what `simulate.simulate` produces on its own. The other two exist
     because a flat background cannot show whether modelling the background
     spatially helps -- on a flat field the right answer is a constant, and any
-    surface estimator can only add variance. The real frames are not flat (both
-    solvers report 110-113% of their own flux there, which is background being
+    surface estimator can only add variance. The real frames are not flat (the
+    solver reports 110-113% of its own flux there, which is background being
     absorbed into amplitudes), so the structured cases are the ones that decide
     whether the map earns its place.
     """
@@ -160,9 +159,6 @@ def aggregate(rs):
 
 def main(args):
     methods = {
-        "boxsolve": lambda adu: boxsolve.detect_boxes(
-            adu, sigma=SIGMA, offset=OFFSET, gain=GAIN, n_outer=1,
-            k_max=16, verbose=0),
         "gsolve-flatbg": lambda adu: gsolve.detect(
             adu, sigma=SIGMA, offset=OFFSET, gain=GAIN, bg_kernel=None,
             verbose=0),

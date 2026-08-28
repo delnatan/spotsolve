@@ -7,8 +7,11 @@ Python.
 This document describes **what the algorithm does and why**.
 [`PORTING_NOTES.md`](PORTING_NOTES.md) records **implementation practices** — the
 traps that cost time here and should be designed out in Rust.
-[`BOXSOLVE.md`](BOXSOLVE.md) documents the superseded box-sequential solver and
-is not a port target.
+
+`gsolve` replaced an earlier box-sequential solver, `boxsolve`. That code and its
+walkthrough were removed once `gsolve` superseded them; both are recoverable from
+git history at the commit tagged in section 13 if the reasoning is ever needed
+again.
 
 ---
 
@@ -346,9 +349,12 @@ Current state, density 0.055, flat, 12 seeds:
 
 ```
               N   recall   FP   <1s   1-2s   2-3s   >3s  rsd z  |z|>3   dA/A  s/fr
-boxsolve    69.2  0.817  0.58  0.469 0.890  1.000 1.000  1.61  17.0%  +3.4%  2.05
 gsolve      72.8  0.860  0.50  0.523 0.958  1.000 1.000  1.43  10.7%  +2.3%  1.06
 ```
+
+For reference, the superseded `boxsolve` on the same benchmark reached
+`N = 69.2`, recall 0.817, `rsd z` 1.61 and 2.05 s/frame — worse on every column
+and twice the time.
 
 Real frames, gain 4.23 — both interior-clean, all findings on the rim:
 
@@ -390,15 +396,18 @@ veto, because `_prune` already catches degenerate survivors on a joint fit. They
 cost an eigendecomposition per proposal. Not kept. Revisit only if a regime
 appears where `_prune` cannot cope.
 
-**Box tiling, core seams, `_adopt_orphans`.** All of `boxsolve`'s machinery for
-stabilizing N. It existed to make a non-converging global sweep converge; a
-forward-only search converges by construction (section 11) and does not need it.
-See [`BOXSOLVE.md`](BOXSOLVE.md) if the reasoning is ever needed again.
+**Box tiling, core seams, `_adopt_orphans`.** All of the old `boxsolve`'s
+machinery for stabilizing N. It existed to make a non-converging global sweep
+converge; a forward-only search converges by construction (section 11) and does
+not need it. Removed with the rest of `boxsolve`; see git history before the
+cleanup commit if the reasoning is ever needed again.
 
-**`score.py`'s projected score as a screen.** Correct as a *statistic* and worth
+**The projected score as a screen.** Correct as a *statistic* and worth
 revisiting for SPLIT ranking (section 7), but it must not be used to seed and
 must not be used to screen: the raw conditional score does not screen at all,
-and was exceeded by the post-fit `A/SE` in 79% of cases.
+and was exceeded by the post-fit `A/SE` in 79% of cases. Its implementation
+(`score.py`) was removed with `boxsolve`; PORTING_NOTES section 16 keeps the two
+traps that make it hard to reimplement.
 
 ## 14. Where the time goes
 
@@ -414,8 +423,8 @@ Profiled at density 0.055, growing the field at fixed density (times are under
 
 Two things the port should take from this:
 
-**µs/px is flat.** `gsolve` is linear in area at fixed density. `boxsolve` was
-not — its halo rendering was `O(area²)`.
+**µs/px is flat.** `gsolve` is linear in area at fixed density. The old
+`boxsolve` was not — its halo rendering was `O(area²)`.
 
 **`_window` is the one super-linear term.** It measures the candidate against
 *every* committed emitter, so it is `O(N)` per proposal and `O(N²)` per round —
@@ -483,3 +492,42 @@ they are re-estimated empirically each round.
 
 `structs.py` (the contracts) → `psf.py` → `lmga.py` → `evidence.py` →
 `gsolve.py` → `crlb.py` and `audit.py` (how it is judged).
+
+---
+
+## Repository map
+
+Every file, in dependency order. Nothing here is optional to the layer above it.
+
+**The algorithm** — this is the port target, and it is all of it:
+
+| file | what it is |
+|---|---|
+| `structs.py` | the `theta` layout and the result records; imports nothing |
+| `psf.py` | pixel-integrated Gaussian, model and Jacobian |
+| `lmga.py` | bounded Poisson-MLE optimizer (Coleman–Li affine scaling) |
+| `evidence.py` | Laplace log Bayes factor, `logdet` and the conditioning guard |
+| `moves.py` | the two proposals: residual quadrupole axis, and the split |
+| `patches.py` | grouping emitters into jointly-fittable patches, and the halo |
+| `calibrate.py` | gain, robust background, model rendering |
+| `gsolve.py` | `detect` and `refine` — FIND → ADD → SPLIT → REFINE → PRUNE |
+
+**Judging it** — the three acceptance tests of section 12, and their inputs:
+
+| file | what it answers |
+|---|---|
+| `simulate.py` | synthetic Poisson fields with known truth |
+| `metrics.py` | matching detections to truth |
+| `audit.py` | is anything PSF-shaped left in the residual? |
+| `bench.py` | count, isolation-resolved recall, false positives, runtime |
+| `crlb.py` | the pull statistic, against an oracle arm that fixes N and truth |
+| `run.py` | one real frame in, detections and audit panel out |
+
+**Checking the layers** — `verify_*.py` test one layer each against analytic
+truth or numerical integration; each exits non-zero on a failure. Run them in
+order: `verify_psf.py` → `verify_optimizer.py` → `verify_geometry.py` →
+`verify_evidence.py`.
+
+**For the port** — `make_fixtures.py` writes `fixtures/*.json`, the golden
+values a second implementation asserts against, layer by layer. See
+[`PORTING_NOTES.md`](PORTING_NOTES.md) section 16.

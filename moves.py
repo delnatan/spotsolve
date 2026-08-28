@@ -1,9 +1,9 @@
 """Proposal constructors: pure transformations of a parameter vector.
 
-Each function takes a `theta` (see structs.py for the layout) and returns a
-new `theta` with one more or one fewer emitter. None of them fits anything,
-scores anything, or decides anything -- they only propose. Scoring lives in
-evidence.py and the accept/reject loop lives in msearch.py.
+Each takes a `theta` (see structs.py for the layout) and returns a new
+`theta` with one more emitter. Neither fits anything, scores anything, or
+decides anything -- they only propose. Scoring lives in evidence.py and the
+accept/reject loop in gsolve.py.
 
 Keeping proposals separate matters because they are where the method's
 domain knowledge sits: a good proposal is what lets the optimizer reach the
@@ -14,20 +14,15 @@ import numpy as np
 
 import psf
 
-__all__ = ["A_MIN", "unpack", "residual_axis", "split", "birth", "drop", "merge"]
+__all__ = ["A_MIN", "residual_axis", "split"]
 
 
 A_MIN = 1e-4
 # A hard zero amplitude makes that emitter's position block of the Fisher
 # matrix identically zero, so F is singular and every evidence term built
 # from it is meaningless. A small positive floor keeps the fit well posed;
-# an emitter that wants to be there is removed by DEATH, on the evidence,
-# rather than by silently collapsing.
-
-
-def unpack(theta):
-    """(b, A, cy, cx) as plain numpy arrays."""
-    return psf.unpack(theta)
+# an emitter that does not want to be there is removed by `gsolve._prune`,
+# on the evidence, rather than by silently collapsing.
 
 
 def residual_axis(theta, k, yy, xx, sigma, resid):
@@ -49,7 +44,7 @@ def residual_axis(theta, k, yy, xx, sigma, resid):
     how much this emitter looks like an unresolved pair. Callers use it to
     rank which emitters are worth proposing a split for.
     """
-    _, _, cy, cx = unpack(theta)
+    _, _, cy, cx = psf.unpack(theta)
     r = resid
     dy = np.asarray(yy) - cy[k]
     dx = np.asarray(xx) - cx[k]
@@ -63,7 +58,7 @@ def residual_axis(theta, k, yy, xx, sigma, resid):
     i = int(np.argmax(vals))
     u = vecs[:, i]
     n = np.linalg.norm(u)
-    _, A, _, _ = unpack(theta)
+    _, A, _, _ = psf.unpack(theta)
     strength = float(vals[i]) / max(float(A[k]), 1e-12)
     return (u / n if n > 0 else np.array([1.0, 0.0])), strength
 
@@ -74,7 +69,7 @@ def split(theta, k, u, disp):
     Total flux is conserved by construction, which is what makes the
     amplitude-prior term in evidence.log_bf_add collapse to -log(A_s).
     """
-    b, A, cy, cx = unpack(theta)
+    b, A, cy, cx = psf.unpack(theta)
     keep = [j for j in range(len(A)) if j != k]
     half = max(A[k] / 2.0, A_MIN)
     return psf.pack(
@@ -82,35 +77,4 @@ def split(theta, k, u, disp):
         list(A[keep]) + [half, half],
         list(cy[keep]) + [cy[k] + 0.5 * disp * u[0], cy[k] - 0.5 * disp * u[0]],
         list(cx[keep]) + [cx[k] + 0.5 * disp * u[1], cx[k] - 0.5 * disp * u[1]],
-    )
-
-
-def birth(theta, py, px, A_new):
-    """Append one emitter at (py, px)."""
-    b, A, cy, cx = unpack(theta)
-    return psf.pack(
-        b, list(A) + [max(A_new, A_MIN)], list(cy) + [py], list(cx) + [px]
-    )
-
-
-def drop(theta, k):
-    """Remove emitter k."""
-    b, A, cy, cx = unpack(theta)
-    keep = [j for j in range(len(A)) if j != k]
-    if not keep:
-        return np.asarray([b])
-    return psf.pack(b, A[keep], cy[keep], cx[keep])
-
-
-def merge(theta, i, j):
-    """Replace emitters i and j with one of their combined flux, at their
-    flux-weighted midpoint."""
-    b, A, cy, cx = unpack(theta)
-    keep = [q for q in range(len(A)) if q not in (i, j)]
-    wsum = A[i] + A[j]
-    return psf.pack(
-        b,
-        list(A[keep]) + [wsum],
-        list(cy[keep]) + [(A[i] * cy[i] + A[j] * cy[j]) / wsum],
-        list(cx[keep]) + [(A[i] * cx[i] + A[j] * cx[j]) / wsum],
     )

@@ -41,7 +41,6 @@ import calibrate
 import evidence
 import lmga
 import moves
-import msearch
 import patches as patch_mod
 import psf
 from structs import DetectResult
@@ -56,7 +55,7 @@ CAND_THRESHOLD = calibrate.LOG_SEED_THRESHOLD
 
 PRUNE_TAU = 2.0
 # A / SE(A), measured on the joint fit, below which `_prune` removes an emitter
-# outright instead of scoring it. Two roles:
+# outright instead of scoring it. Three roles:
 #
 #   - it is the pipeline's precision/recall dial, and the only one left;
 #   - it forces removal where the Laplace evidence cannot be computed. A
@@ -64,10 +63,49 @@ PRUNE_TAU = 2.0
 #     direction, so var(A) diverges and A/SE goes to zero on its own; the
 #     Bayes factor there would argue to KEEP the pair, harder the more
 #     degenerate it is.
+#   - it keeps the Laplace approximation inside its domain of validity. That
+#     is a claim about the approximation, not a significance test: the Laplace
+#     form integrates the added dimensions against an UNBOUNDED Gaussian of
+#     width SE(A), while the true posterior is truncated at A >= 0. When the
+#     mode sits less than a few SE from that boundary the Gaussian spills
+#     across it and the posterior volume -- hence the evidence -- is
+#     overstated.
 #
-# Raising it costs localization as well as recall: removing one member of a
-# real close pair leaves the survivor absorbing both fluxes and sitting between
-# them. 2.0 is the measured optimum on both bead frames.
+# That overstatement is not a bounded nuisance, it diverges. The emitter's 3x3
+# block of F has F_AA = O(1) but F_yy, F_xx proportional to A^2, so |F| ~ A^4
+# and the Laplace volume |F|^-1/2 ~ A^-2. Holding a second emitter at a fixed
+# amplitude and shrinking it (one real emitter, 11x11 patch, bg 4 e-):
+#
+#     A_2      dI      -0.5 dlog|F|    log BF for ADDING it
+#    30.0    3.771         2.042             -2.77
+#     3.0    0.727         6.237             -1.60
+#     1.0    0.045        10.302             +1.78
+#     0.1    0.025        13.191             +4.65
+#     0.01   0.003        17.699             +9.14
+#
+# dI goes to zero -- the emitter explains nothing -- while the Occam term,
+# whose whole job is to charge for complexity, PAYS about 4.5 nats per decade
+# for making it fainter. Any greedy search with an honest optimizer walks
+# straight into that, which is why the guard cannot be dropped.
+#
+# Calibrated against exact 4-D numerical integration of the same posterior,
+# binned by A/SE(A) (mean signed error of the Laplace log BF, and the largest
+# absolute error in the bin):
+#
+#     A/SE(A)     n     mean err    max |err|
+#       0-1       9      -0.59        3.22
+#       1-2      11      -0.80        1.70
+#       2-3       7      -0.74        1.22
+#       3-4       4      -0.26        0.61
+#       4-6       4      -0.22        0.28
+#       6-10      4      +0.01        0.06
+#      10+       31      -0.14        1.70
+#
+# The approximation is trustworthy from about 3 SE outward and degrades below
+# it. Validity alone would argue for 3.0; raising it that far costs
+# localization as well as recall, because removing one member of a real close
+# pair leaves the survivor absorbing both fluxes and sitting between them.
+# 2.0 is the measured optimum on both bead frames.
 
 SPLIT_DISPS = (1.0, 1.6)
 # Displacements, in sigma, at which a split is proposed. Below ~1 sigma a pair
@@ -305,12 +343,62 @@ def _window(positions, cand, sigma, shape, k_max):
     return free, frozen, (y0, x0, y1, x1)
 
 
+A_MIN_REL = 1e-6
+# The amplitude floor a fit may not go below, as a fraction of the window's own
+# `A_max`; `moves.A_MIN` is the absolute backstop. The floor has to be relative
+# because
+# what it protects is a RATIO. An emitter's position block of the Fisher
+# matrix scales as A^2, so at bead fluxes of ~2000 e- an amplitude of 1e-4
+# puts those entries at ~5.7e-12 against a largest diagonal of ~768 -- a ratio
+# of 3e-14, about 130x float64 epsilon. At that point log|F| is numerical
+# noise, the Occam term of every Bayes factor built on it is noise with it,
+# and the LM step along that direction is unbounded: traced on such a patch,
+# the fit predicted a 5.2e4 nat decrease, delivered 1.05e-3, and crawled for
+# 3000+ iterations still 364 nats above the optimum.
+#
+# Measured ratio of smallest to largest diag(F) with a second emitter parked
+# at the floor:
+#
+#     floor / A_max     min/max diag(F)
+#       0 (1e-4 abs)        3.0e-14      <- float64 noise
+#           1e-6            6.4e-10
+#           1e-4            4.8e-07      (saturates; a different parameter
+#           3e-3            4.8e-07       becomes the smallest)
+#
+# 1e-6 buys six orders of margin over epsilon while remaining physically
+# negligible -- on a bead patch it is a floor of ~0.02 e- of total flux. A
+# larger floor would start to express an opinion about how faint an emitter
+# may be, and that decision belongs to `_prune` and the Bayes factor, not to a
+# numerical guard. The absolute floor is only a backstop for a window whose
+# `A_max` is itself tiny.
+#
+# Note this cannot be enforced downstream in `evidence.logdet_cond` instead:
+# no test on F alone distinguishes an uninformed parameter from a well-posed
+# matrix in badly scaled units. Here the flux scale is known, so it can.
+
+
+def _bounds(K, h, w, b_max, A_max):
+    """Box constraints for one window's fit, in LOCAL coordinates.
+
+    Positions are confined to the sub-image. Letting a centre leave the frame
+    was tried -- it lets the fit put rim flux where it actually came from --
+    and measurably lost real detections elsewhere, so the bounds stay closed.
+    """
+    a_min = max(moves.A_MIN, A_MIN_REL * A_max)
+    lo = [0.0]
+    hi = [b_max]
+    for _ in range(K):
+        lo += [a_min, -0.5, -0.5]
+        hi += [A_max, h - 0.5, w - 0.5]
+    return np.asarray(lo), np.asarray(hi)
+
+
 def _fit_window(sub, yy, xx, sigma, halo, theta0, max_iter=100):
     K = (len(theta0) - 1) // 3
     smax = max(float(sub.max()), 1.0)
     b_max = max(smax * 4.0, 10.0)
     A_max = 8.0 * smax / psf.peak_factor(sigma)
-    lo, hi = msearch._bounds(K, sub.shape[0], sub.shape[1], b_max, A_max)
+    lo, hi = _bounds(K, sub.shape[0], sub.shape[1], b_max, A_max)
     th0 = np.clip(np.asarray(theta0, float), lo + 1e-9, hi - 1e-9)
     return lmga.fit(th0, yy, xx, sigma, sub, lo, hi, halo=halo,
                     max_iter=max_iter)

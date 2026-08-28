@@ -1,14 +1,10 @@
-"""Run the box-sequential solver on one image and report the residual audit.
-
-Boxsolve only -- `compare_crop.py` is the head-to-head against the old global
-sweep, and that sweep costs ~260 s on a 39x39 frame, so it is not the tool for
-looking at a new field.
+"""Run `gsolve` on one image and report the residual audit.
 
 The acceptance test is the audit panel (yellow = missed, cyan = over-modelled),
 not N and not the residual spread. Everything shown comes from the model
-boxsolve itself accepted; nothing here re-fits or culls afterwards.
+`gsolve` itself accepted; nothing here re-fits or culls afterwards.
 
-    python run_box.py --image beads_60x_still_02.tif --gain 4.23
+    python run.py --image beads_60x_still_02.tif --gain 4.23
 """
 
 import argparse
@@ -22,7 +18,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 import audit
-import boxsolve
+import gsolve
 
 CAMERA_OFFSET = 100.0
 
@@ -32,22 +28,22 @@ def main(args):
     if args.crop:
         y0, y1, x0, x1 = args.crop
         img = img[y0:y1, x0:x1]
-    print(f"{args.image}  {img.shape}  gain={args.gain}  "
-          f"refine_gain={args.refine_gain}")
+    print(f"{args.image}  {img.shape}  gain={args.gain}")
 
     t = time.time()
-    res = boxsolve.detect_boxes(
-        img, sigma=args.sigma, offset=CAMERA_OFFSET, gain=args.gain,
-        refine_gain=args.refine_gain, n_outer=args.n_outer,
-        core=args.core, pad=args.pad, k_max=args.k_max, verbose=1)
+    res = gsolve.detect(img, sigma=args.sigma, offset=CAMERA_OFFSET,
+                        gain=args.gain, k_max=args.k_max,
+                        bg_kernel=None if args.flat_bg else gsolve.BG_KERNEL,
+                        verbose=1)
     dt = time.time() - t
 
     d_e = (img.astype(float) - CAMERA_OFFSET) / res.gain
     a = audit.audit_result(d_e, res.model_image, res.sigma)
     nr = (d_e - res.model_image) / np.sqrt(np.maximum(res.model_image, 1e-6))
 
-    print(f"\nN={len(res.positions)}  gain={res.gain:.3f}  bg={res.background:.2f}  "
-          f"lam={res.lam:.4f}  A_s={res.A_s:.1f}  {dt:.1f}s")
+    print(f"\nN={len(res.positions)}  gain={res.gain:.3f}  "
+          f"bg={np.median(res.background):.2f}  lam={res.lam:.4f}  "
+          f"A_s={res.A_s:.1f}  {dt:.1f}s")
     print(audit.format_report(a, label=args.image))
     if res.se is not None and len(res.se) and np.isfinite(res.se).any():
         sp = np.nanmedian(np.hypot(res.se[:, 1], res.se[:, 2]))
@@ -56,7 +52,7 @@ def main(args):
         q = np.percentile(res.amplitudes, [5, 50, 95])
         print(f"amplitude e- (5/50/95): {q[0]:.0f} / {q[1]:.0f} / {q[2]:.0f}")
     if res.history:
-        print(f"N per box pass: {[h['N'] for h in res.history]}")
+        print(f"N per round: {[h['N'] for h in res.history]}")
 
     fig, ax = plt.subplots(1, 4, figsize=(15, 4.0))
     ax[0].imshow(img, cmap="gray")
@@ -87,18 +83,17 @@ def main(args):
 
 
 if __name__ == "__main__":
-    ap = argparse.ArgumentParser(description=__doc__,
-                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--image", default="beads_60x_still_02.tif")
     ap.add_argument("--crop", type=int, nargs=4, default=None,
                     metavar=("Y0", "Y1", "X0", "X1"))
     ap.add_argument("--sigma", type=float, default=1.2)
-    ap.add_argument("--gain", type=float, default=4.23)
-    ap.add_argument("--n-outer", type=int, default=1)
-    ap.add_argument("--core", type=int, default=None)
-    ap.add_argument("--pad", type=int, default=None)
-    ap.add_argument("--k-max", type=int, default=16)
-    ap.add_argument("--refine-gain", action="store_true",
-                    help="off by default; see calibrate.py")
-    ap.add_argument("--out", default="box_result.png")
+    ap.add_argument("--gain", type=float, default=4.23,
+                    help="ADU per photoelectron; omit to estimate (calibrate.py)")
+    ap.add_argument("--k-max", type=int, default=12)
+    ap.add_argument("--flat-bg", action="store_true",
+                    help="one background scalar for the frame, no surface")
+    ap.add_argument("--out", default="result.png")
     main(ap.parse_args())

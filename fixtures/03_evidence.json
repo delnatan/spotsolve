@@ -2,8 +2,7 @@
  "what": "evidence.logdet_cond / log_bf_add / log_bf_remove",
  "invariant": "log_bf_remove is the EXACT negation of log_bf_add on the same pair; antisymmetry_residual must be 0.0 exactly, not small. If it is not, the two paths have diverged.",
  "constants": {
-  "COND_GUARD": 1000.0,
-  "RESOLVED_TAU": 3.0
+  "COND_GUARD": 1000.0
  },
  "compare": "log BF to 1e-10 absolute; logdet to 1e-12 relative.",
  "cases": [
@@ -121,8 +120,7 @@
     427.25830645134795,
     4.665201198685095,
     6.394554271261917
-   ],
-   "amplitudes_resolved": 1
+   ]
   },
   {
    "K": 2,
@@ -337,8 +335,7 @@
     1376.7896695293578,
     4.278033658584996,
     4.250150170029309
-   ],
-   "amplitudes_resolved": 1
+   ]
   },
   {
    "K": 4,
@@ -859,8 +856,7 @@
     920.0564397981253,
     7.457391609982388,
     4.692662603972155
-   ],
-   "amplitudes_resolved": 1
+   ]
   }
  ]
 }

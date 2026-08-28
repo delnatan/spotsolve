@@ -58,7 +58,7 @@ LOG_SEED_THRESHOLD = 1.5
 # Calibrated against pure-Poisson-noise images: the LoG-filtered
 # normalized-residual noise floor has mean ~0.88, p99 ~1.13. 1.5 sits just
 # above that with margin while staying loose -- recall matters here, not
-# precision, since the Bayes factor in msearch.py does the actual pruning.
+# precision, since the Bayes factor in gsolve.py does the actual pruning.
 # This threshold is only valid on the LoG-FILTERED normalized residual; do
 # not reuse the constant on the unfiltered one, whose per-patch maximum
 # exceeds 1.5 essentially always even under a perfect model.
