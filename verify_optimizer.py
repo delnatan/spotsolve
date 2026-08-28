@@ -73,8 +73,29 @@ chk("F is the EXPECTED Fisher, not the observed Hessian (documented approx)", Tr
 print("        -> the Occam term uses -0.5*(log|F_a|-log|F_b|); the error above")
 print("           partly cancels between the two sides. Cancellation checked in t4.")
 
-# --- 2.4 optimizer reaches the same optimum as a reference solver ---
-worse=0; better=0; ties=0; gaps=[]
+# --- 2.4 optimizer quality against a reference solver ---
+#
+# This deliberately asks TWO questions, because the obvious single one --
+# "does LM reach the same I as L-BFGS-B from the same start?" -- cannot be
+# asserted at zero failures and was red for exactly that reason.
+#
+# With K up to 3 overlapping emitters on a 13x13 patch the objective is
+# genuinely multimodal, and two local methods from the same start may land in
+# different basins. Traced on the one case that failed (seed 200, K=3): LM
+# converged in 45 of 300 iterations, not stalled, to a configuration whose
+# third emitter is railed at the x = 12.5 bound with A = 26 -- i.e. a K=2
+# solution -- while the reference found a three-emitter one 0.66 nats lower.
+# Restarting LM FROM the reference point reached I = 76.951 against the
+# reference's own 76.968. So LM is the better local optimizer here (it wins 6
+# to 1 outright); it simply is not a global one, and neither is L-BFGS-B.
+#
+# What is worth asserting is therefore:
+#   (a) LM is not SYSTEMATICALLY worse -- it must win at least as often as it
+#       loses, which catches an optimizer that stops early;
+#   (b) LM POLISHES the reference -- started at the reference optimum it must
+#       never do worse than it. This is the real descent-quality test and it
+#       is basin-independent, so it can be asserted at zero failures.
+worse=0; better=0; ties=0; gaps=[]; unpolished=0; polish=[]
 for s in range(40):
     K=int(rng.integers(1,4)); th,d=make(K,200+s)
     lo=np.array([0.]+[1e-4,-0.5,-0.5]*K); hi=np.array([max(d.max()*4,10.)]+[8*max(d.max(),1)/psf.peak_factor(1.2),12.5,12.5]*K)
@@ -87,8 +108,16 @@ for s in range(40):
     if gap>1e-6: worse+=1
     elif gap<-1e-6: better+=1
     else: ties+=1
-chk("LM optimum matches L-BFGS-B reference", worse==0,
+    rp=lmga.fit(np.clip(ref.x,lo+1e-9,hi-1e-9),yy,xx,1.2,d,lo,hi,max_iter=300)
+    polish.append(rp.I-ref.fun)
+    if rp.I-ref.fun>1e-6: unpolished+=1
+chk("LM is not systematically worse than L-BFGS-B (multimodal; see note)",
+    worse<=better,
     "worse %d, better %d, tie %d ; max excess I %.2e"%(worse,better,ties,max(gaps)))
+chk("LM polishes the reference optimum (basin-independent descent test)",
+    unpolished==0,
+    "%d/40 left above the reference ; worst %+.2e, median %+.2e"
+    %(unpolished,max(polish),np.median(polish)))
 
 # --- 2.5 bounds are respected ---
 viol=0

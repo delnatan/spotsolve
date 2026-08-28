@@ -73,23 +73,76 @@ __all__ = ["solve", "refine", "detect_boxes"]
 SEED_THRESHOLD = calibrate.LOG_SEED_THRESHOLD
 
 
+HALO_TRUNCATE = 4.0
+# Distance, in sigma, beyond which a committed emitter is not rendered into a
+# box's frozen halo. Matched deliberately to `calibrate.render_model`'s own
+# `truncate=4.0`: without it, the model each box FITS AGAINST and the model
+# finally REPORTED are not the same function.
+#
+# It is also the pipeline's only super-linear term. `_box_halo` used to render
+# every committed emitter outside the fit region, with no cutoff, so its cost
+# was O(N) per box and O(N * B) = O(area^2) per pass. Measured at the real bead
+# density (0.047/px^2), emitters rendered per box and the share of total
+# runtime it took:
+#
+#     size     N     boxes   emitters/box   halo share
+#      39      64      206        53.0          0.5%
+#      78     244     1060       222.8          1.7%
+#     117     549     2128       506.5          3.3%
+#     156     983     3039       902.8          5.0%
+#     234    2191     8980      2054.4         11.6%
+#
+# At 234x234 only ~1.5% of those emitters are within 4 sigma of their box; the
+# rest each contribute under 1e-4 e-. The share grows linearly with area, so on
+# a 512x512 field this term alone would have been most of the runtime.
+
+
 def _box_halo(positions, amplitudes, keep_out, sigma, yy, xx, y0, x0):
-    """Frozen contribution of the committed emitters OUTSIDE the fit region."""
+    """Frozen contribution of the committed emitters OUTSIDE the fit region.
+
+    Only those within `HALO_TRUNCATE * sigma` of the box are rendered; see the
+    constant above for why the cutoff exists and why it is 4.
+    """
     idx = np.nonzero(~keep_out)[0]
     if idx.size == 0:
         return 0.0
     pos = np.asarray(positions)[idx]
-    return psf.model(psf.pack(0.0, np.asarray(amplitudes)[idx],
-                              pos[:, 0] - y0, pos[:, 1] - x0), yy, xx, sigma)
+    ly = pos[:, 0] - y0
+    lx = pos[:, 1] - x0
+    # Distance from the emitter to the box rectangle, per axis. The rejection
+    # is a cheap comparison; what it saves is the erf evaluation over the whole
+    # box grid that rendering each emitter costs.
+    rad = HALO_TRUNCATE * sigma
+    h, w = yy.shape
+    dy = np.maximum(np.maximum(-0.5 - ly, ly - (h - 0.5)), 0.0)
+    dx = np.maximum(np.maximum(-0.5 - lx, lx - (w - 0.5)), 0.0)
+    near = (dy <= rad) & (dx <= rad)
+    if not near.any():
+        return 0.0
+    return psf.model(psf.pack(0.0, np.asarray(amplitudes)[idx][near],
+                              ly[near], lx[near]), yy, xx, sigma)
 
 
 def _seed_box(sub, base_model, sigma, existing_local, threshold=SEED_THRESHOLD):
     """LoG candidates on this box's own residual.
 
-    The search's BIRTH move would find these one at a time, each costing a full
+    The search's ADD move would find these one at a time, each costing a full
     fit and a full proposal round. Seeding hands the search a configuration
-    that is already roughly right and leaves BIRTH to mop up what the seeding
+    that is already roughly right and leaves ADD to mop up what the seeding
     missed, which is what it is good at.
+
+    Seeding from the projected score of `msearch`/`score.py` instead -- so that
+    seeds and proposals use one statistic -- was tried and is much WORSE, for a
+    reason worth recording: one score map places one emitter. The map is a
+    statement about adding a single emitter to the CURRENT model, so reading
+    several peaks off it at once double-counts every neighbourhood where two
+    peaks compete for the same flux. Measured on beads_60x_still.tif at
+    z >= 4.0: 618 seeds against this function's 140, and 391735 LM iterations
+    against 35031 (31.2 s against 2.8 s) for the same audit -- the surplus
+    seeds all being pruned again by DEATH. A LoG filter has no such problem
+    because it never claims to be a fit. Raising LOG_SEED_THRESHOLD does not
+    help either (2.5 gives 134 seeds and slightly MORE work), so this
+    threshold is left where it is.
     """
     resid = sub - base_model
     nr = resid / np.sqrt(np.maximum(base_model, 1e-6))

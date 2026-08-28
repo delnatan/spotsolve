@@ -1,13 +1,41 @@
 """Greedy evidence-maximizing search over emitter count, for one patch.
 
-Each iteration proposes every enabled move (SPLIT / BIRTH / DEATH / MERGE),
-fits each proposal to convergence, and accepts the single BEST one if its
-log Bayes factor clears the threshold. Taking the best rather than the first
-acceptable move is what makes the loop terminate: log-evidence increases
-strictly on every accepted step, so no configuration can repeat.
+Each step proposes every enabled move (ADD / DEATH), fits each proposal to
+convergence, and accepts the single BEST one if its log Bayes factor clears
+the threshold. Taking the best rather than the first acceptable move is what
+makes the loop terminate: log-evidence increases strictly on every accepted
+step, so no configuration can repeat.
 
-Proposals come from moves.py, scoring from evidence.py, fitting from
-lmga.py. This module contains only the loop.
+Two moves, not four
+-------------------
+SPLIT and BIRTH used to be separate moves because they guessed differently:
+BIRTH placed an emitter at the argmax of the normalized residual, SPLIT
+replaced an emitter with two at a fixed displacement along the residual
+quadrupole's eigenvector. Both guesses were poor, and the fit was left to do
+the searching -- measured on beads_60x_still.tif, add proposals averaged 65
+LM iterations and 52% of split proposals exhausted the 100-iteration cap.
+
+`score.py` computes, without fitting anything, the linearized A/SE(A) of an
+emitter added at each position with every existing parameter marginalized
+out. Its peaks ARE the proposals: a peak on top of an emitter is the split
+(the projection has already removed everything the parent could absorb), a
+peak in open ground is the birth. One move covers both, the proposal count
+becomes data-driven instead of a fixed 5 per step, and the warm start is the
+augmented Gauss-Newton step rather than a guess. Measured on the same frame:
+
+    proposals fitted    2238  ->  1088
+    LM iterations     125273  -> 34441
+    fits at the cap    37.2%  ->   5.0%
+
+with precision, recall, RMSE and audit counts unchanged on 24 ground-truth
+fields (F1 0.936 both ways) -- see `Z_ADD_MIN` for the screen's calibration.
+
+The legacy moves are kept and reachable as `MOVES_LEGACY` /
+`MOVES_WITH_MERGE`; they are correct, and they are how the above was
+measured.
+
+Proposals come from score.py (ADD) and moves.py (the rest), scoring from
+evidence.py, fitting from lmga.py. This module contains only the loop.
 """
 
 import numpy as np
@@ -16,14 +44,44 @@ import psf
 import lmga
 import moves
 import evidence
+import score
 import tracer
 from structs import SearchResult
 
-__all__ = ["search_patch", "fit_theta", "MOVES_ALL", "MOVES_WITH_MERGE"]
+__all__ = ["search_patch", "fit_theta", "MOVES_ALL", "MOVES_WITH_MERGE",
+           "MOVES_LEGACY", "Z_ADD_MIN"]
 
 
-MOVES_ALL = ("split", "birth", "death")
+MOVES_ALL = ("add", "death")
+MOVES_LEGACY = ("split", "birth", "death")
 MOVES_WITH_MERGE = ("split", "birth", "death", "merge")
+
+
+Z_ADD_MIN = 4.0
+# Minimum projected score (see score.py) for an ADD proposal to be worth
+# fitting. This is a SCREEN on the same quantity `evidence.RESOLVED_TAU`
+# blocks on, evaluated before the fit instead of after it.
+#
+# `z` is the linearized A/SE(A) the added emitter would have, with every
+# existing parameter marginalized out. Measured over a full run of the old
+# split/birth proposals on beads_60x_still.tif (1581 add proposals, 1269 of
+# them blocked by A/SE(A) >= 3):
+#
+#   * the post-fit A/SE(A) exceeded the pre-fit `z` in 25 of 1581 cases
+#     (1.6%), median gap -3.8 -- so `z` is an upper bound in practice, which
+#     is the direction a screen needs;
+#   * the LOWEST `z` at which any unblocked proposal was accepted was 5.60.
+#
+#   z_min   proposals skipped   LM iters skipped   unblocked killed   accepted
+#    2.5           5.7%                7380              0               0
+#    3.0          15.2%               19997              0               0
+#    4.0          37.0%               46886              0               0
+#    5.0          54.4%               69833              2               0
+#    6.0          68.4%               81527              7               5
+#
+# 4.0 sits a full 1.6 below the lowest observed acceptance while removing
+# 46886 of 103029 add-proposal iterations. It is a bound with margin, not a
+# tuned threshold: raising it toward 6 starts to cost real detections.
 
 # MERGE is not in the default set, on measurement and on an argument.
 #
@@ -148,6 +206,40 @@ def _unresolved_indices(theta, F, tau=evidence.RESOLVED_TAU):
     return [int(k) for k in np.nonzero(bad)[0]]
 
 
+def _forced_removal(theta, F, max_death_cand):
+    """The emitter whose removal this step is obliged to make, or None.
+
+    An emitter whose amplitude is not resolved from the A >= 0 boundary makes
+    the CURRENT configuration's evidence uncomputable, so `_propose` scores its
+    removal +inf (see `evidence.RESOLVED_TAU`). Nothing finite can outrank
+    that, and the search takes the single best move -- so every other proposal
+    in such a step is fitted only for its result to be discarded by
+    construction.
+
+    This returns exactly the emitter the full proposal round would have
+    settled on, so short-circuiting is an identity, not an approximation: the
+    ordering below reproduces `_propose`'s (faintest `max_death_cand` first,
+    then each unresolved index pushed to the front in turn), and `max` over
+    the candidate list returns the FIRST +inf it meets.
+
+    Measured on beads_60x_still.tif: 85 of 105 accepted deaths are forced
+    ones, and the proposals discarded alongside them were ~27% of all LM
+    iterations in the run.
+    """
+    unresolved = _unresolved_indices(theta, F)
+    if not unresolved:
+        return None
+    A_cur = np.asarray(theta)[1::3]
+    order = list(np.argsort(A_cur)[:max_death_cand])
+    for k in unresolved:
+        if k not in order:
+            order.insert(0, k)
+    for k in order:
+        if k in unresolved:
+            return int(k)
+    return None
+
+
 def _guard(cond, rr):
     """The conditioning number a proposal must clear, raised to +inf when the
     proposal's own amplitudes are too close to the A >= 0 boundary for the
@@ -171,7 +263,28 @@ def _propose(name, res, ctx):
                               pos_lo=ctx["pos_lo"], pos_hi=ctx["pos_hi"])
     lam, A_s = ctx["lam"], ctx["A_s"]
 
-    if name == "split" and K < ctx["k_max"]:
+    if name == "add" and K < ctx["k_max"]:
+        # One move where there used to be two. See score.py: the projected
+        # score is the linearized A/SE(A) of an emitter added at each position
+        # with all existing parameters free, so a peak sitting ON an emitter is
+        # the SPLIT proposal (the projection has removed everything the parent
+        # could absorb, leaving the pair's quadrupole) and a peak in open
+        # ground is the BIRTH proposal. Neither needed a different move; they
+        # only ever needed a different guess.
+        #
+        # `warm_start` returns the full augmented Gauss-Newton step, so the
+        # existing emitters are rebalanced for the new one before the fit
+        # starts -- what a split approximated by halving the parent's flux.
+        for z, cy, cx, _ in ctx["add_cand"]:
+            th0, A_hat, _ = score.warm_start(ctx["sc"], cy, cx)
+            rr = fit(th0)
+            bf, cond = evidence.log_bf_add(
+                res.I, rr.I, res.F, rr.F,
+                _sumA(res.theta), _sumA(rr.theta), K, lam, A_s,
+                before=ctx["ld_inc"])
+            yield bf, f"add(z={z:.1f})", rr, _guard(cond, rr)
+
+    elif name == "split" and K < ctx["k_max"]:
         # Only emitters whose residual actually looks like an unresolved pair
         # are worth splitting. `residual_axis` returns the quadrupole strength
         # alongside the axis; a genuinely single emitter has none, and paying
@@ -189,7 +302,8 @@ def _propose(name, res, ctx):
                 rr = fit(moves.split(res.theta, k, direction, disp * ctx["sigma"]))
                 bf, cond = evidence.log_bf_add(
                     res.I, rr.I, res.F, rr.F,
-                    _sumA(res.theta), _sumA(rr.theta), K, lam, A_s)
+                    _sumA(res.theta), _sumA(rr.theta), K, lam, A_s,
+                    before=ctx["ld_inc"])
                 yield bf, f"split[{k}]", rr, _guard(cond, rr)
 
     elif name == "birth" and K < ctx["k_max"]:
@@ -200,7 +314,8 @@ def _propose(name, res, ctx):
         rr = fit(moves.birth(res.theta, float(py), float(px), A0))
         bf, cond = evidence.log_bf_add(
             res.I, rr.I, res.F, rr.F,
-            _sumA(res.theta), _sumA(rr.theta), K, lam, A_s)
+            _sumA(res.theta), _sumA(rr.theta), K, lam, A_s,
+            before=ctx["ld_inc"])
         yield bf, "birth", rr, _guard(cond, rr)
 
     elif name == "death" and K > 0:
@@ -232,7 +347,8 @@ def _propose(name, res, ctx):
                 continue
             bf = evidence.log_bf_remove(
                 res.I, rr.I, res.F, rr.F,
-                _sumA(res.theta), _sumA(rr.theta), K, lam, A_s)
+                _sumA(res.theta), _sumA(rr.theta), K, lam, A_s,
+                full=ctx["ld_inc"])
             yield bf, f"death[{k}]", rr, 0.0
 
     elif name == "merge" and K > 1:
@@ -247,7 +363,8 @@ def _propose(name, res, ctx):
             rr = fit(moves.merge(res.theta, i, j))
             bf = evidence.log_bf_remove(
                 res.I, rr.I, res.F, rr.F,
-                _sumA(res.theta), _sumA(rr.theta), K, lam, A_s)
+                _sumA(res.theta), _sumA(rr.theta), K, lam, A_s,
+                full=ctx["ld_inc"])
             yield bf, f"merge[{i},{j}]", rr, 0.0
 
 
@@ -268,6 +385,9 @@ def search_patch(
     split_disp=(1.0, 2.0),
     max_split_cand=2,
     max_death_cand=2,
+    z_add_min=Z_ADD_MIN,
+    max_add_cand=2,
+    score_step=0.5,
     enable=MOVES_ALL,
     pos_lo=None,
     pos_hi=None,
@@ -277,6 +397,18 @@ def search_patch(
 
     `sub` is (h,w) in PHOTOELECTRONS; `init_pos` is (K0,2) in local pixel
     coordinates; `init_amp` is (K0,) total flux. Returns a SearchResult.
+
+    ADD knobs (see score.py and Z_ADD_MIN):
+      `z_add_min`   projected score a site must reach to be worth a fit;
+      `max_add_cand` how many score peaks to fit per step -- 1 and 3 measure
+                    the same as 2 on ground truth, so this is a robustness
+                    margin for a box holding two unresolved pairs, not a
+                    tuning knob;
+      `score_step`  grid resolution of the score map, in px. Sub-pixel because
+                    it is also the proposal's starting position; 1.0 measures
+                    the same but starts the fit up to half a pixel off.
+
+    `split_disp` and `max_split_cand` apply only to the legacy SPLIT move.
 
     verbose: 0 silent, 1 accepted moves, 2 every proposal considered.
     """
@@ -312,14 +444,61 @@ def search_patch(
     accepted, best_refused = [], -np.inf
     stop_reason = "max_iter"
 
+    ay, ax_ = psf.axes(ctx["yy"], ctx["xx"])
+
     for _step in range(max_iter):
-        # The incumbent's model and residual, rendered ONCE per step. SPLIT
-        # ranks every emitter against the residual and BIRTH seeds from its
-        # largest normalized peak; neither depends on which proposal is being
-        # scored, so this used to be re-rendered K+1 times per step.
+        # A forced removal settles the step on its own. See `_forced_removal`:
+        # its log BF is +inf, so no other proposal can win, and fitting them
+        # is work whose result is discarded by construction. Taking it here
+        # reproduces exactly what the full round would have chosen.
+        if "death" in enable:
+            kf = _forced_removal(res.theta, res.F, max_death_cand)
+            if kf is not None:
+                rr = fit_theta(moves.drop(res.theta, kf), ctx["yy"], ctx["xx"],
+                               sigma, sub, halo, ctx["b_max"], ctx["A_max"],
+                               pos_lo=pos_lo, pos_hi=pos_hi)
+                if verbose >= 1:
+                    print(f"      accept death[{kf}]     log BF =      +inf "
+                          f"  K -> {(len(rr.theta) - 1) // 3}")
+                if tracer.active():
+                    tracer.emit("move", step=_step, label=f"death[{kf}]",
+                                log_bf=float("inf"),
+                                theta_before=tracer.snap(res.theta),
+                                theta_after=tracer.snap(rr.theta),
+                                I_before=res.I, I_after=rr.I,
+                                converged=rr.converged, stalled=rr.stalled,
+                                n_iter=rr.n_iter)
+                res = rr
+                accepted.append(f"death[{kf}]")
+                continue
+
+        # The incumbent's model and residual, rendered ONCE per step. The
+        # legacy SPLIT ranks every emitter against the residual and the legacy
+        # BIRTH seeds from its largest normalized peak; neither depends on
+        # which proposal is being scored, so this used to be re-rendered K+1
+        # times per step.
         ctx["model"] = psf.model(res.theta, ctx["yy"], ctx["xx"],
                                  ctx["sigma"], ctx["halo"])
         ctx["resid"] = ctx["sub"] - ctx["model"]
+
+        # Every proposal this step is scored against the SAME incumbent, so
+        # its log-determinant is a loop invariant. Factorizing it once here
+        # rather than inside each `log_bf_*` call is exact -- the same
+        # function of the same matrix -- and removed 44.5% of all Cholesky
+        # factorizations in `evidence`.
+        ctx["ld_inc"] = evidence.logdet(res.F)
+
+        # Where the next emitter would go, and whether one is worth proposing
+        # at all -- decided from the incumbent alone, before any fit. When no
+        # site clears `z_add_min` the step proposes no addition, which is the
+        # common case once a box has settled.
+        if "add" in enable and (len(res.theta) - 1) // 3 < k_max:
+            ctx["sc"] = score.add_context(res.theta, ay, ax_, sigma, sub, halo)
+            ctx["add_cand"] = score.candidates(
+                ctx["sc"], z_min=z_add_min, n_max=max_add_cand,
+                step=score_step, pos_lo=pos_lo, pos_hi=pos_hi)
+        else:
+            ctx["sc"], ctx["add_cand"] = None, []
 
         cands = []
         considered = []

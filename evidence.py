@@ -46,8 +46,8 @@ the negative log posterior is the Fisher information exactly: H = F.
 import numpy as np
 from scipy.linalg import cho_factor, LinAlgError
 
-__all__ = ["COND_GUARD", "RESOLVED_TAU", "logdet_cond", "amplitudes_resolved",
-           "log_bf_add", "log_bf_remove"]
+__all__ = ["COND_GUARD", "RESOLVED_TAU", "logdet", "logdet_cond",
+           "amplitudes_resolved", "log_bf_add", "log_bf_remove"]
 
 
 COND_GUARD = 1e3
@@ -60,10 +60,38 @@ COND_GUARD = 1e3
 # and is invariant to reparameterization.
 
 
+def logdet(F):
+    """(log|F|, ok) from one Cholesky factorization, with no condition number.
+
+    Split out from `logdet_cond` because the condition number costs a full SVD
+    and MOST CALLERS THROW IT AWAY. `log_bf_add` reads the cond of the `after`
+    matrix only; `log_bf_remove` reads neither. Measured on a 39x39 frame under
+    the legacy split/birth moves, that was ~2900 SVDs of a p ~ 25 matrix per
+    frame computed for nothing.
+
+    Keeping the two entry points separate rather than making the cond lazy is
+    deliberate: `ok` must stay exactly the conjunction `logdet_cond` reported,
+    so a caller that skips the cond still fails closed on a non-positive-
+    definite F, and still fails closed on a non-positive diagonal -- which is
+    checked here for that reason and not because anything below it is needed.
+    """
+    try:
+        c, _ = cho_factor(F)
+    except (LinAlgError, np.linalg.LinAlgError):
+        return np.inf, False
+    ld = 2.0 * float(np.sum(np.log(np.diag(c))))
+    d = np.diag(F)
+    if np.any(d <= 0) or not np.all(np.isfinite(d)):
+        return ld, False
+    return ld, True
+
+
 def logdet_cond(F):
     """(log|F|, scaled condition number, ok). `ok` is False if F is not
     positive definite, which callers must treat as "this model is ill-posed"
     rather than as evidence for anything.
+
+    Prefer `logdet` unless the condition number is actually consumed.
 
     Note what this deliberately does NOT test. An emitter whose amplitude has
     collapsed to the lower bound has a position block scaling as A^2, which
@@ -201,17 +229,23 @@ def _log_bf_add_from_logdet(I_before, I_after, ld_before, ld_after,
 
 
 def log_bf_add(I_before, I_after, F_before, F_after,
-               sumA_before, sumA_after, K_before, lam, A_s):
-    """log BF for K_before -> K_before+1 (BIRTH or SPLIT).
+               sumA_before, sumA_after, K_before, lam, A_s, before=None):
+    """log BF for K_before -> K_before+1 (an ADD; legacy BIRTH or SPLIT).
 
     Positive favours the larger model. Returns (log_bf, scaled_cond_after)
     so the caller can apply COND_GUARD to the resulting configuration.
+
+    `before` is an optional precomputed `logdet(F_before)`. Every proposal in
+    one search step is scored against the SAME incumbent, so without it the
+    incumbent's Fisher matrix is refactorized once per proposal -- measured at
+    44.5% of all `logdet_cond` calls on a 39x39 frame. Passing it in is exact,
+    not an approximation: it is the same function of the same matrix.
 
     Fails CLOSED: a non-positive-definite Fisher matrix on either side
     returns -inf. An ill-posed larger model must never be accepted, and an
     ill-posed smaller model is not evidence in favour of the larger one.
     """
-    ld_b, _, ok_b = logdet_cond(F_before)
+    ld_b, ok_b = logdet(F_before) if before is None else before
     ld_a, cond_a, ok_a = logdet_cond(F_after)
     if not (ok_b and ok_a):
         return -np.inf, cond_a
@@ -221,16 +255,19 @@ def log_bf_add(I_before, I_after, F_before, F_after,
 
 
 def log_bf_remove(I_full, I_reduced, F_full, F_reduced,
-                  sumA_full, sumA_reduced, K_full, lam, A_s):
+                  sumA_full, sumA_reduced, K_full, lam, A_s, full=None):
     """log BF for K_full -> K_full-1 (DEATH or MERGE).
 
     Positive favours the smaller model. This is the exact negation of the
-    corresponding addition, so DEATH inverts BIRTH and MERGE inverts SPLIT.
+    corresponding addition, so DEATH inverts ADD and MERGE inverts SPLIT.
     That antisymmetry is what stops a greedy search cycling between a move
     and its opposite.
+
+    Neither condition number is read here, so both determinants come from
+    `logdet`. `full` is the incumbent's precomputed one, as in `log_bf_add`.
     """
-    ld_full, _, ok_full = logdet_cond(F_full)
-    ld_reduced, _, ok_reduced = logdet_cond(F_reduced)
+    ld_full, ok_full = logdet(F_full) if full is None else full
+    ld_reduced, ok_reduced = logdet(F_reduced)
     if not ok_reduced:
         return -np.inf      # cannot trust the reduced model; keep what we have
     if not ok_full:
