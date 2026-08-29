@@ -1,0 +1,19 @@
+[workspace]
+members = ["spotsolve-core", "spotsolve-py"]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+# Edition 2024 needs >= 1.85. Pinned so a stale toolchain fails with a clear
+# message rather than a parse error in the manifest.
+rust-version = "1.85"
+
+[profile.release]
+# NOT `target-cpu=native`, here or in RUSTFLAGS or .cargo/config.toml. It lets
+# LLVM contract a*b + c into an FMA, which changes f64 results between machines
+# and would make the fingerprint test machine-dependent. See PORTING_NOTES.md
+# section 2: float associativity is part of the contract.
+opt-level = 3
+lto = "thin"
+codegen-units = 1

@@ -1,0 +1,26 @@
+[package]
+name = "spotsolve-py"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "spotsolve_rs"
+crate-type = ["cdylib"]
+
+[features]
+default = []
+# Enabled by maturin (see pyproject.toml), NOT by default. With
+# `pyo3/extension-module` always on, the Python symbols are left undefined for
+# the interpreter to resolve at load time -- correct for a wheel, but it makes a
+# plain `cargo build` / `cargo test --workspace` fail to link. Gating it keeps
+# both paths working on all three platforms without any per-OS linker flags in
+# a .cargo/config.toml.
+extension-module = ["pyo3/extension-module"]
+
+[dependencies]
+# abi3-py39: one wheel per platform covers every Python from 3.9 up, instead of
+# a wheel per interpreter version.
+pyo3 = { version = "0.29", features = ["abi3-py39"] }
+numpy = "0.29"
+spotsolve-core = { path = "../spotsolve-core" }

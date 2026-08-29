@@ -1,0 +1,74 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "spotsolve"
+version = "0.1.0"
+description = "Multi-emitter spot detection and localization by Bayesian model selection"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Daniel Elnatan", email = "delnatan@gmail.com" }]
+keywords = [
+    "microscopy",
+    "single-molecule",
+    "localization",
+    "spot-detection",
+    "point-spread-function",
+    "bayesian",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Rust",
+    "Topic :: Scientific/Engineering :: Image Processing",
+]
+dependencies = [
+    "numpy>=1.24",
+    "scipy>=1.10",
+]
+
+[project.optional-dependencies]
+# `loctable` -- the standard localization table, and what the tracking
+# downstream consumes.
+tables = ["polars>=1.0"]
+# What `scripts/` needs on top of the library: image I/O and the audit panels.
+scripts = [
+    "polars>=1.0",
+    "tifffile>=2023.1.1",
+    "matplotlib>=3.7",
+]
+# The `spotsolve_rs` extension is NOT listed here: it is a local sibling crate
+# built from `rust/spotsolve-py`, not a published dependency. Build it with
+#     maturin develop --release -m rust/spotsolve-py/Cargo.toml
+# and `detect(..., impl="rs")` will find it.
+test = ["pytest>=7.0"]
+
+[project.urls]
+Homepage = "https://github.com/delnatan/spotsolve"
+Repository = "https://github.com/delnatan/spotsolve"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/spotsolve"]
+
+[tool.hatch.build.targets.sdist]
+# The Rust crate and the golden fixtures travel with the sdist so that
+# `cargo test --workspace` works from an unpacked tarball.
+include = [
+    "src/spotsolve",
+    "rust/Cargo.toml",
+    "rust/spotsolve-core",
+    "rust/spotsolve-py",
+    "tests",
+    "scripts",
+    "docs",
+    "README.md",
+    "LICENSE",
+]
+exclude = ["rust/target", "rust/dist"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

@@ -1,29 +1,57 @@
-# Python / Jupyter scratch
+# --- Python ---
 __pycache__/
 *.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
 .ipynb_checkpoints/
+.pytest_cache/
+.ruff_cache/
 .DS_Store
 
-# Third-party reference implementation, not this project's source
-aguet_matlab/
+# --- Rust ---
+rust/target/
+rust/dist/
+*.so
+*.pyd
+*.dylib
 
-# Papers and other binary reference material (the .md writeup IS tracked)
-*.pdf
+# --- Prototyping and third-party reference material -----------------------
+# `reference/` holds what this project was DERIVED from or measured against,
+# not what it is: Aguet's MATLAB implementation, the paper PDF, exploratory
+# notebooks, and the rendered figures from past runs. Kept on disk because
+# they are worth re-reading; kept out of git because none of it is source and
+# the MATLAB tree alone is ~10 MB of committed binaries (.mex*).
+reference/
 
-# Image data and run artifacts. The pipeline's inputs (beads_60x_still*.tif)
-# and outputs (*.png/.log) are deliberately untracked: this repo is the source,
-# not the dataset. Regenerate results with
-#     python run.py --image beads_60x_still.tif --gain 4.23
+# --- Data and run artifacts ----------------------------------------------
+# The two bead crops in `data/` ARE tracked (39x39 and 62x62 uint16, a few kB
+# each) so that `python scripts/run.py` reproduces the README's audit panel out
+# of the box. Everything else under data/ is an OUTPUT -- regenerate it:
+#     python scripts/localize_movie.py        -> data/hyp7_locs/*.parquet
+#     python scripts/run.py --out result.png  -> the audit panel
+data/**/*.parquet
+data/**/meta.json
+data/hyp7_locs/
 *.tif
 *.tiff
+*.nd2
+*.czi
+!data/beads_60x_still.tif
+!data/beads_60x_still_02.tif
+
+# Figures, logs and scratch. `docs/*.md` is tracked; nothing binary is.
 *.png
+*.pdf
 *.log
 *.npz
 *.pkl
 *.mp4
-*.txt
 *.out
 *.bak
-
-# Notebooks: tracked source here is .py and .md only
 *.ipynb
+
+# The golden fixtures under tests/fixtures/ ARE tracked (~1.6 MB of JSON):
+# they are the contract the Rust port is tested against, and CI needs them
+# without a Python run. Regenerate with `python scripts/make_fixtures.py`.
