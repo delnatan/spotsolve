@@ -1,0 +1,10 @@
+TRUNCATION TEST: does N keep climbing past max_rounds=6?
+                             movie  max_rounds      N  rounds used  last-round added+split       s
+     beads_80pct-glycerol_crop.tif           6   1167            6          0+26             28.9
+     beads_80pct-glycerol_crop.tif          12   1213           12          0+4              54.5
+     beads_80pct-glycerol_crop.tif          20   1235           20          0+0              89.8
+            hyp7gem_wt_04_crop.tif           6   4269            6          0+100           126.5
+            hyp7gem_wt_04_crop.tif          12   4517           12          0+37            249.7
+            hyp7gem_wt_04_crop.tif          20   4738           20          0+31            431.6
+
+[exited with code 0]
