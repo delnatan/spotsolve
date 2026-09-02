@@ -16,6 +16,7 @@ import numpy as np
 import scipy.ndimage as ndi
 
 import spotsolve
+from spotsolve import core
 from spotsolve import backend, simulate
 
 SIGMA, GAIN, OFFSET, BG_E = 1.2, 4.23, 100.0, 4.0
@@ -193,6 +194,8 @@ def main(args):
             adu, sigma=SIGMA, offset=OFFSET, gain=GAIN, verbose=0),
         "spotsolve-rs": lambda adu: spotsolve.detect(
             adu, sigma=SIGMA, offset=OFFSET, gain=GAIN, verbose=0, impl="rs"),
+        "spotsolve-roi": lambda adu: core.detect_local(
+            adu, sigma=SIGMA, offset=OFFSET, gain=GAIN, verbose=0),
     }
     if args.methods:
         methods = {k: v for k, v in methods.items() if k in args.methods}

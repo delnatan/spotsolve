@@ -16,23 +16,33 @@ for t in range(200):
     Fb=rng.normal(size=(p,p)); Fb=Fb@Fb.T+p*np.eye(p)
     Fa=rng.normal(size=(q,q)); Fa=Fa@Fa.T+q*np.eye(q)
     Ib,Ia=rng.uniform(10,100),rng.uniform(10,100)
-    sb,sa=rng.uniform(100,2000),rng.uniform(100,2000)
     K=int(rng.integers(1,6)); lam=rng.uniform(1e-4,.2); A_s=rng.uniform(50,3000)
-    add,_=evidence.log_bf_add(Ib,Ia,Fb,Fa,sb,sa,K,lam,A_s)
-    rem=evidence.log_bf_remove(Ia,Ib,Fa,Fb,sa,sb,K+1,lam,A_s)
+    # per-emitter amplitudes, not sums: the prior is a density on ONE emitter's
+    # flux and `sum_k log g(A_k)` is not `log g(sum_k A_k)`.
+    Ab=rng.uniform(100,2000,size=K); Aa=np.append(Ab,rng.uniform(100,2000))
+    add,_=evidence.log_bf_add(Ib,Ia,Fb,Fa,Ab,Aa,K,lam,A_s)
+    rem=evidence.log_bf_remove(Ia,Ib,Fa,Fb,Aa,Ab,K+1,lam,A_s)
     worst=max(worst,abs(add+rem))
 chk("log_bf_remove == -log_bf_add exactly", worst<1e-9, "worst |add+rem| %.2e"%worst)
 
 # --- 4.2 fails closed on a non-PD Fisher ---
 Fpd=np.eye(4); Fbad=np.diag([1.,1.,1.,-1e-9])
-v,_=evidence.log_bf_add(10.,5.,Fpd,Fbad,100.,200.,1,.05,500.)
+_A1,_A2=np.array([100.]),np.array([100.,100.])
+v,_=evidence.log_bf_add(10.,5.,Fpd,Fbad,_A1,_A2,1,.05,500.)
 chk("add with non-PD F_after == -inf", v==-np.inf)
-v,_=evidence.log_bf_add(10.,5.,Fbad,Fpd,100.,200.,1,.05,500.)
+v,_=evidence.log_bf_add(10.,5.,Fbad,Fpd,_A1,_A2,1,.05,500.)
 chk("add with non-PD F_before == -inf", v==-np.inf)
 chk("remove with non-PD F_full == +inf (current model degenerate)",
-    evidence.log_bf_remove(10.,5.,Fbad,Fpd,200.,100.,2,.05,500.)==np.inf)
+    evidence.log_bf_remove(10.,5.,Fbad,Fpd,_A2,_A1,2,.05,500.)==np.inf)
 chk("remove with non-PD F_reduced == -inf",
-    evidence.log_bf_remove(10.,5.,Fpd,Fbad,200.,100.,2,.05,500.)==-np.inf)
+    evidence.log_bf_remove(10.,5.,Fpd,Fbad,_A2,_A1,2,.05,500.)==-np.inf)
+
+# --- 4.3b a bare scalar must RAISE, not be broadcast into a wrong answer ---
+try:
+    evidence.log_bf_add(10.,5.,Fpd,Fpd,100.,200.,1,.05,500.)
+    chk("scalar amplitudes rejected", False, "no exception raised")
+except TypeError:
+    chk("scalar amplitudes rejected", True)
 
 # --- 4.3 scaled condition number is reparameterization-invariant ---
 F=rng.normal(size=(7,7)); F=F@F.T+7*np.eye(7)
@@ -59,7 +69,8 @@ def laplace_bf(d, lam, A_s):
                             [py+rng.normal(0,.4)],[px+rng.normal(0,.4)]),lo1+1e-9,hi1-1e-9)
         rr=lmga.fit(t0,yy,xx,1.2,d,lo1,hi1,max_iter=400)
         if best is None or rr.I<best.I: best=rr
-    bf,_=evidence.log_bf_add(r0.I,best.I,r0.F,best.F,0.0,float(psf.unpack(best.theta)[1].sum()),0,lam,A_s)
+    bf,_=evidence.log_bf_add(r0.I,best.I,r0.F,best.F,
+                             np.empty(0),psf.unpack(best.theta)[1],0,lam,A_s)
     return bf
 
 def logtrapz(lg, x):

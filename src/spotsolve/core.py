@@ -37,16 +37,19 @@ errors are produced.
 import numpy as np
 import scipy.ndimage as ndi
 
+from . import aguet
 from . import backend as backend_mod
 from . import calibrate
 from . import evidence
 from . import lmga
 from . import moves
 from . import patches as patch_mod
+from . import prior as prior_mod
 from . import psf
 from .structs import DetectResult
 
-__all__ = ["detect", "find_candidates", "background_map", "refine",
+__all__ = ["detect", "detect_local", "solve_roi", "find_candidates",
+           "background_map", "refine",
            "log_kernel_l2", "find_aggregates", "flag_aggregates",
            "aggregate_report"]
 
@@ -1007,8 +1010,7 @@ def _try_add(d_e, positions, amplitudes, bmap, cand, camp, sigma,
 
     log_bf, cond = evidence.log_bf_add(
         r_b.I, r_a.I, r_b.F, r_a.F,
-        float(np.sum(psf.unpack(r_b.theta)[1])),
-        float(np.sum(psf.unpack(r_a.theta)[1])),
+        psf.unpack(r_b.theta)[1], psf.unpack(r_a.theta)[1],
         len(free), lam, A_s)
     if not np.isfinite(log_bf) or log_bf <= 0 or cond > evidence.COND_GUARD:
         return False, positions, amplitudes
@@ -1061,14 +1063,14 @@ def _try_split(d_e, positions, amplitudes, bmap, gi, sigma,
     # One incumbent, several proposals: its log-determinant is the same for
     # all of them and is factorized once.
     ld_b = evidence.logdet(r_b.F)
-    sumA_b = float(np.sum(psf.unpack(r_b.theta)[1]))
+    A_b = psf.unpack(r_b.theta)[1]
     best = None
     for disp in SPLIT_DISPS:
         th_a = moves.split(r_b.theta, lk, u, disp * sigma)
         r_a = _fit_window(sub, yy, xx, sigma, halo, th_a)
         log_bf, cond = evidence.log_bf_add(
-            r_b.I, r_a.I, r_b.F, r_a.F, sumA_b,
-            float(np.sum(psf.unpack(r_a.theta)[1])),
+            r_b.I, r_a.I, r_b.F, r_a.F, A_b,
+            psf.unpack(r_a.theta)[1],
             len(free), lam, A_s, before=ld_b)
         if np.isfinite(log_bf) and log_bf > 0 and cond <= evidence.COND_GUARD:
             if best is None or log_bf > best[0]:
@@ -1228,8 +1230,7 @@ def _prune(d_e, positions, amplitudes, bmap, sigma, lam, A_s, k_max):
         else:
             log_bf = evidence.log_bf_remove(
                 r_full.I, r_red.I, r_full.F, r_red.F,
-                float(np.sum(psf.unpack(r_full.theta)[1])),
-                float(np.sum(psf.unpack(r_red.theta)[1])),
+                psf.unpack(r_full.theta)[1], psf.unpack(r_red.theta)[1],
                 len(keep_idx), lam, A_s)
         if log_bf > 0:
             alive[gi] = False
@@ -1280,7 +1281,7 @@ def _update_bg(d_e, positions, amplitudes, sigma, bmap, kernel, be=None,
 def detect(data_img, sigma=1.2, offset=0.0, gain=None, lam0=0.02, A_s0=None,
            k_max=12, max_rounds=6, threshold=CAND_THRESHOLD, prune=True,
            split=True, bg_kernel=BG_KERNEL, max_settle=4, verbose=1,
-           impl="py", reject_aggregates=False,
+           impl="py", reject_aggregates=False, prior=None,
            agg_flux_ratio=AGG_FLUX_RATIO, agg_sigma_lo=AGG_SIGMA_LO,
            agg_sigma_hi=AGG_SIGMA_HI, agg_mask_radius=AGG_MASK_RADIUS):
     """Full detection. Returns a `DetectResult`.
@@ -1369,8 +1370,9 @@ def detect(data_img, sigma=1.2, offset=0.0, gain=None, lam0=0.02, A_s0=None,
         if agg_mask is not None and len(cand):
             inside = agg_mask[cand[:, 0].astype(int), cand[:, 1].astype(int)]
             cand, camp = cand[~inside], camp[~inside]
+        pri = A_s if prior is None else prior
         positions, amplitudes, n_added = be.add_pass(
-            d_e, bmap, positions, amplitudes, cand, camp, sigma, lam, A_s,
+            d_e, bmap, positions, amplitudes, cand, camp, sigma, lam, pri,
             k_max)
 
         # SPLIT runs on the model the adds just produced: an emitter only looks
@@ -1383,7 +1385,7 @@ def detect(data_img, sigma=1.2, offset=0.0, gain=None, lam0=0.02, A_s0=None,
                 model = bmap + be.render_model(positions, amplitudes, sigma,
                                                bmap.shape, 0.0)
             positions, amplitudes, n_split = be.split_pass(
-                d_e, bmap, positions, amplitudes, model, sigma, lam, A_s,
+                d_e, bmap, positions, amplitudes, model, sigma, lam, pri,
                 k_max)
 
         if n_added or n_split:
@@ -1426,7 +1428,9 @@ def detect(data_img, sigma=1.2, offset=0.0, gain=None, lam0=0.02, A_s0=None,
             break
         n_before = len(positions)
         positions, amplitudes, _ = be.prune(d_e, bmap, positions, amplitudes,
-                                            sigma, lam, A_s, k_max)
+                                            sigma, lam,
+                                            A_s if prior is None else prior,
+                                            k_max)
         if len(positions) == n_before:
             break
         if verbose >= 1:
@@ -1452,4 +1456,639 @@ def detect(data_img, sigma=1.2, offset=0.0, gain=None, lam0=0.02, A_s0=None,
         residual=d_e - model, background=bmap, se=se, history=history,
         aggregates=agg_rec,
         aggregate_fraction=(0.0 if agg_mask is None else float(agg_mask.mean())),
+    )
+
+
+# ---------------------------------------------------------------------------
+# The ROI solver: detector-seeded local model selection
+# ---------------------------------------------------------------------------
+#
+# The alternative to the round loop above. A sensitive matched-filter detector
+# (`aguet.detect_spots`) produces one seed per RESOLVABLE object; each group of
+# seeds defines an ROI; and the whole model-selection question is asked inside
+# that ROI, once, against a window that never changes.
+#
+# Why the window not changing is the point. `_try_add`'s complexity is entirely
+# the K -> K+1 Bayes factor's validity condition: both fits must see the same
+# pixels and the same frozen halo, so `_window` reconstructs that agreement for
+# every proposal against every committed emitter -- which is also the one
+# super-linear term in the profile. Here the ROI IS the window, built once, so
+# the invariant holds structurally and every proposal in the ROI is scored
+# against every other on identical pixels for free.
+#
+# What this gives up, and it is worth stating plainly: the count becomes
+# DETECTOR-CONDITIONAL. In the round loop a peak missed at round 0 can still be
+# found at round 2 as the residual changes. Here it is never considered, so the
+# detector's `alpha` is the recall dial and nothing downstream can recover what
+# it does not seed. Sub-2-sigma companions are the exception -- they leave no
+# peak for ANY linear detector by construction, and they are `_split`'s job as
+# they always were.
+
+AGUET_ALPHA = 0.2
+# The detector's per-pixel significance level, and the pipeline's recall dial.
+# Unlike `LOG_SEED_Z` this is a PROBABILITY, so it means the same thing at
+# every sigma, gain and background -- see `aguet.py`. Measured coverage
+# (fraction of true emitters with a seed within 1.5 px; 40 emitters on 64^2,
+# 8 seeds) against the LoG seeder it replaces:
+#
+#     flux  peakSNR   aguet .05  aguet 0.2  aguet 0.5   LoG 6.50z   LoG 0.65z
+#     1900     13.9       0.828      0.872      0.878       0.878       0.878
+#      120      3.1       0.756      0.844      0.863       0.800       0.863
+#       60      2.0       0.591      0.750      0.809       0.191       0.822
+#
+# with 0.1 / 1.0 / 2.0 spurious seeds per frame at 0.2 and 2.0 / 5.5 / 10.8 at
+# 0.5. The ceiling in every column is close pairs, which give ONE maximum by
+# construction; `_split` recovers those, so coverage is not recall.
+#
+# 0.2 is the operating point: it takes essentially all of the coverage 0.5 buys
+# at a fifth of the spurious seeds, and every spurious seed is a wasted ROI
+# solve. Raise it toward 0.5 on faint data where the extra recall is worth the
+# runtime; the Bayes factor absorbs the extra proposals either way.
+
+GROW_MAX_ROUNDS = 8
+# Backstop on the grow loop, per ROI. Not a convergence criterion: the loop
+# ends when a round accepts nothing, which it must, because every accepted
+# emitter lowers the residual that proposes the next one and `k_max` caps K.
+
+
+BIRTH_Z = 3.0
+# Significance floor on a birth proposal, in standard deviations of the Poisson
+# matched filter's own null. See `_gauss_kernel_l2`.
+#
+# It exists because the first version of `_residual_peaks` had none -- it
+# proposed every positive bump and left the decision entirely to the Bayes
+# factor, on the reasoning (README section 5) that the evidence absorbs extra
+# proposals. It does not absorb an UNBOUNDED number of them. Measured at
+# density 0.055 on the bright arm, with no floor:
+#
+#     arm       N/frame   extra preds on one truth   preds >1.5px from truth
+#     rounds       73.8            0.5                        0.5%
+#     roi          70.0            3.2                        4.3%
+#
+# and those far predictions had a median flux of 72 e- against 1441 for the
+# matched ones -- faint, isolated, and each one a real positive noise
+# fluctuation that a Bayes factor is right to prefer explaining. The evidence
+# was not failing; it was being asked a question about pure noise thousands of
+# times per frame, and at that rate its tail is a false-positive budget.
+#
+# The floor is on the PROPOSAL, not on the emitter, so it is not a detection
+# rule: `LOG_SEED_Z`'s ~6.5 sigma cut decided existence, this only decides what
+# is worth fitting twice. That is why 3.0 is defensible where 6.5 was not.
+
+
+def _gauss_kernel_l2(sigma):
+    """L2 norm of the normalized Gaussian kernel: the null sd of the matched
+    filter applied to a unit-variance field.
+
+    The analytic value is `1/sqrt(4 pi sigma^2)`, but the discretized and
+    renormalized kernel scipy actually convolves with differs from it by a few
+    percent at small sigma, and the whole point of dividing by this is that the
+    threshold means "standard deviations". So it is measured on scipy's own
+    kernel, the same way `log_kernel_l2` is.
+    """
+    key = float(sigma)
+    if key not in _GAUSS_L2_CACHE:
+        n = 201
+        imp = np.zeros(n)
+        imp[n // 2] = 1.0
+        g = ndi.gaussian_filter1d(imp, key, order=0, mode="constant")
+        _GAUSS_L2_CACHE[key] = float(np.sqrt((g @ g) ** 2))
+    return _GAUSS_L2_CACHE[key]
+
+
+_GAUSS_L2_CACHE = {}
+
+
+def _residual_peaks(sub, yy, xx, sigma, halo, theta, owned=None, max_peaks=4,
+                    z_thresh=None):
+    """Birth proposals inside an ROI: PSF-matched peaks of its own residual.
+
+    Returns (points, amplitudes) in LOCAL coordinates, strongest first.
+
+    A plain matched filter, not the LoG the round loop used. There is no
+    background to reject here -- the ROI's fit already carries a free `b` and
+    the surface's shape as a known term -- so subtracting the template's local
+    mean would only cost signal. Peaks within one sigma of an emitter already
+    in `theta` are dropped: that basin is taken, and the move that resolves it
+    is a split, not a birth.
+
+    `owned` is the ROI's OWNERSHIP MASK over its own pixels. ROI boxes are
+    padded by `BBOX_PAD = 3 sigma` and therefore OVERLAP; a neighbour's emitter
+    is frozen into this ROI's halo only if it was a seed, so an emitter BORN in
+    the overlap is invisible to the ROI next door, which is free to give birth
+    to the same source again. Restricting births to the pixels whose nearest
+    seed belongs to THIS ROI partitions the frame exactly once -- a bounds
+    question, not a loss question: no source is excluded, only assigned.
+
+    Worth knowing what this did NOT fix. It was added on the hypothesis that
+    overlap duplication explained the arm's false positives at density 0.055,
+    and it did not move them (5.67 per frame before and after). The duplicates
+    were real but the cost was elsewhere -- see `BIRTH_Z`.
+    """
+    z_thresh = BIRTH_Z if z_thresh is None else float(z_thresh)
+    m = psf.model(theta, yy, xx, sigma, halo=halo)
+    resid = sub - m
+    # The Poisson matched filter: under Poisson noise the residual's own scale
+    # is sqrt(mean), so dividing by it makes the field unit-variance and the
+    # filter response's null sd is then just the kernel's L2 norm. The result is
+    # a z-score, which is what makes one threshold valid at every sigma, gain
+    # and background -- the same normalization `find_candidates` used, with a
+    # matched template instead of a LoG one.
+    nr = resid / np.sqrt(np.maximum(m, BG_FLOOR))
+    f = ndi.gaussian_filter(nr, sigma, mode="nearest") / _gauss_kernel_l2(sigma)
+    win = 2 * int(np.ceil(sigma)) + 1
+    pk = (f == ndi.maximum_filter(f, size=win, mode="nearest")) & (f > z_thresh)
+    ys, xs = np.nonzero(pk)
+    if len(ys) == 0:
+        return np.empty((0, 2)), np.empty(0)
+
+    pts = np.stack([ys, xs], axis=1).astype(float)
+    _, _, cy, cx = psf.unpack(theta)
+    if len(cy):
+        centres = np.stack([cy, cx], axis=1)
+        d = np.linalg.norm(pts[:, None, :] - centres[None, :, :], axis=-1)
+        keep = d.min(axis=1) > sigma
+        pts, ys, xs = pts[keep], ys[keep], xs[keep]
+    if len(pts) == 0:
+        return np.empty((0, 2)), np.empty(0)
+
+    if owned is not None and len(pts):
+        keep = owned[ys, xs]
+        pts, ys, xs = pts[keep], ys[keep], xs[keep]
+        if len(pts) == 0:
+            return np.empty((0, 2)), np.empty(0)
+
+    order = np.argsort(-f[ys, xs])[:max_peaks]
+    pts = pts[order]
+    amp = np.maximum(resid[ys[order], xs[order]], 1e-2) / psf.peak_factor(sigma)
+    return pts, amp
+
+
+def _score_add(sub, yy, xx, sigma, halo, r_b, th_a, lam, A_s, ld_b=None):
+    """Fit `th_a` and score it against incumbent `r_b` as one K -> K+1 move.
+
+    The single scoring path for both birth and split. In the round loop this
+    logic was written twice, in `_try_add` and `_try_split`, because each also
+    had to build its own window; here the window is the ROI's and the only
+    thing that differs between the two moves is which `theta` is proposed.
+    """
+    r_a = _fit_window(sub, yy, xx, sigma, halo, th_a)
+    K_b = (len(r_b.theta) - 1) // 3
+    log_bf, cond = evidence.log_bf_add(
+        r_b.I, r_a.I, r_b.F, r_a.F,
+        psf.unpack(r_b.theta)[1], psf.unpack(r_a.theta)[1],
+        K_b, lam, A_s, before=ld_b)
+    ok = bool(np.isfinite(log_bf) and log_bf > 0
+              and cond <= evidence.COND_GUARD)
+    return ok, log_bf, r_a
+
+
+def _grow(sub, yy, xx, sigma, halo, r, lam, A_s, k_max, owned=None,
+          birth_z=None):
+    """Birth and split until the ROI stops accepting. Returns the fit.
+
+    Both moves take K -> K+1, so N is monotone here exactly as it was in the
+    round loop, and `k_max` bounds it. Splits are visited most pair-like first
+    for the same reason as before: an accepted split changes its neighbours, so
+    the order decides what later proposals are scored against.
+    """
+    for _ in range(GROW_MAX_ROUNDS):
+        accepted = False
+
+        K = (len(r.theta) - 1) // 3
+        if K < k_max:
+            pts, amps = _residual_peaks(sub, yy, xx, sigma, halo, r.theta,
+                                        owned=owned, z_thresh=birth_z)
+            for c, a in zip(pts, amps):
+                b, A, cy, cx = psf.unpack(r.theta)
+                if len(A) >= k_max:
+                    break
+                if len(cy) and np.min(np.hypot(cy - c[0], cx - c[1])) <= sigma:
+                    continue
+                th_a = psf.pack(b, np.append(A, a), np.append(cy, c[0]),
+                                np.append(cx, c[1]))
+                ok, _, r_a = _score_add(sub, yy, xx, sigma, halo, r, th_a,
+                                        lam, A_s)
+                if ok:
+                    r, accepted = r_a, True
+
+        b, A, cy, cx = psf.unpack(r.theta)
+        if len(A) and len(A) < k_max:
+            resid = sub - psf.model(r.theta, yy, xx, sigma, halo=halo)
+            strengths = np.array([
+                moves.residual_axis(r.theta, k, yy, xx, sigma, resid)[1]
+                for k in range(len(A))])
+            for k in np.argsort(-strengths):
+                k = int(k)
+                if strengths[k] <= 0:
+                    break
+                b, A, cy, cx = psf.unpack(r.theta)
+                if k >= len(A) or len(A) >= k_max:
+                    break
+                # Recomputed against the CURRENT fit: an earlier acceptance in
+                # this same round moved this emitter's neighbours.
+                resid = sub - psf.model(r.theta, yy, xx, sigma, halo=halo)
+                u, _ = moves.residual_axis(r.theta, k, yy, xx, sigma, resid)
+                ld_b = evidence.logdet(r.F)
+                best = None
+                for disp in SPLIT_DISPS:
+                    th_a = moves.split(r.theta, k, u, disp * sigma)
+                    ok, log_bf, r_a = _score_add(sub, yy, xx, sigma, halo, r,
+                                                 th_a, lam, A_s, ld_b=ld_b)
+                    if ok and (best is None or log_bf > best[0]):
+                        best = (log_bf, r_a)
+                if best is not None:
+                    r, accepted = best[1], True
+
+        if not accepted:
+            break
+    return r
+
+
+def _shrink(sub, yy, xx, sigma, halo, r, lam, A_s):
+    """Removal tests until nothing goes. Returns the fit at the reduced K.
+
+    Faintest first, and the reduced fit is what is kept -- so the survivors
+    absorbing a removed neighbour's flux is not a separate write-back step as
+    it was in `_prune`, it is just the fit that won.
+
+    Removal is FORCED, not weighed, when `_amplitude_var` cannot be trusted or
+    when `A < PRUNE_TAU * SE(A)`; see `PRUNE_TAU`. Weighing is not available
+    there, because the quantity that would do the weighing is what has broken.
+    """
+    while True:
+        b, A, cy, cx = psf.unpack(r.theta)
+        if len(A) == 0:
+            return r
+        ld_full = evidence.logdet(r.F)
+        victim = None
+        for k in np.argsort(A):
+            k = int(k)
+            keep = np.ones(len(A), dtype=bool)
+            keep[k] = False
+            th_red = psf.pack(b, A[keep], cy[keep], cx[keep])
+            r_red = _fit_window(sub, yy, xx, sigma, halo, th_red)
+            v = _amplitude_var(r.F, k)
+            if v is None or A[k] < PRUNE_TAU * np.sqrt(v):
+                log_bf = np.inf                   # forced, not weighed
+            else:
+                log_bf = evidence.log_bf_remove(
+                    r.I, r_red.I, r.F, r_red.F, A,
+                    psf.unpack(r_red.theta)[1],
+                    len(A), lam, A_s, full=ld_full)
+            if log_bf > 0:
+                victim = r_red
+                break
+        if victim is None:
+            return r
+        r = victim
+
+
+WIDE_SIGMA_LO = 0.95
+WIDE_SIGMA_HI = 8.0
+# Bounds on `H_wide`'s free width, as multiples of the PSF sigma, and together
+# the width of its uniform prior.
+#
+# The LOWER bound is not 0. Nothing images narrower than the PSF, so a fit that
+# goes there is a fit that has broken, not a narrow object -- and letting it is
+# not free: on the two finished movie runs the post-hoc per-emitter free-sigma
+# refit put 8-16% of its rejects BELOW the PSF width and 4-9% flat on its lower
+# bound. 0.95 is just interior enough that `H_wide` at the PSF width reduces to
+# `H_1` without lmga's Coleman-Li scaling collapsing on a bound.
+#
+# The UPPER bound is what "one object" can still mean; beyond it the thing is
+# not a defocused point source and belongs to the background.
+
+
+def _fit_wide(sub, yy, xx, sigma, halo, level, sumA, cy0, cx0, s0):
+    """Fit one emitter of FREE width to the whole ROI. theta = [b, A, y, x, s]."""
+    h, w = sub.shape
+    smax = max(float(sub.max()), 1.0)
+    b_max = max(smax * 4.0, 10.0)
+    A_max = 8.0 * smax / psf.peak_factor(sigma) * max(1.0, (s0 / sigma) ** 2)
+    lo = np.array([0.0, max(moves.A_MIN, A_MIN_REL * A_max), -0.5, -0.5,
+                   WIDE_SIGMA_LO * sigma])
+    hi = np.array([b_max, A_max, h - 0.5, w - 0.5, WIDE_SIGMA_HI * sigma])
+    th0 = np.clip(np.array([level, sumA, cy0, cx0, s0], dtype=float),
+                  lo + 1e-9, hi - 1e-9)
+    return lmga.fit(th0, yy, xx, sigma, sub, lo, hi, halo=halo,
+                    max_iter=100, tol_obj=EVIDENCE_TOL_OBJ, free_sigma=True)
+
+
+def _wide_start(sub, yy, xx, halo, level, sigma):
+    """(cy, cx, sigma) moment start for `H_wide`, from the ROI's own flux.
+
+    Starting the width at the PSF sigma does not work: an ROI tiled by four
+    PSF-width emitters has a broad flux distribution, and a fit begun at the
+    narrow end sits in the wrong basin and reports it as evidence against
+    width. The second moment does not care how the flux was tiled, which is
+    exactly the property needed here.
+    """
+    w = np.maximum(sub - level - halo, 0.0)
+    tot = float(w.sum())
+    if tot <= 0:
+        return sub.shape[0] / 2.0 - 0.5, sub.shape[1] / 2.0 - 0.5, sigma
+    cy = float((w * yy).sum() / tot)
+    cx = float((w * xx).sum() / tot)
+    m2 = float((w * ((yy - cy) ** 2 + (xx - cx) ** 2)).sum() / tot)
+    # For a 2-D Gaussian the mean squared radius is 2 sigma^2.
+    s = np.sqrt(max(m2, 0.0) / 2.0)
+    return cy, cx, float(np.clip(s, sigma, WIDE_SIGMA_HI * sigma * 0.9))
+
+
+def _try_wide(d_e, bmap, seeds, seed_amps, patch, sigma, r, lam, A_s):
+    """Score `H_wide` against the ROI's chosen `H_K`. Returns (log_bf, fit, bbox).
+
+    This is the discriminator README section 10b named as missing -- "a
+    genuinely extended object leaves a SMOOTH residual, a cluster of point
+    sources leaves PSF-scale peaks" -- computed rather than thresholded.
+    Merging a real cluster into one wide Gaussian loses the data term badly;
+    merging the tiles of one defocused object does not.
+
+    It is well posed HERE and nowhere later. A post-hoc free-sigma refit of a
+    finished detection asks the same question of a tile whose neighbours have
+    been frozen into its halo, and a tile with its neighbours frozen IS a
+    PSF-sized bump: measured, sigma 1.22 against 1.20 for an ordinary emitter.
+    The width evidence exists only while the ROI's flux is still undivided.
+
+    Both hypotheses are refitted on a WINDOW SIZED FOR THE WIDE ONE, which is
+    why this cannot reuse the solve's own window. An ROI is padded by
+    `BBOX_PAD = 3 sigma`, about 3.6 px at sigma=1.2, while a source at 4x the
+    PSF width reaches 14 px -- measured, testing on the ROI's own window found
+    the wide object 100% of the time at 1.5-2x defocus and only 17-50% at
+    3-4x, because the window could not hold it. Refitting `H_K` on the enlarged
+    window too is what keeps the two I-divergences differencable at all.
+    """
+    b, A, cy, cx = psf.unpack(r.theta)
+    if len(A) == 0:
+        return -np.inf, None, None
+
+    y0, x0 = patch.y0, patch.x0
+    sub0 = np.asarray(d_e[y0:patch.y1, x0:patch.x1])
+    yy0, xx0 = np.mgrid[0:sub0.shape[0], 0:sub0.shape[1]] * 1.0
+    level0, _ = _window_bg(bmap, y0, x0, patch.y1, patch.x1)
+    _, _, s0 = _wide_start(sub0, yy0, xx0, 0.0, level0, sigma)
+
+    # Enlarged window: wide enough to hold a source of the moment-estimated
+    # width, and never smaller than the ROI's own box.
+    pad = max(BBOX_PAD * sigma, 3.0 * s0)
+    gy, gx = cy + y0, cx + x0
+    ny0 = max(0, int(np.floor(gy.min() - pad)))
+    nx0 = max(0, int(np.floor(gx.min() - pad)))
+    ny1 = min(d_e.shape[0], int(np.ceil(gy.max() + pad)) + 1)
+    nx1 = min(d_e.shape[1], int(np.ceil(gx.max() + pad)) + 1)
+
+    sub = np.asarray(d_e[ny0:ny1, nx0:nx1])
+    h, w = sub.shape
+    yy, xx = np.mgrid[0:h, 0:w] * 1.0
+    level, halo = _window_bg(bmap, ny0, nx0, ny1, nx1)
+
+    # The halo must be rebuilt for the new box: `patch.frozen_indices` was
+    # computed for the small one, and what is frozen has to be the same set for
+    # both fits or their objectives are not comparable.
+    own = set(np.asarray(patch.indices, dtype=int).tolist())
+    others = np.array([i for i in range(len(seeds)) if i not in own], dtype=int)
+    if len(others):
+        py = np.clip(seeds[others, 0], ny0, ny1 - 1)
+        px = np.clip(seeds[others, 1], nx0, nx1 - 1)
+        d = np.hypot(seeds[others, 0] - py, seeds[others, 1] - px)
+        others = others[d <= HALO_FACTOR * sigma]
+    halo = _halo_image(seeds, seed_amps, others, sigma, yy, xx, ny0, nx0, halo)
+
+    th_k = psf.pack(level, A, gy - ny0, gx - nx0)
+    r_k = _fit_window(sub, yy, xx, sigma, halo, th_k)
+
+    cy0, cx0, s0 = _wide_start(sub, yy, xx, halo, level, sigma)
+    _, Ak, _, _ = psf.unpack(r_k.theta)
+    r_w = _fit_wide(sub, yy, xx, sigma, halo, level, float(np.sum(Ak)),
+                    cy0, cx0, s0)
+
+    sigma_width = (WIDE_SIGMA_HI - WIDE_SIGMA_LO) * sigma
+    log_bf = evidence.log_bf_wide(
+        r_k.I, r_w.I, r_k.F, r_w.F, Ak, float(r_w.theta[1]),
+        len(Ak), lam, A_s, sigma_width)
+    return log_bf, r_w, (ny0, nx0)
+
+
+def solve_roi(d_e, bmap, seeds, seed_amps, patch, sigma, lam, A_s, k_max=12,
+              wide=True, birth_z=None):
+    """Model selection inside one ROI. Returns (positions, amplitudes), global.
+
+    The window -- pixels, frozen halo, background level and shape -- is built
+    ONCE here and every fit inside `_grow` and `_shrink` shares it, which is
+    what makes their I-divergences differencable without any of `_window`'s
+    bookkeeping.
+
+    Returns `(positions, amplitudes, wide_record)`. When `H_wide` wins, the ROI
+    yields no point sources at all and one record instead: the object is not
+    representable at the PSF width, so every emitter the fixed-sigma model put
+    on it was a tile.
+
+    The halo is rendered from the DETECTOR's seed amplitudes, not from fitted
+    neighbours, because neighbouring ROIs have not been solved yet. That is a
+    seeding error in the frozen term, and it is why `refine` still runs
+    globally afterwards: solving decides N, refining decides the parameters
+    and the CRLBs, and only refine sees every neighbour at its fitted value.
+    """
+    y0, x0, y1, x1 = patch.y0, patch.x0, patch.y1, patch.x1
+    sub = np.asarray(d_e[y0:y1, x0:x1])
+    h, w = sub.shape
+    yy, xx = np.mgrid[0:h, 0:w] * 1.0
+
+    level, halo = _window_bg(bmap, y0, x0, y1, x1)
+    halo = _halo_image(seeds, seed_amps, np.asarray(patch.frozen_indices,
+                                                    dtype=int),
+                       sigma, yy, xx, y0, x0, halo)
+
+    idx = np.asarray(patch.indices, dtype=int)
+
+    # Nearest-seed ownership over this ROI's pixels. Ties go to the lower seed
+    # index, which is the same rule in every ROI, so the partition is a true
+    # partition: every pixel is owned by exactly one ROI.
+    if len(seeds) > len(idx):
+        gy = yy + y0
+        gx = xx + x0
+        d2 = ((gy[..., None] - seeds[None, None, :, 0]) ** 2
+              + (gx[..., None] - seeds[None, None, :, 1]) ** 2)
+        owned = np.isin(np.argmin(d2, axis=-1), idx)
+    else:
+        owned = np.ones(sub.shape, dtype=bool)
+
+    loc = seeds[idx] - np.array([y0, x0])
+    theta0 = psf.pack(level, seed_amps[idx], loc[:, 0], loc[:, 1])
+    r = _fit_window(sub, yy, xx, sigma, halo, theta0)
+
+    r = _grow(sub, yy, xx, sigma, halo, r, lam, A_s, k_max, owned=owned,
+              birth_z=birth_z)
+    r = _shrink(sub, yy, xx, sigma, halo, r, lam, A_s)
+
+    if wide:
+        log_bf, r_w, org = _try_wide(d_e, bmap, seeds, seed_amps, patch, sigma,
+                                     r, lam, A_s)
+        if np.isfinite(log_bf) and log_bf > 0 and r_w is not None:
+            wy0, wx0 = org
+            Aw, cyw, cxw, sw = (r_w.theta[1], r_w.theta[2], r_w.theta[3],
+                                r_w.theta[4])
+            rec = np.zeros(1, dtype=AGGREGATE_DTYPE)
+            rec["y"], rec["x"] = cyw + wy0, cxw + wx0
+            rec["sigma"], rec["flux"] = sw, Aw
+            rec["radius"] = AGG_MASK_RADIUS * sw
+            return np.empty((0, 2)), np.empty(0), rec
+
+    _, A, cy, cx = psf.unpack(r.theta)
+    if len(A) == 0:
+        return np.empty((0, 2)), np.empty(0), None
+    return np.stack([cy + y0, cx + x0], axis=1), A, None
+
+
+def _dedupe_wide(rec):
+    """Collapse wide records that are the same physical object.
+
+    One over-wide source raises SEVERAL detector seeds -- a broad blob is not a
+    single local maximum of the LoG -- so it becomes several ROIs, each of which
+    independently concludes it is looking at one wide object. Measured on a
+    single synthetic source at 3-4x the PSF width: two records where there is
+    one thing.
+
+    Brightest first, absorbing any later record whose centre falls inside
+    `AGG_MASK_RADIUS` of the wider of the two. This is the rule
+    `find_aggregates` already uses on its own overlapping hits; it is repeated
+    rather than shared because that one dedupes CANDIDATES before a search and
+    this one dedupes CONCLUSIONS after one.
+    """
+    if rec is None or len(rec) <= 1:
+        return rec
+    keep = []
+    for row in rec[np.argsort(-rec["flux"])]:
+        if any((row["y"] - k["y"]) ** 2 + (row["x"] - k["x"]) ** 2
+               <= (AGG_MASK_RADIUS * max(row["sigma"], k["sigma"])) ** 2
+               for k in keep):
+            continue
+        keep.append(row)
+    return np.array(keep, dtype=AGGREGATE_DTYPE)
+
+
+def detect_local(data_img, sigma=1.2, offset=0.0, gain=None,
+                 alpha=AGUET_ALPHA, lam0=0.02, A_s0=None, k_max=12,
+                 bg_kernel=BG_KERNEL, max_settle=4, verbose=1, impl="py",
+                 wide=True, birth_z=None):
+    """Detector-seeded local model selection. Returns a `DetectResult`.
+
+        DETECT   aguet.detect_spots        one seed per resolvable object
+        GROUP    patches.build_patches     seeds -> ROIs, halo, bbox
+        SOLVE    solve_roi, per ROI        birth/split/prune, independently
+        REFINE   refine                    parameters and CRLBs, to a fixed point
+
+    No round loop, no residual map over the frame, no background backfitting
+    between rounds. ROIs do not interact during SOLVE, so the order they are
+    visited in cannot change the answer -- which the round loop could not say.
+    """
+    be = backend_mod.get(impl)
+    raw = np.asarray(data_img, dtype=float)
+    H, W = raw.shape
+    g_eff = calibrate.estimate_gain(raw, offset) if gain is None else float(gain)
+    d_e = (raw - offset) / g_eff
+
+    seeds, seed_amps, _ = aguet.detect_spots(d_e, sigma, alpha,
+                                             clear_border=False)
+
+    b0 = float(np.percentile(d_e, 10.0))
+    if A_s0 is None:
+        A_s0 = max(float(d_e.max()) - b0, 10.0) / psf.peak_factor(sigma)
+    lam = max(len(seeds) / float(H * W), 1e-6) if len(seeds) else lam0
+    A_s = max(float(np.mean(seed_amps)), 1.0) if len(seed_amps) else A_s0
+
+    # Estimated ONCE, from the detector's own seeds. The round loop re-estimated
+    # it every round because its emitter set kept changing; here the seed set is
+    # final before any fit runs. README section 10 measured what the surface is
+    # worth -- a cleaner residual, and ~5% on SE(A) at most -- so paying for it
+    # more than once buys nothing.
+    bmap = _update_bg(d_e, seeds, seed_amps, sigma, np.full((H, W), max(b0, BG_FLOOR)),
+                      bg_kernel, be=be)
+
+    rois = patch_mod.build_patches(seeds, sigma, (H, W), k_max=k_max) \
+        if len(seeds) else []
+
+    pos_parts, amp_parts, wide_parts = [], [], []
+    for p in rois:
+        pp, aa, ww = solve_roi(d_e, bmap, seeds, seed_amps, p, sigma, lam, A_s,
+                               k_max, wide=wide, birth_z=birth_z)
+        if ww is not None:
+            wide_parts.append(ww)
+        elif len(aa):
+            pos_parts.append(pp)
+            amp_parts.append(aa)
+    positions = np.vstack(pos_parts) if pos_parts else np.empty((0, 2))
+    amplitudes = np.concatenate(amp_parts) if amp_parts else np.empty(0)
+    agg_rec = _dedupe_wide(np.concatenate(wide_parts)) if wide_parts else None
+
+    # Frozen into `bmap` as a KNOWN additive term, exactly as `find_aggregates`
+    # does, and for the same reason: an over-wide object left in the residual is
+    # re-tiled from the boundary inward by the very next thing that looks at it
+    # -- here, `refine` and the settle prune. Every window fit already splits
+    # `bmap` into a free level and a frozen shape, so this costs no new code in
+    # any pass.
+    agg_model = render_aggregates(agg_rec, (H, W))
+    bmap = bmap + agg_model
+
+    if verbose >= 1:
+        nw = 0 if agg_rec is None else len(agg_rec)
+        print(f"  [detect] {len(seeds):4d} seeds (alpha={alpha}) -> "
+              f"{len(rois):4d} ROIs -> N={len(positions):4d}"
+              + (f", {nw} wide" if nw else ""))
+
+    if len(positions):
+        lam = max(len(positions) / float(H * W), 1e-6)
+        A_s = max(float(np.mean(amplitudes)), 1.0)
+
+        # Re-estimated ONCE, now from the emitters that were actually found.
+        # The first estimate masked only the DETECTOR's seeds, and the detector
+        # returns one seed per resolvable object, not one per emitter -- at
+        # density 0.055 that is ~25 seeds against 84 true sources, so two
+        # thirds of the frame's emitters were sitting in their own background
+        # window and inflating it. The signature is an amplitude bias with the
+        # wrong sign: measured on the bright arm, dA/A ran -2.1% here against
+        # +2.0% for the round loop, and the median position error was 0.27 px
+        # against 0.14.
+        bmap = _update_bg(d_e, positions, amplitudes, sigma, bmap, bg_kernel,
+                          be=be) + agg_model
+
+    positions, amplitudes, se = be.refine(d_e, positions, amplitudes, sigma,
+                                          bmap, k_max, REFINE_SWEEPS)
+
+    # `refine` re-fits at fixed N with no separation constraint and can pull an
+    # accepted pair together, which no ROI saw when it accepted them. That is
+    # what this loop is for and it is INSTRUMENTED: if it never removes
+    # anything on real data, it is dead weight and should go.
+    n_settled = 0
+    for _ in range(max_settle):
+        if not len(positions):
+            break
+        n_before = len(positions)
+        positions, amplitudes, _ = be.prune(d_e, bmap, positions, amplitudes,
+                                            sigma, lam, A_s, k_max)
+        if len(positions) == n_before:
+            break
+        n_settled += n_before - len(positions)
+        positions, amplitudes, se = be.refine(d_e, positions, amplitudes,
+                                              sigma, bmap, k_max,
+                                              REFINE_SWEEPS)
+
+    model = bmap + be.render_model(positions, amplitudes, sigma, bmap.shape,
+                                   0.0)
+    if verbose >= 1:
+        nr = (d_e - model) / np.sqrt(np.maximum(model, 1e-6))
+        print(f"[final] N={len(positions)}  settle removed {n_settled}  "
+              f"bg={np.median(bmap):.2f} [{bmap.min():.2f}, {bmap.max():.2f}]  "
+              f"resid median={np.median(nr):+.3f}  "
+              f"robust_std={calibrate.robust_spread(nr):.3f}")
+
+    return DetectResult(
+        positions=positions, amplitudes=amplitudes, sigma=sigma, lam=lam,
+        A_s=A_s, gain=g_eff, n_outer_passes=1, model_image=model,
+        residual=d_e - model, background=bmap, se=se,
+        history=[dict(seeds=len(seeds), rois=len(rois),
+                      N=len(positions), settled=n_settled,
+                      wide=0 if agg_rec is None else len(agg_rec))],
+        aggregates=agg_rec,
     )

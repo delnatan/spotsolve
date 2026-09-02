@@ -154,23 +154,32 @@ def significance_map(img, sigma, alpha=ALPHA, truncate=4.0):
     return np.nan_to_num(pval, nan=1.0) < alpha
 
 
-def log_local_maxima(img, sigma, truncate=4.0):
+def log_local_maxima(img, sigma, truncate=4.0, clear_border=True):
     """Local maxima of the LoG response, on a `2*ceil(sigma)+1` footprint.
 
-    The border strip of that width is cleared: a reflect-padded curvature
-    estimate at a true edge is an artifact of the padding, and the original
-    detector discards it rather than trusting it.
+    With `clear_border`, the border strip of that width is cleared: a
+    reflect-padded curvature estimate at a true edge is an artifact of the
+    padding, and the original detector discards it rather than trusting it.
+
+    Turn it OFF when the frame is small enough that the strip is a large share
+    of it. At sigma=1.2 the strip is 5 px, which is 4% of a 256^2 frame but
+    **45% of a 39^2 one** -- measured on `scripts/bench.py`'s fields, blanking
+    it cost 45% of all seeds (18.3 -> 10.0 per frame) and dropped seed coverage
+    inside the strip to 0.035-0.048. `core.find_candidates`, which this
+    replaces, never blanked, so leaving it on makes the two incomparable on
+    exactly the geometry the benchmark uses.
     """
     img = np.asarray(img, float)
     log_f = -ndi.gaussian_laplace(img, sigma, mode="reflect")
     dom = 2 * int(np.ceil(sigma)) + 1
     lm = log_f == ndi.maximum_filter(log_f, size=dom, mode="reflect")
-    lm[:dom, :] = lm[-dom:, :] = False
-    lm[:, :dom] = lm[:, -dom:] = False
+    if clear_border:
+        lm[:dom, :] = lm[-dom:, :] = False
+        lm[:, :dom] = lm[:, -dom:] = False
     return lm
 
 
-def detect_spots(img, sigma, alpha=ALPHA, truncate=4.0):
+def detect_spots(img, sigma, alpha=ALPHA, truncate=4.0, clear_border=True):
     """`(cand, amp, strength)`, the same contract as `core.find_candidates`.
 
     `cand` is `(M, 2)` float `(y, x)` pixel coordinates, `amp` is TOTAL FLUX
@@ -179,7 +188,7 @@ def detect_spots(img, sigma, alpha=ALPHA, truncate=4.0):
     """
     img = np.asarray(img, float)
     sig = significance_map(img, sigma, alpha, truncate)
-    lm = log_local_maxima(img, sigma, truncate)
+    lm = log_local_maxima(img, sigma, truncate, clear_border)
     ys, xs = np.nonzero(sig & lm)
     if len(ys) == 0:
         return np.empty((0, 2)), np.empty(0), np.empty(0)

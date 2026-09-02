@@ -47,7 +47,7 @@ import numpy as np
 from scipy.linalg import cho_factor, LinAlgError
 
 __all__ = ["COND_GUARD", "logdet", "logdet_cond",
-           "log_bf_add", "log_bf_remove"]
+           "log_bf_add", "log_bf_remove", "log_bf_wide"]
 
 
 COND_GUARD = 1e3
@@ -123,23 +123,59 @@ def logdet_cond(F):
     return logdet, cond, True
 
 
-def _d_log_amplitude_prior(sumA_before, sumA_after, A_s):
-    """Difference of the full Exp(1/A_s) prior over all emitters when one is
-    added.
+def _as_prior(prior):
+    """Accept a `FluxPrior` or a bare `A_s` float (the historical exponential).
 
-    This is deliberately NOT "the prior of the added emitter". For a BIRTH
-    total flux genuinely increases and the expression reduces to the
-    familiar -log(A_s) - A_new/A_s. For a SPLIT the parent's flux is merely
-    redistributed between two children, the flux difference vanishes, and
-    the correct cost is just the -log(A_s) of carrying one more amplitude.
-    Charging a split A_child/A_s as well over-penalizes -- by ~1 nat at
-    typical bead flux -- precisely the move that resolves close pairs.
+    The float form exists so that a caller that has not been migrated -- or a
+    frame with too few detections to estimate a shape -- keeps EXACTLY the old
+    arithmetic. See `ExponentialFlux`.
     """
-    return -np.log(A_s) - (sumA_after - sumA_before) / A_s
+    if isinstance(prior, (int, float, np.floating, np.integer)):
+        from .prior import ExponentialFlux
+        return ExponentialFlux(float(prior))
+    return prior
+
+
+def _d_log_amplitude_prior(A_before, A_after, prior):
+    """Difference of the amplitude prior over ALL emitters when one is added.
+
+    The general form: `sum_k log g(A_k^after) - sum_k log g(A_k^before)`, with
+    `g` the flux prior. It is deliberately NOT "the prior of the added emitter",
+    for two reasons.
+
+    For a BIRTH total flux genuinely increases. For a SPLIT the parent's flux is
+    merely redistributed between two children, so the only honest question is
+    what the population thinks of one emitter at `2A` against two at `A`. With
+    the old `Exp(1/A_s)` that reduced to `-log(A_s)` -- a flat charge for
+    carrying one more amplitude, about 7.5 nats at bead brightness -- and it was
+    the single term that made every sub-sigma split impossible. An exponential
+    has its mode at zero, so it prefers the one bright emitter by construction.
+    See `prior.py` for the measurement.
+
+    The second reason is that the OTHER emitters' amplitudes move in the refit
+    too, and under a general `g` their prior contributions move with them. The
+    old sum-only form could not see that; this one does, and it costs nothing.
+    """
+    prior = _as_prior(prior)
+    # A bare scalar is REJECTED rather than broadcast. Callers used to pass the
+    # SUM of the amplitudes here, which under a general prior is a different
+    # quantity entirely -- `sum_k log g(A_k)` is not `log g(sum_k A_k)` -- and a
+    # scalar would be silently read as "exactly one emitter", quietly dropping
+    # the `-log(A_s)` term that is the whole cost of carrying one more emitter.
+    # An empty array is the correct way to say "no emitters"; 0.0 is not.
+    if np.ndim(A_before) == 0 or np.ndim(A_after) == 0:
+        raise TypeError(
+            "log_bf_* now take the per-emitter amplitude ARRAYS, not their "
+            "sums; pass np.empty(0) for a configuration with no emitters")
+    A_before = np.asarray(A_before, dtype=float).ravel()
+    A_after = np.asarray(A_after, dtype=float).ravel()
+    lb = prior.logpdf(A_before).sum() if A_before.size else 0.0
+    la = prior.logpdf(A_after).sum() if A_after.size else 0.0
+    return float(la - lb)
 
 
 def _log_bf_add_from_logdet(I_before, I_after, ld_before, ld_after,
-                            sumA_before, sumA_after, K_before, lam, A_s):
+                            A_before, A_after, K_before, lam, prior):
     """The Bayes factor itself, once both log-determinants are in hand.
 
     Split out so `log_bf_remove` can reuse it. Removal is the exact negation of
@@ -152,14 +188,14 @@ def _log_bf_add_from_logdet(I_before, I_after, ld_before, ld_after,
         (I_before - I_after)
         + np.log(lam)
         - np.log(K_before + 1)
-        + _d_log_amplitude_prior(sumA_before, sumA_after, A_s)
+        + _d_log_amplitude_prior(A_before, A_after, prior)
         + 1.5 * np.log(2.0 * np.pi)
         - 0.5 * (ld_after - ld_before)
     )
 
 
 def log_bf_add(I_before, I_after, F_before, F_after,
-               sumA_before, sumA_after, K_before, lam, A_s, before=None):
+               A_before, A_after, K_before, lam, prior, before=None):
     """log BF for K_before -> K_before+1 (an ADD; legacy BIRTH or SPLIT).
 
     Positive favours the larger model. Returns (log_bf, scaled_cond_after)
@@ -180,12 +216,12 @@ def log_bf_add(I_before, I_after, F_before, F_after,
     if not (ok_b and ok_a):
         return -np.inf, cond_a
     return _log_bf_add_from_logdet(I_before, I_after, ld_b, ld_a,
-                                   sumA_before, sumA_after, K_before,
-                                   lam, A_s), cond_a
+                                   A_before, A_after, K_before,
+                                   lam, prior), cond_a
 
 
 def log_bf_remove(I_full, I_reduced, F_full, F_reduced,
-                  sumA_full, sumA_reduced, K_full, lam, A_s, full=None):
+                  A_full, A_reduced, K_full, lam, prior, full=None):
     """log BF for K_full -> K_full-1 (DEATH or MERGE).
 
     Positive favours the smaller model. This is the exact negation of the
@@ -204,5 +240,48 @@ def log_bf_remove(I_full, I_reduced, F_full, F_reduced,
         return np.inf       # the current model is degenerate; removal is right
     return -_log_bf_add_from_logdet(
         I_reduced, I_full, ld_reduced, ld_full,
-        sumA_reduced, sumA_full, K_full - 1, lam, A_s,
+        A_reduced, A_full, K_full - 1, lam, prior,
+    )
+
+
+def log_bf_wide(I_narrow, I_wide, F_narrow, F_wide, A_narrow, A_wide,
+                K_narrow, lam, prior, sigma_width, narrow=None):
+    """log BF for "one emitter of free width" against "K emitters at the PSF
+    width". Positive favours the ONE WIDE object.
+
+    The two models are NOT nested -- H_wide is not H_K with a parameter fixed --
+    which is exactly why this is an evidence and not a likelihood-ratio test.
+    Each side's Laplace evidence is computed on its own and differenced:
+
+        log P(d|H) = -I + log pi(theta_hat) + (p/2) log(2pi) - 0.5 log|F|
+
+    `I` is an I-divergence, so the data-only constant separating it from the
+    negative log-likelihood is the same on both sides and cancels. So does
+    `b`'s uniform prior (same range), and so does the point process's
+    `exp(-lam*Area)`: the Poisson count prior contributes `(lam*Area)^K/K!` and
+    the K uniform positions contribute `Area^-K`, leaving `lam^K/K!` and no
+    area anywhere -- the same cancellation `log_bf_add` relies on.
+
+    H_wide pays for its extra width parameter three times over, which is what
+    stops it swallowing ordinary close pairs: one more Laplace dimension, one
+    more Occam factor in `|F_wide|`, and `-log(sigma_width)` for the uniform
+    prior over the widths it was allowed to choose from.
+
+    Fails CLOSED in both directions: a non-positive-definite Fisher matrix on
+    either side is "this model is ill-posed", never evidence for the other.
+    """
+    ld_n, ok_n = logdet(F_narrow) if narrow is None else narrow
+    ld_w, ok_w = logdet(F_wide)
+    if not (ok_n and ok_w):
+        return -np.inf
+    K = int(K_narrow)
+    from scipy.special import gammaln
+    return float(
+        (I_narrow - I_wide)
+        + (1 - K) * np.log(lam)
+        + gammaln(K + 1)
+        + _d_log_amplitude_prior(A_narrow, [A_wide], prior)
+        - np.log(sigma_width)
+        + 0.5 * (4 - 3 * K) * np.log(2.0 * np.pi)
+        - 0.5 * (ld_w - ld_n)
     )
