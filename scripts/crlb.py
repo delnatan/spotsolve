@@ -15,6 +15,26 @@ the two arms below separate them:
     pipeline  `detect` output matched to truth. The gap to `oracle` is what
               the search costs.
 
+BOTH ARMS EMIT ONE ROW PER TRUE EMITTER. Until 2026-09-02 the oracle did but
+the pipeline emitted one per MATCHED detection, so the `<1s` rows compared
+n = 114 unconditioned truths against n = 63 truths the search had already
+resolved -- and that is why pipeline `<1s` med err read 0.286 against the
+oracle's 0.329 while being 4.8x overconfident. The bias runs the wrong way for
+anything that helps: resolving more close pairs admits the harder ones, so
+`med err` and `rsd z` can degrade while the estimate strictly improves.
+
+A pull needs an SE, so the pull columns are still computable only where there
+IS a matched detection. Two columns make that conditioning impossible to miss
+rather than removing it:
+
+    match%  the share of the bin's true emitters the pull columns rest on.
+            Compare rows only at comparable match%.
+    d_nn    distance from each TRUE emitter to the nearest estimate, over ALL
+            of them, matched or not. Same denominator in both arms, so this
+            one column can be read across arms directly. A merged pair member
+            scores about half the separation here; a missed emitter scores
+            whatever else is nearby, which is the honest cost of missing it.
+
 Reported per isolation bin, because a frame-level number is dominated by the
 easy majority and is blind to the regime still in question.
 
@@ -52,28 +72,57 @@ def collect(size, densities, seeds, radius, bg, impl="py"):
             p, a, se = backend.get(impl).refine(
                 d_e, truth.copy(), amps.copy(), SIGMA, sim.background, 12,
                 spotsolve.REFINE_SWEEPS)
+            dnn = nearest(truth, p)
             for j in range(len(truth)):
-                if np.all(np.isfinite(se[j, 1:])):
-                    recs.append(dict(
-                        arm="oracle", dens=dens, nn=nn[j],
-                        zy=(p[j, 0] - truth[j, 0]) / se[j, 1],
-                        zx=(p[j, 1] - truth[j, 1]) / se[j, 2],
-                        za=(a[j] - amps[j]) / se[j, 0],
-                        d=float(np.linalg.norm(p[j] - truth[j])),
-                        se=0.5 * (se[j, 1] + se[j, 2])))
+                ok = np.all(np.isfinite(se[j, 1:]))
+                recs.append(dict(
+                    arm="oracle", dens=dens, nn=nn[j], matched=bool(ok),
+                    dnn=dnn[j],
+                    zy=(p[j, 0] - truth[j, 0]) / se[j, 1] if ok else np.nan,
+                    zx=(p[j, 1] - truth[j, 1]) / se[j, 2] if ok else np.nan,
+                    za=(a[j] - amps[j]) / se[j, 0] if ok else np.nan,
+                    d=float(np.linalg.norm(p[j] - truth[j])) if ok else np.nan,
+                    se=0.5 * (se[j, 1] + se[j, 2]) if ok else np.nan))
 
             r = spotsolve.detect(raw, sigma=SIGMA, offset=OFFSET, gain=GAIN,
                               verbose=0, impl=impl)
-            for i, j, dist in bench.greedy_match(r.positions, truth, radius):
-                if r.se is None or not np.all(np.isfinite(r.se[i, 1:])):
-                    continue
+            # One row per TRUTH, so the denominator is the bin's emitter count
+            # in both arms. `hit` is keyed by the truth index, which is what
+            # the greedy matcher assigns; truths it never reached fall through
+            # as unmatched rows rather than vanishing from the table.
+            hit = {j: (i, dist)
+                   for i, j, dist in bench.greedy_match(r.positions, truth,
+                                                        radius)}
+            dnn = nearest(truth, r.positions)
+            for j in range(len(truth)):
+                i, dist = hit.get(j, (None, np.nan))
+                ok = (i is not None and r.se is not None
+                      and np.all(np.isfinite(r.se[i, 1:])))
                 recs.append(dict(
-                    arm="pipeline", dens=dens, nn=nn[j],
-                    zy=(r.positions[i, 0] - truth[j, 0]) / r.se[i, 1],
-                    zx=(r.positions[i, 1] - truth[j, 1]) / r.se[i, 2],
-                    za=(r.amplitudes[i] - amps[j]) / r.se[i, 0],
-                    d=dist, se=0.5 * (r.se[i, 1] + r.se[i, 2])))
+                    arm="pipeline", dens=dens, nn=nn[j], matched=bool(ok),
+                    dnn=dnn[j],
+                    zy=(r.positions[i, 0] - truth[j, 0]) / r.se[i, 1] if ok else np.nan,
+                    zx=(r.positions[i, 1] - truth[j, 1]) / r.se[i, 2] if ok else np.nan,
+                    za=(r.amplitudes[i] - amps[j]) / r.se[i, 0] if ok else np.nan,
+                    d=dist if ok else np.nan,
+                    se=0.5 * (r.se[i, 1] + r.se[i, 2]) if ok else np.nan))
     return recs
+
+
+def nearest(truth, est):
+    """Distance from each true emitter to the nearest estimate, or inf.
+
+    Deliberately not capped at the matching radius: a missed emitter's cost IS
+    how far the nearest thing to it is, and capping would fold that back into
+    the same conditioning this arm exists to avoid.
+    """
+    if len(truth) == 0:
+        return np.empty(0)
+    if len(est) == 0:
+        return np.full(len(truth), np.inf)
+    return np.min(np.linalg.norm(np.asarray(truth)[:, None, :]
+                                 - np.asarray(est)[None, :, :], axis=-1),
+                  axis=1)
 
 
 def summarize(rs, label):
@@ -83,23 +132,33 @@ def summarize(rs, label):
     z = z[np.isfinite(z)]
     za = np.array([r["za"] for r in rs])
     za = za[np.isfinite(za)]
-    d = np.array([r["d"] for r in rs])
-    se = np.array([r["se"] for r in rs])
+    d = np.array([r["d"] for r in rs], float)
+    d = d[np.isfinite(d)]
+    se = np.array([r["se"] for r in rs], float)
+    dnn = np.array([r["dnn"] for r in rs], float)
+    frac = np.mean([r["matched"] for r in rs])
     if len(z) == 0:
-        return f"{label:>16s}       -"
+        return (f"{label:>16s} {len(rs):6d} {100 * frac:6.1f}% "
+                + " " * 48 + f"{np.median(dnn):8.4f}")
     # Robust sd: a heavy tail is a separate failure and must not be allowed to
     # masquerade as inefficiency in the core of the distribution.
     rsd = 0.7413 * (np.percentile(z, 75) - np.percentile(z, 25))
     rsd_a = (0.7413 * (np.percentile(za, 75) - np.percentile(za, 25))
              if len(za) else np.nan)
-    return (f"{label:>16s} {len(rs):6d} {np.mean(z):+7.3f} {np.std(z):7.2f} "
+    return (f"{label:>16s} {len(rs):6d} {100 * frac:6.1f}% "
+            f"{np.mean(z):+7.3f} {np.std(z):7.2f} "
             f"{rsd:7.2f} {100 * np.mean(np.abs(z) > 3):6.1f}% "
             f"{rsd_a:7.2f} {np.median(d):8.4f} "
-            f"{np.sqrt(np.mean(d ** 2)):8.4f} {np.nanmedian(se):8.4f}")
+            f"{np.sqrt(np.mean(d ** 2)):8.4f} {np.nanmedian(se):8.4f} "
+            f"{np.median(dnn):8.4f}")
 
 
-HDR = (f"{'arm / bin':>16s} {'n':>6} {'mean z':>7} {'sd z':>7} {'rsd z':>7} "
-       f"{'|z|>3':>7} {'rsd zA':>7} {'med err':>8} {'RMSE':>8} {'med SE':>8}")
+# `n` is the bin's TRUE EMITTER count in both arms. Every column between
+# `match%` and `med SE` is computed on the matched subset only -- read them
+# across arms only at comparable match%. `d_nn` is over all n.
+HDR = (f"{'arm / bin':>16s} {'n':>6} {'match%':>7} {'mean z':>7} {'sd z':>7} "
+       f"{'rsd z':>7} {'|z|>3':>7} {'rsd zA':>7} {'med err':>8} {'RMSE':>8} "
+       f"{'med SE':>8} {'d_nn':>8}")
 
 
 def main(args):
@@ -110,6 +169,12 @@ def main(args):
     print("pull z = (estimate - truth)/SE per axis; rsd 1.00 = at the CRLB, "
           "|z|>3 ideal 0.3%")
     print("rsd zA is the same statistic on the AMPLITUDE")
+    print("n is TRUE EMITTERS in both arms; the pull columns rest on the "
+          "match% of them that")
+    print("were matched, so compare those across arms only at comparable "
+          "match%. d_nn -- the")
+    print("distance to the nearest estimate, over all n -- has the same "
+          "denominator everywhere.")
     for dens in args.densities:
         print(f"\n=== density {dens} ===")
         print(HDR)

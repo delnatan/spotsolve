@@ -18,6 +18,12 @@ class SimResult:
     amplitudes: np.ndarray  # (N,) true peak amplitudes
     background: float
     sigma: float
+    sigmas: np.ndarray = None
+    """(N,) per-emitter true width, or None when every emitter is at `sigma`.
+
+    Recorded rather than derived because it is the only truth column a
+    width-mismatch arm can be scored against, and the solver never sees it.
+    """
 
 
 def simulate(
@@ -27,6 +33,7 @@ def simulate(
     amplitude_range=(150.0, 600.0),
     background=20.0,
     sigma=1.2,
+    sigma_spread=0.0,
     border=4.0,
     min_separation=0.0,
     seed=None,
@@ -35,6 +42,25 @@ def simulate(
 
     Exactly one of n_emitters or density (emitters/px^2, over the interior
     area excluding `border`) must be given.
+
+    `sigma_spread` is the sd, IN LOG SPACE, of a per-emitter lognormal width
+    drawn around `sigma`. It exists because a field where every emitter sits at
+    the model's own width cannot exhibit the failure the real data does: on
+    `beads_80pct-glycerol` the per-object sigma_ratio sd is 0.194 and the
+    per-localization sd 0.442, so 0.2 and 0.4 bracket that data. Measured at
+    the benchmark's easiest arm (bright, density 0.015, flat background, where
+    recall is 0.978 and FP 0.00), width spread alone drives N_est/N_true:
+
+        spread   0.0    0.10   0.20   0.40
+        Nest/Nt  0.95   1.07   1.26   1.56
+
+    and the excess is one-sided tiling, monotone in each emitter's OWN width:
+    at sigma_true/sigma <= 1.05 no emitter collects a second detection, at
+    1.05-1.25 38% do, at 1.25-1.60 85% do. Emitters NARROWER than the model
+    never tile.
+
+    `sigma_spread = 0` draws no random numbers and renders through `psf.model`,
+    so every existing seed reproduces its field byte for byte.
     """
     rng = np.random.default_rng(seed)
     H, W = shape
@@ -58,12 +84,23 @@ def simulate(
             positions = np.stack([ys, xs], axis=1)
             amplitudes = rng.uniform(*amplitude_range, size=n_emitters)
 
+    # Drawn only when asked for, and only after positions and amplitudes, so a
+    # spread of 0 leaves the random stream exactly where it was.
+    sigmas = None
+    if sigma_spread > 0 and positions.shape[0] > 0:
+        sigmas = sigma * np.exp(
+            rng.normal(0.0, sigma_spread, size=positions.shape[0]))
+
     yy, xx = np.mgrid[0:H, 0:W] * 1.0
-    if positions.shape[0] > 0:
+    if positions.shape[0] == 0:
+        clean = np.full(shape, background)
+    elif sigmas is None:
         theta = psf.pack(background, amplitudes, positions[:, 0], positions[:, 1])
         clean = psf.model(theta, yy, xx, sigma)
     else:
-        clean = np.full(shape, background)
+        theta = psf.pack_var_sigma(background, amplitudes, positions[:, 0],
+                                   positions[:, 1], sigmas)
+        clean = psf.model_var_sigma(theta, yy, xx)
 
     image = rng.poisson(clean).astype(float)
 
@@ -74,6 +111,7 @@ def simulate(
         amplitudes=amplitudes,
         background=background,
         sigma=sigma,
+        sigmas=sigmas,
     )
 
 

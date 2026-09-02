@@ -1,0 +1,186 @@
+# scripts/bench.py --amps bright mid --densities 0.015 0.034 --widths 0.0 0.2 0.4 --methods spotsolve spotsolve-roi
+# captured 2026-09-02T14:37:00Z from git ff651cc + the width arm
+
+=== bright (amp 900-1900 e-, peak SNR 11.9)  density 0.015  background=flat  sigma_spread=0.00 (6 seeds, 39x39) ===
+         method  Ntrue   Nest  recall    FP  close    <1s   1-2s   2-3s    >3s  med err   sd z  rsd z  |z|>3    dA/A  s/frame
+-----------------------------------------------------------------------------------------------------------------------------
+      spotsolve   23.0   22.5   0.978  0.00   0.00  0.667  0.966  1.000  1.000   0.0613   1.99   1.03   3.7%   +0.6%     0.21
+  spotsolve-roi   23.0   21.7   0.935  0.17   0.00  0.333  0.966  1.000  0.944   0.0627   1.82   1.05   3.5%   +0.6%     0.39
+
+=== bright (amp 900-1900 e-, peak SNR 11.9)  density 0.015  background=flat  sigma_spread=0.20 (6 seeds, 39x39) ===
+         method  Ntrue   Nest  recall    FP  close    <1s   1-2s   2-3s    >3s  med err   sd z  rsd z  |z|>3    dA/A  s/frame
+-----------------------------------------------------------------------------------------------------------------------------
+      spotsolve   23.0   31.8   0.971  9.50   0.17  0.667  0.931  1.000  1.000   0.1672   2.86   2.38  26.5%   -0.5%     0.41
+  spotsolve-roi   23.0   24.3   0.725  7.67   0.00  0.333  0.931  0.969  0.563   0.1836   3.08   2.95  26.5%   -2.6%     0.48
+
+         method  width bin     n  recall   tiled  dets/em  tiles/det
+--------------------------------------------------------------------
+      spotsolve       <.95    50   1.000    0.0%     1.00       1.00
+      spotsolve   .95-1.05    30   0.967    3.3%     1.00       1.03
+      spotsolve  1.05-1.25    41   0.976   39.0%     1.51       1.55
+      spotsolve   1.25-1.6    16   0.938   93.8%     2.56       2.56
+      spotsolve       >1.6     1   0.000    0.0%     0.00        nan
+  spotsolve-roi       <.95    50   0.600    0.0%     0.60       1.00
+  spotsolve-roi   .95-1.05    30   0.933    6.7%     1.00       1.07
+  spotsolve-roi  1.05-1.25    41   0.732   29.3%     1.07       1.47
+  spotsolve-roi   1.25-1.6    16   0.750   81.2%     2.12       2.62
+  spotsolve-roi       >1.6     1   0.000    0.0%     0.00        nan
+
+=== bright (amp 900-1900 e-, peak SNR 11.9)  density 0.015  background=flat  sigma_spread=0.40 (6 seeds, 39x39) ===
+         method  Ntrue   Nest  recall    FP  close    <1s   1-2s   2-3s    >3s  med err   sd z  rsd z  |z|>3    dA/A  s/frame
+-----------------------------------------------------------------------------------------------------------------------------
+      spotsolve   23.0   40.0   0.935 18.50   0.00  0.833  0.759  1.000  0.986   0.2871   3.72   3.10  38.0%   -4.4%     0.54
+  spotsolve-roi   23.0   26.3   0.674 10.83   0.00  0.500  0.759  0.938  0.535   0.3289   4.28   3.89  45.7%   -4.7%     0.54
+
+         method  width bin     n  recall   tiled  dets/em  tiles/det
+--------------------------------------------------------------------
+      spotsolve       <.95    59   0.983    0.0%     0.98       1.00
+      spotsolve   .95-1.05    13   0.923   15.4%     1.08       1.17
+      spotsolve  1.05-1.25    27   0.963   55.6%     1.63       1.69
+      spotsolve   1.25-1.6    24   0.958   87.5%     2.42       2.42
+      spotsolve       >1.6    15   0.667   53.3%     1.53       1.77
+  spotsolve-roi       <.95    59   0.661    0.0%     0.66       1.00
+  spotsolve-roi   .95-1.05    13   0.846    7.7%     0.92       1.09
+  spotsolve-roi  1.05-1.25    27   0.667   22.2%     0.89       1.33
+  spotsolve-roi   1.25-1.6    24   0.792   66.7%     1.88       2.25
+  spotsolve-roi       >1.6    15   0.400   60.0%     1.33       2.00
+
+=== bright (amp 900-1900 e-, peak SNR 11.9)  density 0.034  background=flat  sigma_spread=0.00 (6 seeds, 39x39) ===
+         method  Ntrue   Nest  recall    FP  close    <1s   1-2s   2-3s    >3s  med err   sd z  rsd z  |z|>3    dA/A  s/frame
+-----------------------------------------------------------------------------------------------------------------------------
+      spotsolve   52.0   49.2   0.942  0.17   0.00  0.562  0.960  1.000  1.000   0.0849   1.92   1.22   4.8%   +0.6%     0.55
+  spotsolve-roi   52.0   46.8   0.891  0.50   0.00  0.469  0.941  0.958  0.916   0.0951   2.63   1.44  11.2%   +0.2%     1.39
+
+=== bright (amp 900-1900 e-, peak SNR 11.9)  density 0.034  background=flat  sigma_spread=0.20 (6 seeds, 39x39) ===
+         method  Ntrue   Nest  recall    FP  close    <1s   1-2s   2-3s    >3s  med err   sd z  rsd z  |z|>3    dA/A  s/frame
+-----------------------------------------------------------------------------------------------------------------------------
+      spotsolve   52.0   64.8   0.942 15.83   0.17  0.594  0.960  0.990  1.000   0.2742   3.42   3.10  34.0%   +0.8%     1.06
+  spotsolve-roi   52.0   58.2   0.853 13.83   0.17  0.562  0.871  0.938  0.843   0.3291   4.15   3.29  36.8%   -6.3%     1.69
+
+         method  width bin     n  recall   tiled  dets/em  tiles/det
+--------------------------------------------------------------------
+      spotsolve       <.95   126   0.944    0.0%     0.94       1.00
+      spotsolve   .95-1.05    56   0.929    5.4%     0.98       1.06
+      spotsolve  1.05-1.25    90   0.944   40.0%     1.39       1.47
+      spotsolve   1.25-1.6    37   0.946   64.9%     1.84       1.89
+      spotsolve       >1.6     3   1.000  100.0%     3.00       3.00
+  spotsolve-roi       <.95   126   0.849    0.0%     0.85       1.00
+  spotsolve-roi   .95-1.05    56   0.911    5.4%     0.96       1.06
+  spotsolve-roi  1.05-1.25    90   0.867   31.1%     1.23       1.41
+  spotsolve-roi   1.25-1.6    37   0.784   45.9%     1.43       1.66
+  spotsolve-roi       >1.6     3   0.333   66.7%     1.33       2.00
+
+=== bright (amp 900-1900 e-, peak SNR 11.9)  density 0.034  background=flat  sigma_spread=0.40 (6 seeds, 39x39) ===
+         method  Ntrue   Nest  recall    FP  close    <1s   1-2s   2-3s    >3s  med err   sd z  rsd z  |z|>3    dA/A  s/frame
+-----------------------------------------------------------------------------------------------------------------------------
+      spotsolve   52.0   79.8   0.865 34.83   0.17  0.562  0.782  0.958  0.976   0.3334   4.62   3.62  42.0%   +3.6%     1.30
+  spotsolve-roi   52.0   60.3   0.782 19.67   0.00  0.562  0.752  0.865  0.807   0.3226   5.17   4.18  48.0%   +0.2%     1.55
+
+         method  width bin     n  recall   tiled  dets/em  tiles/det
+--------------------------------------------------------------------
+      spotsolve       <.95   140   0.943    0.7%     0.95       1.01
+      spotsolve   .95-1.05    25   0.880    4.0%     0.92       1.05
+      spotsolve  1.05-1.25    52   0.923   42.3%     1.44       1.56
+      spotsolve   1.25-1.6    59   0.797   67.8%     1.81       2.02
+      spotsolve       >1.6    36   0.583   33.3%     1.42       1.55
+  spotsolve-roi       <.95   140   0.843    0.0%     0.84       1.00
+  spotsolve-roi   .95-1.05    25   0.760    8.0%     0.84       1.11
+  spotsolve-roi  1.05-1.25    52   0.827   25.0%     1.08       1.30
+  spotsolve-roi   1.25-1.6    59   0.763   42.4%     1.31       1.60
+  spotsolve-roi       >1.6    36   0.528   25.0%     1.11       1.33
+
+=== mid (amp 200-400 e-, peak SNR 5.3)  density 0.015  background=flat  sigma_spread=0.00 (6 seeds, 39x39) ===
+         method  Ntrue   Nest  recall    FP  close    <1s   1-2s   2-3s    >3s  med err   sd z  rsd z  |z|>3    dA/A  s/frame
+-----------------------------------------------------------------------------------------------------------------------------
+      spotsolve   23.0   22.3   0.971  0.00   0.00  0.500  0.966  1.000  1.000   0.1549   1.30   1.03   2.2%   +1.1%     0.17
+  spotsolve-roi   23.0   21.2   0.920  0.00   0.00  0.500  0.862  0.906  0.986   0.1555   1.56   1.10   3.5%   +1.2%     0.24
+
+=== mid (amp 200-400 e-, peak SNR 5.3)  density 0.015  background=flat  sigma_spread=0.20 (6 seeds, 39x39) ===
+         method  Ntrue   Nest  recall    FP  close    <1s   1-2s   2-3s    >3s  med err   sd z  rsd z  |z|>3    dA/A  s/frame
+-----------------------------------------------------------------------------------------------------------------------------
+      spotsolve   23.0   22.7   0.942  1.00   0.00  0.500  0.828  1.000  1.000   0.1941   1.75   1.44   7.7%   +0.7%     0.18
+  spotsolve-roi   23.0   20.3   0.848  0.83   0.00  0.500  0.724  0.938  0.887   0.2172   1.85   1.45   9.0%   +0.4%     0.25
+
+         method  width bin     n  recall   tiled  dets/em  tiles/det
+--------------------------------------------------------------------
+      spotsolve       <.95    50   0.960    0.0%     0.96       1.00
+      spotsolve   .95-1.05    30   0.933    0.0%     0.93       1.00
+      spotsolve  1.05-1.25    41   0.951    2.4%     0.98       1.03
+      spotsolve   1.25-1.6    16   0.938   12.5%     1.12       1.12
+      spotsolve       >1.6     1   0.000    0.0%     0.00        nan
+  spotsolve-roi       <.95    50   0.820    0.0%     0.82       1.00
+  spotsolve-roi   .95-1.05    30   0.933    0.0%     0.93       1.00
+  spotsolve-roi  1.05-1.25    41   0.878    2.4%     0.90       1.03
+  spotsolve-roi   1.25-1.6    16   0.750    6.2%     0.81       1.08
+  spotsolve-roi       >1.6     1   0.000    0.0%     0.00        nan
+
+=== mid (amp 200-400 e-, peak SNR 5.3)  density 0.015  background=flat  sigma_spread=0.40 (6 seeds, 39x39) ===
+         method  Ntrue   Nest  recall    FP  close    <1s   1-2s   2-3s    >3s  med err   sd z  rsd z  |z|>3    dA/A  s/frame
+-----------------------------------------------------------------------------------------------------------------------------
+      spotsolve   23.0   24.8   0.906  4.00   0.00  0.500  0.793  0.969  0.958   0.3145   2.09   2.01  12.8%   +0.2%     0.24
+  spotsolve-roi   23.0   17.7   0.688  1.83   0.00  0.333  0.655  0.906  0.634   0.2876   2.19   1.95  13.7%   +0.3%     0.22
+
+         method  width bin     n  recall   tiled  dets/em  tiles/det
+--------------------------------------------------------------------
+      spotsolve       <.95    59   0.966    0.0%     0.97       1.00
+      spotsolve   .95-1.05    13   0.923    0.0%     0.92       1.00
+      spotsolve  1.05-1.25    27   0.889   18.5%     1.07       1.21
+      spotsolve   1.25-1.6    24   1.000   25.0%     1.29       1.29
+      spotsolve       >1.6    15   0.533   13.3%     0.80       1.20
+  spotsolve-roi       <.95    59   0.712    0.0%     0.71       1.00
+  spotsolve-roi   .95-1.05    13   0.923    0.0%     0.92       1.00
+  spotsolve-roi  1.05-1.25    27   0.704    3.7%     0.74       1.05
+  spotsolve-roi   1.25-1.6    24   0.708    4.2%     0.75       1.06
+  spotsolve-roi       >1.6    15   0.333    6.7%     0.60       1.12
+
+=== mid (amp 200-400 e-, peak SNR 5.3)  density 0.034  background=flat  sigma_spread=0.00 (6 seeds, 39x39) ===
+         method  Ntrue   Nest  recall    FP  close    <1s   1-2s   2-3s    >3s  med err   sd z  rsd z  |z|>3    dA/A  s/frame
+-----------------------------------------------------------------------------------------------------------------------------
+      spotsolve   52.0   47.8   0.910  0.50   0.00  0.469  0.891  1.000  1.000   0.2136   1.75   1.33   6.9%   +2.5%     0.52
+  spotsolve-roi   52.0   46.3   0.878  0.67   0.00  0.469  0.851  0.958  0.976   0.2366   2.15   1.44  11.1%   +2.5%     0.78
+
+=== mid (amp 200-400 e-, peak SNR 5.3)  density 0.034  background=flat  sigma_spread=0.20 (6 seeds, 39x39) ===
+         method  Ntrue   Nest  recall    FP  close    <1s   1-2s   2-3s    >3s  med err   sd z  rsd z  |z|>3    dA/A  s/frame
+-----------------------------------------------------------------------------------------------------------------------------
+      spotsolve   52.0   50.8   0.894  4.33   0.00  0.531  0.842  0.979  1.000   0.3177   2.34   1.95  15.4%   +6.6%     0.64
+  spotsolve-roi   52.0   46.0   0.824  3.17   0.00  0.469  0.782  0.927  0.892   0.3353   2.31   1.85  15.6%   +2.7%     0.88
+
+         method  width bin     n  recall   tiled  dets/em  tiles/det
+--------------------------------------------------------------------
+      spotsolve       <.95   126   0.913    0.8%     0.92       1.01
+      spotsolve   .95-1.05    56   0.839    1.8%     0.86       1.02
+      spotsolve  1.05-1.25    90   0.911   10.0%     1.02       1.12
+      spotsolve   1.25-1.6    37   0.865   21.6%     1.14       1.24
+      spotsolve       >1.6     3   1.000    0.0%     1.00       1.00
+  spotsolve-roi       <.95   126   0.857    0.8%     0.87       1.01
+  spotsolve-roi   .95-1.05    56   0.821    0.0%     0.82       1.00
+  spotsolve-roi  1.05-1.25    90   0.822    8.9%     0.92       1.11
+  spotsolve-roi   1.25-1.6    37   0.730    8.1%     0.84       1.11
+  spotsolve-roi       >1.6     3   0.667    0.0%     0.67       1.00
+
+=== mid (amp 200-400 e-, peak SNR 5.3)  density 0.034  background=flat  sigma_spread=0.40 (6 seeds, 39x39) ===
+         method  Ntrue   Nest  recall    FP  close    <1s   1-2s   2-3s    >3s  med err   sd z  rsd z  |z|>3    dA/A  s/frame
+-----------------------------------------------------------------------------------------------------------------------------
+      spotsolve   52.0   51.2   0.808  9.17   0.00  0.500  0.683  0.958  0.904   0.3149   2.62   2.06  19.0%  +10.2%     0.73
+  spotsolve-roi   52.0   39.5   0.663  5.00   0.00  0.406  0.574  0.802  0.711   0.3075   2.63   2.08  18.6%   +7.6%     0.68
+
+         method  width bin     n  recall   tiled  dets/em  tiles/det
+--------------------------------------------------------------------
+      spotsolve       <.95   140   0.921    0.0%     0.92       1.00
+      spotsolve   .95-1.05    25   0.880    0.0%     0.88       1.00
+      spotsolve  1.05-1.25    52   0.827   11.5%     0.96       1.14
+      spotsolve   1.25-1.6    59   0.712   15.3%     1.02       1.20
+      spotsolve       >1.6    36   0.444   16.7%     0.86       1.24
+  spotsolve-roi       <.95   140   0.779    0.7%     0.79       1.01
+  spotsolve-roi   .95-1.05    25   0.760    0.0%     0.76       1.00
+  spotsolve-roi  1.05-1.25    52   0.673    5.8%     0.73       1.09
+  spotsolve-roi   1.25-1.6    59   0.593    6.8%     0.76       1.12
+  spotsolve-roi       >1.6    36   0.250    2.8%     0.42       1.07
+
+recall columns are per true-emitter isolation (nn distance, in sigma)
+sd z / rsd z: pull spread, 1.00 = at the CRLB; |z|>3 ideal 0.3%
+width bins are sigma_true/sigma_model; `tiled` is the share of true emitters
+collecting 2 or more detections, `dets/em` the mean count (within 2 sigma).
+`tiles/det` is that mean over emitters that got ANY detection -- the tiling rate
+with the seeder's recall divided out, and the only one of the three an
+anti-tiling move can improve without simply missing the object.

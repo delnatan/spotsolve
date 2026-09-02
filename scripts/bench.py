@@ -6,7 +6,14 @@ success. In particular recall is reported PER ISOLATION BIN, because a
 frame-level recall is dominated by the easy majority and is insensitive to
 exactly the regime under test.
 
+There is a second reason for the column layout: every arm rendered every
+emitter at the model's own sigma until 2026-09-02, so no measurement in
+`docs/baseline/bench.txt` contained a single mis-widthed source -- and width
+mismatch is the one thing the real movies show. `--widths` adds it. See
+`simulate.simulate`'s `sigma_spread` for the measurement that sets the arms.
+
     python bench.py --seeds 6
+    python bench.py --widths 0.0 0.2 0.4 --densities 0.015
 """
 
 import argparse
@@ -48,6 +55,23 @@ def peak_snr(amp=AMP, sigma=SIGMA, bg=BG_E):
 BINS = [(0.0, 1.0, "<1s"), (1.0, 2.0, "1-2s"), (2.0, 3.0, "2-3s"),
         (3.0, np.inf, ">3s")]
 
+# Ratio of a true emitter's own width to the model's. The edges are where the
+# behaviour changes, not round numbers: tiling is one-sided and switches on at
+# about 1.1 (measured, `simulate.simulate`), so 0.95-1.05 is the matched core,
+# 1.05-1.25 the shoulder where it starts, and 1.25-1.60 where 85% of emitters
+# collect a second detection. Emitters NARROWER than the model never tile,
+# which is why everything below 0.95 is one bin.
+WIDTH_BINS = [(0.0, 0.95, "<.95"), (0.95, 1.05, ".95-1.05"),
+              (1.05, 1.25, "1.05-1.25"), (1.25, 1.60, "1.25-1.6"),
+              (1.60, np.inf, ">1.6")]
+
+# Radius, in sigma, within which a detection is attributed to a true emitter
+# for the tiling count. Wide enough to catch the pieces a tiled object is cut
+# into (they sit inside the object), narrow enough that at the densities run
+# here ownership is unambiguous. It is NOT the matching radius: recall in every
+# table below uses `greedy_match` at `--radius`, so the two rules never mix.
+TILE_R = 2.0
+
 
 def background_surface(shape, kind, seed):
     """Ground-truth background, in photoelectrons.
@@ -79,12 +103,18 @@ def background_surface(shape, kind, seed):
     raise ValueError(kind)
 
 
-def field(size, density, seed, bg="flat", amp=AMP):
-    """Emitters on a (possibly structured) background, Poisson-sampled."""
+def field(size, density, seed, bg="flat", amp=AMP, sigma_spread=0.0):
+    """Emitters on a (possibly structured) background, Poisson-sampled.
+
+    `simulate` draws the widths after the positions and amplitudes, so raising
+    `sigma_spread` at a fixed seed gives the SAME field with only the widths
+    changed. The width arms are therefore paired with the spread-0 arm rather
+    than being an independent sample of it.
+    """
     n = max(1, int(round(density * size * size)))
     sim = simulate.simulate(shape=(size, size), n_emitters=n, background=0.0,
                             amplitude_range=amp, sigma=SIGMA, border=1.0,
-                            seed=seed)
+                            sigma_spread=sigma_spread, seed=seed)
     surf = background_surface((size, size), bg, seed)
     rng = np.random.default_rng(50_000 + seed)
     # `sim.clean` carries the emitters with a zero background, so the sum is
@@ -153,7 +183,51 @@ def evaluate(r, sim, radius, pile_sep):
     return dict(n_true=len(truth), n_est=len(r.positions), matched=len(pairs),
                 fp=len(r.positions) - len(pairs), per_bin=per_bin,
                 z=np.array(zs), d=np.array(dists), damp=np.array(damp),
-                close=close)
+                close=close, per_width=per_width(r, sim, matched_t))
+
+
+def per_width(r, sim, matched_t):
+    """(recalled, tiled, n_det, n_emitters) per width bin, or None.
+
+    Two quantities per bin, and they answer different questions:
+
+      recalled  did the emitter get a detection at all -- the SAME
+                `greedy_match` verdict the main table reports, only regrouped
+                by the emitter's own width instead of by its isolation.
+      tiled     did it get MORE than one. This is the failure width causes,
+                and no column of the main table isolates it: a tiled object
+                is recalled, so recall barely moves while `Nest` and `FP`
+                absorb the damage without saying where it came from.
+      tiles/det the mean count over emitters that got ANY detection. This is
+                the column that decides whether an anti-tiling move works,
+                because `dets/em` and `FP` cannot tell "the move merged the
+                tiles" from "the seeder never found the object". A method
+                that simply misses wide emitters scores well on both of those
+                and unchanged on this one.
+
+    Attribution is nearest-truth within `TILE_R`, which is a different rule
+    from the matcher and deliberately so -- the extra pieces of a tiled object
+    are exactly the detections the 1-1 matcher has no truth left to assign.
+    """
+    if sim.sigmas is None:
+        return None
+    truth, ratio = sim.positions, sim.sigmas / sim.sigma
+    n_det = np.zeros(len(truth), int)
+    if len(r.positions) and len(truth):
+        d = np.linalg.norm(r.positions[:, None, :] - truth[None, :, :], axis=-1)
+        owner = np.argmin(d, axis=1)
+        for i, j in enumerate(owner):
+            if d[i, j] <= TILE_R * SIGMA:
+                n_det[j] += 1
+    out = {}
+    for lo, hi, nm in WIDTH_BINS:
+        sel = np.nonzero((ratio >= lo) & (ratio < hi))[0]
+        if len(sel):
+            got = n_det[sel] >= 1
+            out[nm] = (int(sum(1 for j in sel if j in matched_t)),
+                       int(np.sum(n_det[sel] >= 2)), int(n_det[sel].sum()),
+                       len(sel), int(got.sum()))
+    return out
 
 
 def aggregate(rs):
@@ -178,6 +252,16 @@ def aggregate(rs):
         got = sum(r["per_bin"].get(nm, (0, 0))[0] for r in rs)
         tot = sum(r["per_bin"].get(nm, (0, 0))[1] for r in rs)
         out[nm] = got / tot if tot else np.nan
+    out["per_width"] = None
+    if rs and rs[0]["per_width"] is not None:
+        w = {}
+        for _, _, nm in WIDTH_BINS:
+            c = np.array([r["per_width"].get(nm, (0, 0, 0, 0, 0))
+                          for r in rs]).sum(0)
+            if c[3]:
+                w[nm] = (c[0] / c[3], c[1] / c[3], c[2] / c[3], int(c[3]),
+                         c[2] / c[4] if c[4] else np.nan)
+        out["per_width"] = w
     return out
 
 
@@ -214,33 +298,60 @@ def main(args):
            + f" {'med err':>8} {'sd z':>6} {'rsd z':>6} {'|z|>3':>6} "
              f"{'dA/A':>7} {'s/frame':>8}")
 
+    whdr = (f"{'method':>15} {'width bin':>10} {'n':>5} {'recall':>7} "
+            f"{'tiled':>7} {'dets/em':>8} {'tiles/det':>10}")
+
     for arm in args.amps:
         amp = AMP_ARMS[arm]
         for dens in args.densities:
-            print(f"\n=== {arm} (amp {amp[0]:.0f}-{amp[1]:.0f} e-, peak SNR "
-                  f"{peak_snr(amp):.1f})  density {dens:.3f}  "
-                  f"background={args.bg} "
-                  f"({args.seeds} seeds, {args.size}x{args.size}) ===")
-            print(hdr)
-            print("-" * len(hdr))
-            for name, fn in methods.items():
-                rs, t0 = [], time.perf_counter()
-                for s in range(args.seeds):
-                    sim, adu = field(args.size, dens, 2000 + s, bg=args.bg,
-                                     amp=amp)
-                    rs.append(evaluate(fn(adu), sim, args.radius,
-                                       args.pile_sep))
-                el = (time.perf_counter() - t0) / args.seeds
-                a = aggregate(rs)
-                print(f"{name:>15} {a['n_true']:6.1f} {a['n_est']:6.1f} "
-                      f"{a['recall']:7.3f} {a['fp']:5.2f} {a['close']:6.2f} "
-                      + " ".join(f"{a[nm]:6.3f}" for _, _, nm in BINS)
-                      + f" {a['med']:8.4f} {a['sdz']:6.2f} {a['rsdz']:6.2f} "
-                        f"{100 * a['tail']:5.1f}% {100 * a['damp']:+6.1f}% "
-                        f"{el:8.2f}")
+            for spread in args.widths:
+                print(f"\n=== {arm} (amp {amp[0]:.0f}-{amp[1]:.0f} e-, peak SNR "
+                      f"{peak_snr(amp):.1f})  density {dens:.3f}  "
+                      f"background={args.bg}  sigma_spread={spread:.2f} "
+                      f"({args.seeds} seeds, {args.size}x{args.size}) ===")
+                print(hdr)
+                print("-" * len(hdr))
+                widths = {}
+                for name, fn in methods.items():
+                    rs, t0 = [], time.perf_counter()
+                    for s in range(args.seeds):
+                        sim, adu = field(args.size, dens, 2000 + s, bg=args.bg,
+                                         amp=amp, sigma_spread=spread)
+                        rs.append(evaluate(fn(adu), sim, args.radius,
+                                           args.pile_sep))
+                    el = (time.perf_counter() - t0) / args.seeds
+                    a = aggregate(rs)
+                    widths[name] = a["per_width"]
+                    print(f"{name:>15} {a['n_true']:6.1f} {a['n_est']:6.1f} "
+                          f"{a['recall']:7.3f} {a['fp']:5.2f} {a['close']:6.2f} "
+                          + " ".join(f"{a[nm]:6.3f}" for _, _, nm in BINS)
+                          + f" {a['med']:8.4f} {a['sdz']:6.2f} {a['rsdz']:6.2f} "
+                            f"{100 * a['tail']:5.1f}% {100 * a['damp']:+6.1f}% "
+                            f"{el:8.2f}")
+                if spread > 0:
+                    print(f"\n{whdr}")
+                    print("-" * len(whdr))
+                    for name, w in widths.items():
+                        for _, _, nm in WIDTH_BINS:
+                            if w and nm in w:
+                                rc, ti, dp, n, td = w[nm]
+                                print(f"{name:>15} {nm:>10} {n:5d} {rc:7.3f} "
+                                      f"{100 * ti:6.1f}% {dp:8.2f} "
+                                      f"{td:10.2f}")
 
     print("\nrecall columns are per true-emitter isolation (nn distance, in sigma)")
     print("sd z / rsd z: pull spread, 1.00 = at the CRLB; |z|>3 ideal 0.3%")
+    if any(s > 0 for s in args.widths):
+        print("width bins are sigma_true/sigma_model; `tiled` is the share of "
+              "true emitters")
+        print("collecting 2 or more detections, `dets/em` the mean count "
+              f"(within {TILE_R:.0f} sigma).")
+        print("`tiles/det` is that mean over emitters that got ANY detection "
+              "-- the tiling rate")
+        print("with the seeder's recall divided out, and the only one of the "
+              "three an")
+        print("anti-tiling move can improve without simply missing the "
+              "object.")
 
 
 if __name__ == "__main__":
@@ -255,6 +366,11 @@ if __name__ == "__main__":
                     choices=sorted(AMP_ARMS),
                     help="amplitude arms to run; `bright` alone hides the "
                          "low-SNR recall cliff (see AMP_ARMS)")
+    ap.add_argument("--widths", type=float, nargs="*", default=[0.0],
+                    help="per-emitter sigma spreads (lognormal sd in log "
+                         "space) to run. 0.0 is every arm captured before "
+                         "2026-09-02; 0.2 and 0.4 bracket the real bead data "
+                         "(see simulate.simulate)")
     ap.add_argument("--radius", type=float, default=1.5)
     ap.add_argument("--pile-sep", type=float, default=SIGMA)
     ap.add_argument("--methods", nargs="*", default=None)

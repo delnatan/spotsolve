@@ -542,13 +542,60 @@ By construction, not by a tolerance:
 There is no fixed point to chase. `max_rounds` and `max_settle` are backstops
 that should not fire.
 
+**They fire.** That argument is sound about *monotonicity* and wrong about
+*termination*, because the second bullet assumes the candidate list empties.
+Measured on 69 of 69 frames of both movies, `n_rounds == max_rounds == 6`
+every time (`docs/baseline/truncation.txt`):
+
+| movie | N at max_rounds 6 → 12 → 20 | last round's added+split |
+|---|---|---|
+| `beads_80pct-glycerol` | 1167 → 1213 → **1235** | 0+26 → 0+4 → 0+0 |
+| `hyp7gem_wt_04` | 4269 → 4517 → **4738** | 0+100 → 0+37 → **0+31** |
+
+`hyp7gem` has not converged at 20 rounds. In every late round **adds are zero
+and splits are everything**: the loop is not discovering emitters, it is
+subdividing objects the fixed-σ model cannot represent, one PSF at a time. An
+object wider than σ leaves a residual no single PSF can flatten, so the list
+refills as fast as it empties. Section 12's width arm reproduces this in
+synthetic data with ground truth.
+
 ## 12. The acceptance tests
 
-Three, in increasing order of authority.
+Four, in increasing order of authority.
 
 **Recall by isolation bin.** A frame-level recall is dominated by the easy
 majority and is blind to the only regime in question. `scripts/bench.py` breaks it out
 by each *true* emitter's distance to its nearest neighbour.
+
+**Recall and tiling by width bin** (`bench.py --widths`). Every arm rendered
+every emitter at the model's own σ until 2026-09-02, so no measurement in
+`docs/baseline/bench.txt` contained a single mis-widthed source — and width
+mismatch is the one thing the real movies show. It is also the most damaging
+axis in the benchmark by a wide margin. At the *easiest* arm (bright, density
+0.015, flat), raising the per-emitter σ spread alone:
+
+```
+spread   Nest   recall     FP   med err   rsd z   |z|>3
+  0.00   22.5    0.978   0.00    0.0613    1.03    3.7%
+  0.20   31.8    0.971   9.50    0.1672    2.38   26.5%
+  0.40   40.0    0.935  18.50    0.2871    3.10   38.0%
+```
+
+For scale: sweeping density 0.015 → 0.055 at spread 0 takes FP from 0.00 to
+1.00, and sweeping SNR from `bright` to `dim` leaves it under 1. **Recall is
+nearly blind to it** — it moves 4 points while FP goes from zero to eighteen.
+The damage is one-sided and monotone in each emitter's own width: below 1.05×
+nothing tiles, at 1.25–1.6× about 90% of emitters collect a second detection.
+Read `tiles/det`, not `dets/em` or `FP`. The other two cannot tell "the move
+merged the tiles" from "the seeder never found the object", and on the first
+run of this arm that distinction decided the answer: `spotsolve-roi` appears to
+halve FP under width mismatch (18.50 → 10.83 at bright/0.015, spread 0.40), but
+with recall divided out its genuine anti-tiling effect is **0–21%** and negative
+in two cells, because its matched-filter seeder finds only 0.67–0.79 of the wide
+emitters against the round loop's 0.92–0.96. The same seeder loses 34–40 points
+of recall on emitters *narrower* than σ, which defocus cannot produce and which
+never tile in either method — the attenuation is two-sided even though the
+failure it is aimed at is not.
 
 **The pull statistic** (`scripts/crlb.py`). `z = (estimate − truth) / reported SE`, per
 axis. An estimator at the CRLB with an honest Fisher matrix gives spread 1.00
@@ -556,6 +603,17 @@ and 0.3% beyond `|z| = 3`. The tool also runs an **oracle** arm — `refine` fro
 the true positions at the true N with the true background — so the gap between
 arms is exactly what the search costs, and a deficit can be attributed to the
 estimator or to the search rather than guessed at.
+
+Both arms report one row per **true emitter**, and `match%` says what share of
+the bin each pull column rests on. Until 2026-09-02 the pipeline arm reported
+one row per *matched detection*, so the `<1s` rows compared 118 unconditioned
+truths against the 63 the search had already resolved. That is why the
+pipeline's `med err` read *better* than the oracle's (0.286 against 0.329) while
+being 4.8× overconfident, and it biased against every change that helps:
+resolving more close pairs admits the harder ones. The `d_nn` column — distance
+from each true emitter to the nearest estimate, over all of them — has the same
+denominator in both arms and inverts that verdict: 0.366 against the oracle's
+0.290.
 
 Do **not** use `err / CRLB`; that column has a built-in `sqrt(2)`.
 
@@ -670,8 +728,27 @@ widening its SE honestly, is the next real problem. Seen from the flux side it
 is an over-bright detection at ratio ≈ 2 (section 10b), which is why that
 section's 20× cut does not find it.
 
-**Sub-σ recall is ~0.52 and neither solver does better.** At the identifiability
-limit. Not obviously fixable.
+**Sub-σ recall is ~0.52 and neither solver does better.** ~~At the
+identifiability limit. Not obviously fixable.~~ Wrong: the Fisher information
+is not the limit. CRLB on pair separation at bead flux gives `d/SE(d)` of
+2.7–4.2 at 0.5σ (`docs/baseline/crlb.txt`). The block is three constants in
+series — the amplitude prior, `COND_GUARD` and `PRUNE_TAU` — and relaxing any
+one alone changes final N by nothing. Measure final N, never stage acceptance.
+
+**The Laplace volume term omits the prior's curvature.**
+`evidence._log_bf_add_from_logdet` builds the Occam factor from `log|F|` with
+`F = Jᵀ W J`, the *likelihood* Fisher, where the Laplace evidence wants the
+negative Hessian of the log *posterior*, `log|F + Λ|`. Under the old
+`Exp(1/A_s)` prior `log g(A)` is linear in `A`, so `Λ = 0` exactly and the
+omission was correct. The NPMLE `MixturePrior` is curved and it no longer is:
+including `Λ` moves `log BF` for a 0.5σ split by −4.0 nats under a
+`U(900,1900)` population and −5.8 under a tight one, ~0 under a broad one. A
+degenerate configuration currently collects an Occam *bonus* from its own
+ill-conditioning, and `Λ` is the term that regularizes it — which makes
+`COND_GUARD` a hard cutoff standing in for a term that belongs in the formula.
+Fixing it makes sub-σ splits **harder**, not easier. `verify_evidence`'s 4-D
+quadrature check cannot see this: it passes a scalar `A_s`, which
+`_as_prior` turns back into `ExponentialFlux`.
 
 **Amplitudes run 110–113% of frame flux on the bead data.** Tracks density
 (+1.0% at 0.034, +2.2% at 0.055 on a perfectly flat background), so it points at
