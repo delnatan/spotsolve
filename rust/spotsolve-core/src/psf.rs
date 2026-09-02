@@ -54,6 +54,13 @@ pub fn n_emitters(theta: &[f64]) -> usize {
     (theta.len() - 1) / 3
 }
 
+/// Number of emitters in a variable-sigma `theta` of length `4K+1`.
+#[inline]
+pub fn n_emitters_var(theta: &[f64]) -> usize {
+    debug_assert!(theta.len() % 4 == 1, "theta length must be 4K+1");
+    (theta.len() - 1) / 4
+}
+
 #[inline]
 pub fn background(theta: &[f64]) -> f64 {
     theta[0]
@@ -71,6 +78,23 @@ pub fn cx(theta: &[f64], k: usize) -> f64 {
     theta[3 + 3 * k]
 }
 
+#[inline]
+pub fn amp_var(theta: &[f64], k: usize) -> f64 {
+    theta[1 + 4 * k]
+}
+#[inline]
+pub fn cy_var(theta: &[f64], k: usize) -> f64 {
+    theta[2 + 4 * k]
+}
+#[inline]
+pub fn cx_var(theta: &[f64], k: usize) -> f64 {
+    theta[3 + 4 * k]
+}
+#[inline]
+pub fn sigma_var(theta: &[f64], k: usize) -> f64 {
+    theta[4 + 4 * k]
+}
+
 /// Build a flat `theta` from a background and per-emitter arrays.
 pub fn pack(b: f64, a: &[f64], ys: &[f64], xs: &[f64]) -> Vec<f64> {
     assert_eq!(a.len(), ys.len());
@@ -81,6 +105,22 @@ pub fn pack(b: f64, a: &[f64], ys: &[f64], xs: &[f64]) -> Vec<f64> {
         t.push(a[k]);
         t.push(ys[k]);
         t.push(xs[k]);
+    }
+    t
+}
+
+/// Build a variable-sigma theta `[b, A0, y0, x0, sigma0, ...]`.
+pub fn pack_var(b: f64, a: &[f64], ys: &[f64], xs: &[f64], sigmas: &[f64]) -> Vec<f64> {
+    assert_eq!(a.len(), ys.len());
+    assert_eq!(a.len(), xs.len());
+    assert_eq!(a.len(), sigmas.len());
+    let mut t = Vec::with_capacity(4 * a.len() + 1);
+    t.push(b);
+    for k in 0..a.len() {
+        t.push(a[k]);
+        t.push(ys[k]);
+        t.push(xs[k]);
+        t.push(sigmas[k]);
     }
     t
 }
@@ -110,10 +150,15 @@ pub struct Factors {
     pub ex: Vec<f64>,
     /// `d ex / d cx`, same layout
     pub dex: Vec<f64>,
+    /// `d ey / d sigma` and `d ex / d sigma`, same layouts; only used by the
+    /// variable-sigma diagnostic path.
+    pub dsy: Vec<f64>,
+    pub dsx: Vec<f64>,
     /// unpacked amplitudes and centres, compact over `k`
     pub a: Vec<f64>,
     pub cy: Vec<f64>,
     pub cx: Vec<f64>,
+    pub sigma: Vec<f64>,
 }
 
 impl Factors {
@@ -123,9 +168,12 @@ impl Factors {
             dey: vec![0.0; h * k_max],
             ex: vec![0.0; w * k_max],
             dex: vec![0.0; w * k_max],
+            dsy: vec![0.0; h * k_max],
+            dsx: vec![0.0; w * k_max],
             a: vec![0.0; k_max],
             cy: vec![0.0; k_max],
             cx: vec![0.0; k_max],
+            sigma: vec![0.0; k_max],
         }
     }
 
@@ -146,9 +194,12 @@ impl Factors {
         grow(&mut self.dey, h * k);
         grow(&mut self.ex, w * k);
         grow(&mut self.dex, w * k);
+        grow(&mut self.dsy, h * k);
+        grow(&mut self.dsx, w * k);
         grow(&mut self.a, k);
         grow(&mut self.cy, k);
         grow(&mut self.cx, k);
+        grow(&mut self.sigma, k);
     }
 
     /// Copy the per-emitter values out of `theta` into the compact arrays.
@@ -158,6 +209,17 @@ impl Factors {
             self.a[i] = amp(theta, i);
             self.cy[i] = cy(theta, i);
             self.cx[i] = cx(theta, i);
+        }
+    }
+
+    /// Copy per-emitter values out of a variable-sigma theta.
+    pub fn unpack_var(&mut self, theta: &[f64]) {
+        let k = n_emitters_var(theta);
+        for i in 0..k {
+            self.a[i] = amp_var(theta, i);
+            self.cy[i] = cy_var(theta, i);
+            self.cx[i] = cx_var(theta, i);
+            self.sigma[i] = sigma_var(theta, i);
         }
     }
 }
@@ -345,6 +407,93 @@ pub fn model_and_jac_ax(
                     j[q_a + off + c] = v;
                     j[q_y + off + c] = a_de * ex_c;
                     j[q_x + off + c] = a_e * dex[c];
+                    m[off + c] += a * v;
+                }
+            }
+        }
+    }
+    if let Some(hl) = halo {
+        debug_assert_eq!(hl.len(), n);
+        for (v, &x) in m.iter_mut().zip(hl) {
+            *v += x;
+        }
+    }
+}
+
+/// Model and Jacobian with one sigma parameter per emitter.
+///
+/// `theta` is `[b, A0, y0, x0, sigma0, ...]`, and `j` is parameter-major with
+/// `p = 4K+1`. This is for the post-hoc out-of-focus filtering stage; the
+/// fixed-sigma detector does not call it.
+pub fn model_and_jac_var_sigma_ax(
+    theta: &[f64],
+    ay: &[f64],
+    ax: &[f64],
+    halo: Option<&[f64]>,
+    f: &mut Factors,
+    m: &mut [f64],
+    j: &mut [f64],
+) {
+    let (h, w) = (ay.len(), ax.len());
+    let n = h * w;
+    let k = n_emitters_var(theta);
+    let p = 4 * k + 1;
+    let b = background(theta);
+    debug_assert_eq!(m.len(), n);
+    debug_assert_eq!(j.len(), p * n);
+
+    for v in j[..n].iter_mut() {
+        *v = 1.0;
+    }
+    for v in m.iter_mut() {
+        *v = b;
+    }
+    if k > 0 {
+        f.unpack_var(theta);
+        for kk in 0..k {
+            let a = f.a[kk];
+            let sigma = f.sigma[kk];
+            factors_axis_sigma(
+                ay,
+                &f.cy[kk..kk + 1],
+                sigma,
+                &mut f.ey[kk * h..kk * h + h],
+                &mut f.dey[kk * h..kk * h + h],
+                &mut f.dsy[kk * h..kk * h + h],
+            );
+            factors_axis_sigma(
+                ax,
+                &f.cx[kk..kk + 1],
+                sigma,
+                &mut f.ex[kk * w..kk * w + w],
+                &mut f.dex[kk * w..kk * w + w],
+                &mut f.dsx[kk * w..kk * w + w],
+            );
+            let ey = &f.ey[kk * h..kk * h + h];
+            let dey = &f.dey[kk * h..kk * h + h];
+            let dsy = &f.dsy[kk * h..kk * h + h];
+            let ex = &f.ex[kk * w..kk * w + w];
+            let dex = &f.dex[kk * w..kk * w + w];
+            let dsx = &f.dsx[kk * w..kk * w + w];
+            let (q_a, q_y, q_x, q_s) = (
+                (1 + 4 * kk) * n,
+                (2 + 4 * kk) * n,
+                (3 + 4 * kk) * n,
+                (4 + 4 * kk) * n,
+            );
+            for r in 0..h {
+                let (e_r, de_r, ds_r) = (ey[r], dey[r], dsy[r]);
+                let a_e = a * e_r;
+                let a_de = a * de_r;
+                let a_ds = a * ds_r;
+                let off = r * w;
+                for c in 0..w {
+                    let ex_c = ex[c];
+                    let v = e_r * ex_c;
+                    j[q_a + off + c] = v;
+                    j[q_y + off + c] = a_de * ex_c;
+                    j[q_x + off + c] = a_e * dex[c];
+                    j[q_s + off + c] = a_ds * ex_c + a_e * dsx[c];
                     m[off + c] += a * v;
                 }
             }

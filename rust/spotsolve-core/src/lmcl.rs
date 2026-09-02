@@ -67,7 +67,11 @@ impl Bounds {
             .zip(hi)
             .map(|(&l, &h)| INTERIOR_FRAC * (h - l).max(1e-12))
             .collect();
-        Self { lo: lo.to_vec(), hi: hi.to_vec(), margin }
+        Self {
+            lo: lo.to_vec(),
+            hi: hi.to_vec(),
+            margin,
+        }
     }
 
     #[inline]
@@ -89,7 +93,8 @@ impl Bounds {
 
     #[inline]
     fn pull_inside(&self, i: usize, v: f64) -> f64 {
-        v.max(self.lo[i] + self.margin[i]).min(self.hi[i] - self.margin[i])
+        v.max(self.lo[i] + self.margin[i])
+            .min(self.hi[i] - self.margin[i])
     }
 }
 
@@ -104,7 +109,13 @@ pub struct Interior(Vec<f64>);
 impl Interior {
     pub fn new(theta: &[f64], b: &Bounds) -> Self {
         assert_eq!(theta.len(), b.len());
-        Interior(theta.iter().enumerate().map(|(i, &v)| b.pull_inside(i, v)).collect())
+        Interior(
+            theta
+                .iter()
+                .enumerate()
+                .map(|(i, &v)| b.pull_inside(i, v))
+                .collect(),
+        )
     }
 
     /// `self <- interior(base + delta)`. The only way to advance an iterate.
@@ -115,7 +126,11 @@ impl Interior {
         debug_assert_eq!(delta.len(), b.len());
         self.0.clear();
         self.0.extend(
-            base.0.iter().zip(delta).enumerate().map(|(i, (&t, &d))| b.pull_inside(i, t + d)),
+            base.0
+                .iter()
+                .zip(delta)
+                .enumerate()
+                .map(|(i, (&t, &d))| b.pull_inside(i, t + d)),
         );
     }
 
@@ -126,7 +141,8 @@ impl Interior {
     pub fn set_from(&mut self, theta: &[f64], b: &Bounds) {
         assert_eq!(theta.len(), b.len());
         self.0.clear();
-        self.0.extend(theta.iter().enumerate().map(|(i, &v)| b.pull_inside(i, v)));
+        self.0
+            .extend(theta.iter().enumerate().map(|(i, &v)| b.pull_inside(i, v)));
     }
 
     pub fn copy_from(&mut self, other: &Interior) {
@@ -191,7 +207,13 @@ pub struct FitOpts {
 
 impl Default for FitOpts {
     fn default() -> Self {
-        Self { max_iter: 100, tol_obj: 1e-8, tol_grad: 1e-6, tol_step: 1e-10, lambda0: 1e-2 }
+        Self {
+            max_iter: 100,
+            tol_obj: 1e-8,
+            tol_grad: 1e-6,
+            tol_step: 1e-10,
+            lambda0: 1e-2,
+        }
     }
 }
 
@@ -281,8 +303,13 @@ impl FitWorkspace {
         for v in [&mut self.f, &mut self.a] {
             grow(v, p * p);
         }
-        for v in [&mut self.grad, &mut self.delta, &mut self.s, &mut self.jac_of_v, &mut self.dinv2]
-        {
+        for v in [
+            &mut self.grad,
+            &mut self.delta,
+            &mut self.s,
+            &mut self.jac_of_v,
+            &mut self.dinv2,
+        ] {
             grow(v, p);
         }
         if self.chol.capacity() < p * p {
@@ -314,6 +341,12 @@ fn grow(v: &mut Vec<f64>, n: usize) {
     if v.len() < n {
         v.resize(n, 0.0);
     }
+}
+
+#[derive(Clone, Copy)]
+enum ModelKind {
+    FixedSigma(f64),
+    PerEmitterSigma,
 }
 
 /// Fit `theta0` by bounded Fisher-scoring LM on a `h x w` patch.
@@ -350,9 +383,63 @@ pub fn fit(
     halo: Option<&[f64]>,
     opts: FitOpts,
 ) -> FitInfo {
+    fit_model(
+        ws,
+        theta0,
+        h,
+        w,
+        ModelKind::FixedSigma(sigma),
+        d,
+        bounds,
+        halo,
+        opts,
+    )
+}
+
+/// Fit a variable-sigma theta `[b, A0, y0, x0, sigma0, ...]`.
+///
+/// This is the Rust counterpart of the Python post-hoc filtering experiment.
+/// It deliberately lives beside, not inside, the fixed-sigma detector path.
+pub fn fit_var_sigma(
+    ws: &mut FitWorkspace,
+    theta0: &[f64],
+    h: usize,
+    w: usize,
+    d: &[f64],
+    bounds: &Bounds,
+    halo: Option<&[f64]>,
+    opts: FitOpts,
+) -> FitInfo {
+    fit_model(
+        ws,
+        theta0,
+        h,
+        w,
+        ModelKind::PerEmitterSigma,
+        d,
+        bounds,
+        halo,
+        opts,
+    )
+}
+
+fn fit_model(
+    ws: &mut FitWorkspace,
+    theta0: &[f64],
+    h: usize,
+    w: usize,
+    model: ModelKind,
+    d: &[f64],
+    bounds: &Bounds,
+    halo: Option<&[f64]>,
+    opts: FitOpts,
+) -> FitInfo {
     let n = h * w;
     let p = theta0.len();
-    let k = psf::n_emitters(theta0);
+    let k = match model {
+        ModelKind::FixedSigma(_) => psf::n_emitters(theta0),
+        ModelKind::PerEmitterSigma => psf::n_emitters_var(theta0),
+    };
     assert_eq!(d.len(), n);
     assert_eq!(bounds.len(), p);
     ws.ensure(h, w, k, p);
@@ -370,7 +457,7 @@ pub fn fit(
     let mut lam = opts.lambda0;
     let mut nu = 2.0f64;
 
-    eval(ws, h, w, sigma, halo, p, false);
+    eval(ws, h, w, model, halo, p, false);
     let mut i_cur = idiv(ws, d, n, false);
 
     let mut converged = false;
@@ -457,7 +544,7 @@ pub fn fit(
 
             let (theta_ref, trial) = (&ws.theta, &mut ws.theta_trial);
             trial.set_step(theta_ref, &ws.delta[..p], bounds);
-            eval(ws, h, w, sigma, halo, p, true);
+            eval(ws, h, w, model, halo, p, true);
             let i_trial = idiv(ws, d, n, true);
 
             let actual_dec = i_cur - i_trial;
@@ -471,7 +558,11 @@ pub fn fit(
             // delivered 1.05e-3, halved lambda anyway, and took the identical
             // 2.3e-5 step again -- 3000+ iterations, finishing 364 nats above
             // the optimum.
-            let rho = if pred_dec > 0.0 { actual_dec / pred_dec } else { -1.0 };
+            let rho = if pred_dec > 0.0 {
+                actual_dec / pred_dec
+            } else {
+                -1.0
+            };
 
             if i_trial < i_cur && rho > 1e-4 {
                 step_norm = ws.delta[..p].iter().map(|v| v * v).sum::<f64>().sqrt();
@@ -512,7 +603,12 @@ pub fn fit(
     // from.
     fisher(ws, p, n, true);
 
-    FitInfo { i_div: i_cur, n_iter: it, converged, stalled }
+    FitInfo {
+        i_div: i_cur,
+        n_iter: it,
+        converged,
+        stalled,
+    }
 }
 
 /// `F = J^T W J` with `W = diag(1/m)`, into `ws.f`.
@@ -551,23 +647,42 @@ fn fisher(ws: &mut FitWorkspace, p: usize, n: usize, clip: bool) {
 
 /// Evaluate model and Jacobian at the current or trial iterate, clipping the
 /// model away from zero -- `W = 1/m` is singular at `m = 0`.
-fn eval(ws: &mut FitWorkspace, h: usize, w: usize, sigma: f64, halo: Option<&[f64]>, p: usize, trial: bool) {
+fn eval(
+    ws: &mut FitWorkspace,
+    h: usize,
+    w: usize,
+    model: ModelKind,
+    halo: Option<&[f64]>,
+    p: usize,
+    trial: bool,
+) {
     let n = h * w;
     let (theta, m, j) = if trial {
         (ws.theta_trial.as_slice(), &mut ws.m_trial, &mut ws.j_trial)
     } else {
         (ws.theta.as_slice(), &mut ws.m, &mut ws.j)
     };
-    psf::model_and_jac_ax(
-        theta,
-        &ws.ay[..h],
-        &ws.ax[..w],
-        sigma,
-        halo,
-        &mut ws.factors,
-        &mut m[..n],
-        &mut j[..p * n],
-    );
+    match model {
+        ModelKind::FixedSigma(sigma) => psf::model_and_jac_ax(
+            theta,
+            &ws.ay[..h],
+            &ws.ax[..w],
+            sigma,
+            halo,
+            &mut ws.factors,
+            &mut m[..n],
+            &mut j[..p * n],
+        ),
+        ModelKind::PerEmitterSigma => psf::model_and_jac_var_sigma_ax(
+            theta,
+            &ws.ay[..h],
+            &ws.ax[..w],
+            halo,
+            &mut ws.factors,
+            &mut m[..n],
+            &mut j[..p * n],
+        ),
+    }
     for v in m[..n].iter_mut() {
         *v = v.max(1e-9);
     }
@@ -577,7 +692,11 @@ fn idiv(ws: &FitWorkspace, d: &[f64], n: usize, trial: bool) -> f64 {
     let m = if trial { &ws.m_trial } else { &ws.m };
     let mut s = 0.0;
     for i in 0..n {
-        let term = if ws.d_pos[i] { ws.d_safe[i] * (ws.d_safe[i] / m[i]).ln() } else { 0.0 };
+        let term = if ws.d_pos[i] {
+            ws.d_safe[i] * (ws.d_safe[i] / m[i]).ln()
+        } else {
+            0.0
+        };
         s += term - (d[i] - m[i]);
     }
     s
@@ -598,7 +717,11 @@ fn accept(ws: &mut FitWorkspace, p: usize, n: usize) {
 fn coleman_li_scale(theta: &Interior, grad: &[f64], b: &Bounds, s: &mut [f64]) {
     let t = theta.as_slice();
     for i in 0..s.len() {
-        let v = if grad[i] >= 0.0 { t[i] - b.lo()[i] } else { b.hi()[i] - t[i] };
+        let v = if grad[i] >= 0.0 {
+            t[i] - b.lo()[i]
+        } else {
+            b.hi()[i] - t[i]
+        };
         s[i] = v.max(1e-12).sqrt();
     }
 }

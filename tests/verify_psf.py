@@ -78,6 +78,22 @@ Ja=psf.jac_free_sigma(ths,yy,xx); Jf=fd_jac_fs(ths)
 rel=np.abs(Ja-Jf).max()/np.abs(Jf).max()
 chk("jac_free_sigma == finite differences", rel<2e-6, "rel %.2e"%rel)
 
+# --- 1.6b per-emitter free-sigma model/jac ---
+thv=psf.pack_var_sigma(3.,[500.,800.],[10.2,7.1],[9.7,12.3],[1.1,1.6])
+chk("model_var_sigma == model when sigmas match",
+    np.abs(psf.model_var_sigma(psf.pack_var_sigma(3.,[500.,800.],[10.2,7.1],[9.7,12.3],[1.35,1.35]),yy,xx)
+           - psf.model(th,yy,xx,1.35)).max()<1e-12)
+def fd_jac_vs(t,h=1e-6):
+    J=np.empty(yy.shape+(len(t),))
+    for i in range(len(t)):
+        tp=t.copy();tm=t.copy();st=h*max(abs(t[i]),1.0)
+        tp[i]+=st;tm[i]-=st
+        J[...,i]=(psf.model_var_sigma(tp,yy,xx)-psf.model_var_sigma(tm,yy,xx))/(2*st)
+    return J
+Ja=psf.jac_var_sigma(thv,yy,xx); Jf=fd_jac_vs(thv)
+rel=np.abs(Ja-Jf).max()/np.abs(Jf).max()
+chk("jac_var_sigma == finite differences", rel<2e-6, "rel %.2e"%rel)
+
 # --- 1.7 pack/unpack round trip ---
 b,A,cy,cx=4.,np.array([1.,2.,3.]),np.array([4.,5.,6.]),np.array([7.,8.,9.])
 b2,A2,cy2,cx2=psf.unpack(psf.pack(b,A,cy,cx))

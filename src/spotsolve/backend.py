@@ -18,6 +18,8 @@ Every backend takes and returns the same things:
     refine(d_e, pos, amp, sigma, bmap, k_max, max_sweeps)  -> (pos, amp, se)
     prune(d_e, bmap, pos, amp, sigma, lam, A_s, k_max)
                                             -> (pos, amp, n_removed)
+    fit_var_sigma(theta0, h, w, d, halo, lower, upper, max_iter)
+                                            -> FitResult
     render_model(pos, amp, sigma, shape, background)       -> (H, W)
     emitter_free_mask(pos, sigma, shape, radius_factor)    -> (H, W) bool
 
@@ -72,6 +74,14 @@ class PythonBackend:
         n0 = len(pos)
         pos, amp = core._prune(d_e, pos, amp, bmap, sigma, lam, A_s, k_max)
         return pos, amp, n0 - len(pos)
+
+    def fit_var_sigma(self, theta0, h, w, d, halo, lower, upper, max_iter):
+        from . import core, lmga
+        yy, xx = np.mgrid[0:h, 0:w]
+        return lmga.fit(theta0, yy.astype(float), xx.astype(float), 1.0, d,
+                        lower, upper, halo=halo, max_iter=max_iter,
+                        tol_obj=core.EVIDENCE_TOL_OBJ,
+                        free_sigma="per_emitter")
 
     def render_model(self, pos, amp, sigma, shape, background):
         from . import calibrate
@@ -128,6 +138,15 @@ class RustBackend:
     def prune(self, d_e, bmap, pos, amp, sigma, lam, A_s, k_max):
         return self._rs.prune(_img(d_e, "d_e"), _img(bmap, "bmap"),
                               _f2(pos), _f1(amp), sigma, lam, A_s, k_max)
+
+    def fit_var_sigma(self, theta0, h, w, d, halo, lower, upper, max_iter):
+        from .structs import FitResult
+        theta, i_div, fisher, n_iter, converged, stalled = \
+            self._rs.lmcl_fit_var_sigma(
+                _f1(theta0), int(h), int(w), _img(d, "d"), _img(halo, "halo"),
+                _f1(lower), _f1(upper), int(max_iter))
+        return FitResult(theta=theta, I=i_div, F=fisher, n_iter=n_iter,
+                         converged=converged, stalled=stalled)
 
     def render_model(self, pos, amp, sigma, shape, background):
         return self._rs.render_model(_f2(pos), _f1(amp), sigma,

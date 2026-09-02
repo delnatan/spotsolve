@@ -78,7 +78,7 @@ def main(args):
           f"{stack.shape[1]}x{stack.shape[2]} px, sigma={args.sigma}, "
           f"gain={args.gain}, backend={args.impl}")
 
-    locs_parts, frame_parts, agg_parts = [], [], []
+    locs_parts, frame_parts, agg_parts, width_parts = [], [], [], []
     loc_id = 0
     for k, raw in enumerate(stack):
         frame = first + k
@@ -86,27 +86,43 @@ def main(args):
         res = spotsolve.detect(raw, sigma=args.sigma, offset=CAMERA_OFFSET,
                             gain=args.gain, k_max=args.k_max, impl=args.impl,
                             verbose=0)
+        if args.filter_in_focus:
+            res = spotsolve.filter_in_focus(
+                raw, res, offset=CAMERA_OFFSET, gain=args.gain,
+                sigma_ratio_min=args.sigma_ratio_min,
+                sigma_ratio_max=args.sigma_ratio_max,
+                sigma_lo_ratio=args.var_sigma_lo_ratio,
+                sigma_hi_ratio=args.var_sigma_hi_ratio,
+                k_max=args.k_max, impl=args.impl)
         dt = time.time() - t0
 
         locs, row, aggs = loctable.frame_tables(
             res, frame=frame, t=frame * args.interval,
             pixel_size=args.pixel_size, agg_ratio=args.agg_ratio,
             seconds=dt, loc_id0=loc_id)
+        width_rejects = loctable.width_reject_table(
+            res, frame=frame, t=frame * args.interval,
+            pixel_size=args.pixel_size)
         loc_id += locs.height
         locs_parts.append(locs)
         frame_parts.append(row)
         agg_parts.append(aggs)
+        width_parts.append(width_rejects)
 
         r = row.row(0, named=True)
         print(f"  frame {frame:3d}  N={r['n_locs']:4d}  "
               f"median flux {r['median_flux']:7.0f} e-  "
               f"median SE(pos) {r['median_se_pos']:.3f} px  "
+              f"width pruned/reject "
+              f"{r['n_width_pruned']:3d}/"
+              f"{r['n_width_too_narrow'] + r['n_width_too_wide']:3d}  "
               f"aggregates {r['n_aggregates']:2d} "
               f"({100 * r['agg_flux_fraction']:4.1f}% of flux)  {dt:.1f}s")
 
     locs = loctable.concat(locs_parts)
     frames = loctable.concat(frame_parts)
     aggregates = loctable.concat(agg_parts)
+    width_rejects = loctable.concat(width_parts)
     clean = loctable.filter_aggregates(locs)
 
     print(f"\n{locs.height} localizations over {frames.height} frames; "
@@ -122,6 +138,8 @@ def main(args):
                            "flux_ratio").head(6))
         print("\nper-frame summary:")
         print(frames.select("frame", "n_locs", "median_flux", "median_se_pos",
+                            "n_width_pruned", "n_width_too_narrow",
+                            "n_width_too_wide",
                             "n_aggregates", "agg_flux_fraction", "seconds"))
         print("\naggregates, brightest first:")
         print(aggregates.sort("flux", descending=True)
@@ -138,6 +156,7 @@ def main(args):
     locs.write_parquet(out / "localizations.parquet")
     frames.write_parquet(out / "frames.parquet")
     aggregates.write_parquet(out / "aggregates.parquet")
+    width_rejects.write_parquet(out / "width_rejects.parquet")
     # Pixel size, interval and gain are not in the parquet -- they are
     # properties of the acquisition, not of any row -- but every physical
     # quantity a tracker computes depends on them, so they travel alongside.
@@ -148,12 +167,17 @@ def main(args):
         "camera_offset_adu": CAMERA_OFFSET,
         "pixel_size_um": args.pixel_size, "frame_interval_s": args.interval,
         "k_max": args.k_max, "impl": args.impl,
+        "filter_in_focus": args.filter_in_focus,
+        "sigma_ratio_min": args.sigma_ratio_min if args.filter_in_focus else None,
+        "sigma_ratio_max": args.sigma_ratio_max if args.filter_in_focus else None,
+        "var_sigma_lo_ratio": args.var_sigma_lo_ratio if args.filter_in_focus else None,
+        "var_sigma_hi_ratio": args.var_sigma_hi_ratio if args.filter_in_focus else None,
         "agg_ratio": args.agg_ratio if args.agg_ratio is not None
         else spotsolve.AGG_AMP_RATIO,
         "flux_units": "photoelectrons", "position_units": "px (y, x)",
     }, indent=2) + "\n")
     print(f"\nwrote {out}/localizations.parquet, frames.parquet, "
-          f"aggregates.parquet, meta.json")
+          f"aggregates.parquet, width_rejects.parquet, meta.json")
 
 
 if __name__ == "__main__":
@@ -177,6 +201,20 @@ if __name__ == "__main__":
     ap.add_argument("--agg-ratio", type=float, default=None,
                     help=f"over-bright cut, flux / the frame's median "
                          f"detection (default {spotsolve.AGG_AMP_RATIO:.0f})")
+    ap.add_argument("--filter-in-focus", action="store_true",
+                    help="post-detect variable-sigma physical-width filter")
+    ap.add_argument("--sigma-ratio-min", type=float,
+                    default=spotsolve.INF_FOCUS_SIGMA_RATIO_MIN,
+                    help="minimum fitted sigma / in-focus sigma to keep")
+    ap.add_argument("--sigma-ratio-max", type=float,
+                    default=spotsolve.INF_FOCUS_SIGMA_RATIO_MAX,
+                    help="maximum fitted sigma / in-focus sigma to keep")
+    ap.add_argument("--var-sigma-lo-ratio", type=float,
+                    default=spotsolve.VAR_SIGMA_RATIO_LO,
+                    help="lower variable-sigma fit bound, relative to sigma")
+    ap.add_argument("--var-sigma-hi-ratio", type=float,
+                    default=spotsolve.VAR_SIGMA_RATIO_HI,
+                    help="upper variable-sigma fit bound, relative to sigma")
     ap.add_argument("--out",
                     default=str(Path(__file__).resolve().parent.parent
                                 / "data" / "hyp7_locs"))

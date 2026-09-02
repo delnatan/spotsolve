@@ -164,7 +164,8 @@ def fit(
 
     If `free_sigma` is True, `theta` includes sigma as its last entry and
     `sigma` (the scalar argument) is ignored; the model used is
-    psf.model_free_sigma. Otherwise sigma is fixed and passed through.
+    psf.model_free_sigma. If `free_sigma == "per_emitter"`, theta carries one
+    sigma per emitter using psf.pack_var_sigma.
 
     Convergence: `tol_obj` in NATS
     ------------------------------
@@ -203,7 +204,10 @@ def fit(
     ay, ax_ = psf.axes(yy, xx)
 
     def eval_model_jac(th):
-        if free_sigma:
+        if free_sigma == "per_emitter":
+            m = psf.model_var_sigma(th, yy, xx, halo)
+            J = psf.jac_var_sigma(th, yy, xx, halo)
+        elif free_sigma:
             m = psf.model_free_sigma(th, yy, xx, halo)
             J = psf.jac_free_sigma(th, yy, xx, halo)
         else:

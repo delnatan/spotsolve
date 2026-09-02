@@ -94,3 +94,14 @@ class DetectResult:
     emitters fitted at the PSF sigma.
     """
     aggregate_fraction: float = 0.0   # masked share of the frame, 0..1
+    fit_sigma: np.ndarray = None
+    """Optional per-emitter sigma from a post-hoc physical-width fit.
+
+    `sigma` remains the in-focus PSF width used for the reported final
+    positions, amplitudes and CRLBs. This field is diagnostic: it records the
+    variable-sigma fit that decided whether each retained emitter was
+    physically plausible.
+    """
+    sigma_ratio: np.ndarray = None
+    width_rejects: np.ndarray = None
+    width_filter: dict = field(default_factory=dict)

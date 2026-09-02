@@ -41,6 +41,13 @@ from .core import (  # noqa: F401
     render_aggregates,
     log_kernel_l2,
 )
+from .infocus import (  # noqa: F401
+    filter_in_focus,
+    INF_FOCUS_SIGMA_RATIO_MIN,
+    INF_FOCUS_SIGMA_RATIO_MAX,
+    VAR_SIGMA_RATIO_LO,
+    VAR_SIGMA_RATIO_HI,
+)
 from .structs import DetectResult, FitResult, Patch  # noqa: F401
 
 # Tuning constants. These are the pipeline's dials and are part of the public
@@ -84,6 +91,7 @@ __all__ = [
     "aggregate_report",
     "render_aggregates",
     "log_kernel_l2",
+    "filter_in_focus",
     "DetectResult",
     "FitResult",
     "Patch",
@@ -108,5 +116,9 @@ __all__ = [
     "AGG_MASK_RADIUS",
     "AGG_AMP_RATIO",
     "AGG_LINK",
+    "INF_FOCUS_SIGMA_RATIO_MIN",
+    "INF_FOCUS_SIGMA_RATIO_MAX",
+    "VAR_SIGMA_RATIO_LO",
+    "VAR_SIGMA_RATIO_HI",
     "__version__",
 ]

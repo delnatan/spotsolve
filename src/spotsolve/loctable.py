@@ -13,6 +13,7 @@ every detection or hiding them:
   `locs`        one row per detection          -- LOCALIZATION_SCHEMA
   `frames`      one row per frame              -- FRAME_SCHEMA
   `aggregates`  one row per flagged object     -- AGGREGATE_SCHEMA
+  `width_rejects` one row per width rejection   -- WIDTH_REJECT_SCHEMA
 
 Units
 -----
@@ -51,7 +52,7 @@ diffusion coefficients from without saying so.
 import numpy as np
 import polars as pl
 
-from . import core
+from . import core, infocus
 
 LOCALIZATION_SCHEMA = {
     "loc_id": pl.UInt32,      # unique over the whole movie; a stable handle
@@ -71,6 +72,9 @@ LOCALIZATION_SCHEMA = {
     "flux_snr": pl.Float64,   # flux / se_flux; the search's own A/SE statistic
     "bg": pl.Float64,         # photoelectrons/px, background surface here
     "sigma": pl.Float64,      # px, the PSF sigma the fit was held at
+    "fit_sigma": pl.Float64,  # px, optional post-hoc variable-sigma diagnostic
+    "sigma_ratio": pl.Float64,  # fit_sigma / sigma
+    "width_filter_state": pl.String,
     "flux_ratio": pl.Float64,  # flux / this frame's median detection
     "is_aggregate": pl.Boolean,
 }
@@ -79,6 +83,9 @@ FRAME_SCHEMA = {
     "frame": pl.UInt32,
     "t": pl.Float64,
     "n_locs": pl.UInt32,
+    "n_width_pruned": pl.UInt32,
+    "n_width_too_narrow": pl.UInt32,
+    "n_width_too_wide": pl.UInt32,
     "n_aggregates": pl.UInt32,        # linked objects, not detections
     "n_locs_flagged": pl.UInt32,      # detections inside those objects
     "median_flux": pl.Float64,
@@ -89,6 +96,20 @@ FRAME_SCHEMA = {
     "gain": pl.Float64,
     "n_rounds": pl.UInt32,
     "seconds": pl.Float64,            # wall clock for this frame's detect()
+}
+
+WIDTH_REJECT_SCHEMA = {
+    "frame": pl.UInt32,
+    "t": pl.Float64,
+    "source_index": pl.Int64,
+    "y": pl.Float64,
+    "x": pl.Float64,
+    "y_um": pl.Float64,
+    "x_um": pl.Float64,
+    "flux": pl.Float64,
+    "fit_sigma": pl.Float64,
+    "sigma_ratio": pl.Float64,
+    "reason": pl.String,
 }
 
 AGGREGATE_SCHEMA = {
@@ -137,6 +158,15 @@ def frame_tables(result, frame, t=0.0, pixel_size=1.0, agg_ratio=None,
     mask, objs = core.flag_aggregates(result, ratio=ratio)
     med = float(np.median(amp)) if n else float("nan")
     ps = float(pixel_size)
+    if result.fit_sigma is not None and len(result.fit_sigma) == n:
+        fit_sigma = np.asarray(result.fit_sigma, float)
+    else:
+        fit_sigma = np.full(n, float(result.sigma))
+    if result.sigma_ratio is not None and len(result.sigma_ratio) == n:
+        sigma_ratio = np.asarray(result.sigma_ratio, float)
+    else:
+        sigma_ratio = np.ones(n)
+    width_state = "kept" if result.width_filter else "unchecked"
 
     locs = pl.DataFrame(
         {
@@ -154,6 +184,9 @@ def frame_tables(result, frame, t=0.0, pixel_size=1.0, agg_ratio=None,
                                   where=np.isfinite(se[:, 0]) & (se[:, 0] > 0)),
             "bg": _sample_background(result.background, pos),
             "sigma": np.full(n, float(result.sigma)),
+            "fit_sigma": fit_sigma,
+            "sigma_ratio": sigma_ratio,
+            "width_filter_state": np.full(n, width_state),
             "flux_ratio": amp / med if n else amp,
             "is_aggregate": mask,
         },
@@ -173,9 +206,20 @@ def frame_tables(result, frame, t=0.0, pixel_size=1.0, agg_ratio=None,
     )
 
     flux_total = float(amp.sum())
+    rejects = result.width_rejects
+    n_too_narrow = 0
+    n_too_wide = 0
+    if rejects is not None and len(rejects):
+        n_too_narrow = int(np.sum(rejects["reason"] == "too_narrow"))
+        n_too_wide = int(np.sum(rejects["reason"] == "too_wide"))
+    n_width_pruned = len(result.width_filter.get("var_pruned_indices", [])) \
+        if result.width_filter else 0
     row = pl.DataFrame(
         {
             "frame": [frame], "t": [t], "n_locs": [n],
+            "n_width_pruned": [n_width_pruned],
+            "n_width_too_narrow": [n_too_narrow],
+            "n_width_too_wide": [n_too_wide],
             "n_aggregates": [len(objs)],
             "n_locs_flagged": [int(mask.sum())],
             "median_flux": [med],
@@ -191,6 +235,28 @@ def frame_tables(result, frame, t=0.0, pixel_size=1.0, agg_ratio=None,
         schema=FRAME_SCHEMA,
     )
     return locs, row, aggs
+
+
+def width_reject_table(result, frame, t=0.0, pixel_size=1.0):
+    """Width-filter rejected detections as a table."""
+    rec = result.width_rejects
+    ps = float(pixel_size)
+    if rec is None:
+        rec = np.empty(0, dtype=infocus.WIDTH_REJECT_DTYPE)
+    return pl.DataFrame(
+        {
+            "frame": np.full(len(rec), frame),
+            "t": np.full(len(rec), t),
+            "source_index": rec["source_index"],
+            "y": rec["y"], "x": rec["x"],
+            "y_um": rec["y"] * ps, "x_um": rec["x"] * ps,
+            "flux": rec["flux"],
+            "fit_sigma": rec["sigma"],
+            "sigma_ratio": rec["sigma_ratio"],
+            "reason": rec["reason"],
+        },
+        schema=WIDTH_REJECT_SCHEMA,
+    )
 
 
 def concat(parts):

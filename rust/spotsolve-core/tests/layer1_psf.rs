@@ -99,5 +99,44 @@ fn amplitude_is_total_flux_and_peak_factor_is_its_peak() {
     assert_rel(total, 1000.0, 1e-9, "flux is conserved");
     // The emitter sits exactly on pixel centre (20, 20), so that pixel's value
     // is A * peak_factor by definition.
-    assert_rel(m[20 * w + 20], 1000.0 * psf::peak_factor(sigma), 1e-13, "peak");
+    assert_rel(
+        m[20 * w + 20],
+        1000.0 * psf::peak_factor(sigma),
+        1e-13,
+        "peak",
+    );
+}
+
+#[test]
+fn variable_sigma_jacobian_matches_finite_difference() {
+    let (h, w) = (13, 15);
+    let (ay, ax) = (psf::local_axis(h), psf::local_axis(w));
+    let theta = psf::pack_var(3.0, &[500.0, 800.0], &[6.2, 4.1], &[5.7, 9.3], &[1.1, 1.6]);
+    let n = h * w;
+    let p = theta.len();
+    let mut f = psf::Factors::new(h, w, 2);
+    let mut m = vec![0.0; n];
+    let mut j = vec![0.0; p * n];
+    psf::model_and_jac_var_sigma_ax(&theta, &ay, &ax, None, &mut f, &mut m, &mut j);
+
+    for q in 0..p {
+        let step = 1e-6 * theta[q].abs().max(1.0);
+        let mut tp = theta.clone();
+        let mut tm = theta.clone();
+        tp[q] += step;
+        tm[q] -= step;
+        let (mut mp, mut mm) = (vec![0.0; n], vec![0.0; n]);
+        let (mut jp, mut jm) = (vec![0.0; p * n], vec![0.0; p * n]);
+        psf::model_and_jac_var_sigma_ax(&tp, &ay, &ax, None, &mut f, &mut mp, &mut jp);
+        psf::model_and_jac_var_sigma_ax(&tm, &ay, &ax, None, &mut f, &mut mm, &mut jm);
+        for i in 0..n {
+            let fd = (mp[i] - mm[i]) / (2.0 * step);
+            let got = j[q * n + i];
+            let scale = fd.abs().max(got.abs()).max(1.0);
+            assert!(
+                (got - fd).abs() / scale < 2e-8,
+                "q={q} i={i}: got {got}, fd {fd}"
+            );
+        }
+    }
 }

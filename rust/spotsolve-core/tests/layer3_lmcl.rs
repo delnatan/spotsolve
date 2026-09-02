@@ -39,7 +39,10 @@ fn converged_objective_matches_the_fixture() {
             &d,
             &bounds,
             None,
-            FitOpts { max_iter: 100, ..Default::default() },
+            FitOpts {
+                max_iter: 100,
+                ..Default::default()
+            },
         );
 
         // The objective, in nats. This is the assertion that matters: it is
@@ -56,8 +59,18 @@ fn converged_objective_matches_the_fixture() {
                 1e-4,
                 &format!("K={k} A[{e}]"),
             );
-            assert_abs(psf::cy(got, e), psf::cy(&want_theta, e), 1e-6, &format!("K={k} y[{e}]"));
-            assert_abs(psf::cx(got, e), psf::cx(&want_theta, e), 1e-6, &format!("K={k} x[{e}]"));
+            assert_abs(
+                psf::cy(got, e),
+                psf::cy(&want_theta, e),
+                1e-6,
+                &format!("K={k} y[{e}]"),
+            );
+            assert_abs(
+                psf::cx(got, e),
+                psf::cx(&want_theta, e),
+                1e-6,
+                &format!("K={k} x[{e}]"),
+            );
         }
 
         assert_all_rel(ws.fisher(p), &want_f, 1e-9, &format!("K={k} Fisher"));
@@ -84,7 +97,12 @@ fn iterates_are_always_strictly_interior() {
     let b = Bounds::new(&lo, &hi);
 
     // Start ON the bounds, and past them, from both sides.
-    for start in [lo.clone(), hi.clone(), vec![-1e9, -1e9, -1e9, -1e9], vec![1e9; 4]] {
+    for start in [
+        lo.clone(),
+        hi.clone(),
+        vec![-1e9, -1e9, -1e9, -1e9],
+        vec![1e9; 4],
+    ] {
         let t = Interior::new(&start, &b);
         for i in 0..4 {
             assert!(
@@ -113,7 +131,10 @@ fn iterates_are_always_strictly_interior() {
     let at_lo = Interior::new(&lo, &b);
     let m_amp = at_lo.as_slice()[1] - lo[1];
     let m_pos = at_lo.as_slice()[2] - lo[2];
-    assert!(m_amp > m_pos * 100.0, "margin is not scaled to each bound's range");
+    assert!(
+        m_amp > m_pos * 100.0,
+        "margin is not scaled to each bound's range"
+    );
 }
 
 /// The I-divergence's `0*log(0) := 0` convention, and its behaviour on the
@@ -148,10 +169,64 @@ fn noiseless_fit_from_truth_is_a_fixed_point() {
     let hi = vec![40.0, 9e4, h as f64 - 0.5, w as f64 - 0.5];
     let b = Bounds::new(&lo, &hi);
     let mut ws = FitWorkspace::new();
-    let info = lmcl::fit(&mut ws, &theta, h, w, sigma, &d, &b, None, FitOpts::default());
+    let info = lmcl::fit(
+        &mut ws,
+        &theta,
+        h,
+        w,
+        sigma,
+        &d,
+        &b,
+        None,
+        FitOpts::default(),
+    );
 
     assert!(info.converged, "did not converge from the exact optimum");
     assert_abs(info.i_div, 0.0, 1e-9, "I at the truth on noiseless data");
+    for q in 0..theta.len() {
+        assert_abs(ws.theta()[q], theta[q], 1e-6, &format!("theta[{q}] moved"));
+    }
+}
+
+#[test]
+fn variable_sigma_fit_from_truth_is_a_fixed_point() {
+    let (h, w) = (17usize, 19usize);
+    let theta = psf::pack_var(
+        4.0,
+        &[1200.0, 800.0],
+        &[7.3, 10.1],
+        &[8.1, 12.4],
+        &[1.1, 1.7],
+    );
+    let (ay, ax) = (psf::local_axis(h), psf::local_axis(w));
+    let mut factors = psf::Factors::new(h, w, 2);
+    let n = h * w;
+    let p = theta.len();
+    let mut d = vec![0.0; n];
+    let mut j = vec![0.0; p * n];
+    psf::model_and_jac_var_sigma_ax(&theta, &ay, &ax, None, &mut factors, &mut d, &mut j);
+
+    let lo = vec![0.0, 1e-4, -0.5, -0.5, 0.7, 1e-4, -0.5, -0.5, 0.7];
+    let hi = vec![
+        40.0,
+        9e4,
+        h as f64 - 0.5,
+        w as f64 - 0.5,
+        8.0,
+        9e4,
+        h as f64 - 0.5,
+        w as f64 - 0.5,
+        8.0,
+    ];
+    let bounds = Bounds::new(&lo, &hi);
+    let mut ws = FitWorkspace::new();
+    let info = lmcl::fit_var_sigma(&mut ws, &theta, h, w, &d, &bounds, None, FitOpts::default());
+
+    assert!(
+        info.converged,
+        "variable-sigma fit did not converge at truth"
+    );
+    assert_abs(info.i_div, 0.0, 1e-9, "I at variable-sigma truth");
     for q in 0..theta.len() {
         assert_abs(ws.theta()[q], theta[q], 1e-6, &format!("theta[{q}] moved"));
     }
@@ -210,8 +285,13 @@ fn one_workspace_survives_any_sequence_of_patch_shapes() {
     let sigma = 1.2;
     let mut ws = FitWorkspace::new();
     // Deliberately adversarial: shrinking pixel counts against growing K.
-    for &(h, w, k) in &[(20usize, 20usize, 2usize), (8, 8, 5), (30, 4, 1), (5, 5, 12), (13, 11, 3)]
-    {
+    for &(h, w, k) in &[
+        (20usize, 20usize, 2usize),
+        (8, 8, 5),
+        (30, 4, 1),
+        (5, 5, 12),
+        (13, 11, 3),
+    ] {
         let (ay, ax) = (psf::local_axis(h), psf::local_axis(w));
         let a: Vec<f64> = (0..k).map(|i| 500.0 + 100.0 * i as f64).collect();
         let ys: Vec<f64> = (0..k).map(|i| 1.0 + (i % h.max(1)) as f64).collect();
@@ -229,7 +309,17 @@ fn one_workspace_survives_any_sequence_of_patch_shapes() {
             hi.extend_from_slice(&[9e4, h as f64 - 0.5, w as f64 - 0.5]);
         }
         let b = Bounds::new(&lo, &hi);
-        let info = lmcl::fit(&mut ws, &theta, h, w, sigma, &d, &b, None, FitOpts::default());
+        let info = lmcl::fit(
+            &mut ws,
+            &theta,
+            h,
+            w,
+            sigma,
+            &d,
+            &b,
+            None,
+            FitOpts::default(),
+        );
         assert!(
             info.i_div.is_finite(),
             "{h}x{w} K={k}: fit produced a non-finite objective after a reused workspace"

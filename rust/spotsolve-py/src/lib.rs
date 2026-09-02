@@ -20,15 +20,15 @@
 //! Arrays must be C-contiguous f64; `as_slice()` fails loudly otherwise rather
 //! than silently transposing.
 
-use spotsolve_core::evidence::{Evidence, Prior};
-use spotsolve_core::passes::{self, Emitters, Frame, Solver};
-use spotsolve_core::{linalg, lmcl, psf, render};
 use numpy::{
     IntoPyArray, PyArray1, PyArray2, PyArrayMethods, PyReadonlyArray1, PyReadonlyArray2,
     PyUntypedArrayMethods,
 };
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
+use spotsolve_core::evidence::{Evidence, Prior};
+use spotsolve_core::passes::{self, Emitters, Frame, Solver};
+use spotsolve_core::{linalg, lmcl, psf, render};
 
 type Arr1 = Py<PyArray1<f64>>;
 type Arr2 = Py<PyArray2<f64>>;
@@ -43,9 +43,8 @@ fn slice2<'a>(a: &'a PyReadonlyArray2<'_, f64>, name: &str) -> PyResult<&'a [f64
 }
 
 fn slice1<'a>(a: &'a PyReadonlyArray1<'_, f64>, name: &str) -> PyResult<&'a [f64]> {
-    a.as_slice().map_err(|_| {
-        PyValueError::new_err(format!("`{name}` must be a contiguous float64 array"))
-    })
+    a.as_slice()
+        .map_err(|_| PyValueError::new_err(format!("`{name}` must be a contiguous float64 array")))
 }
 
 /// Take `(positions, amplitudes)` as the core's flat representation.
@@ -84,12 +83,21 @@ fn make_frame<'a>(
 ) -> PyResult<Frame<'a>> {
     let (h, w) = (shape[0], shape[1]);
     if bmap.len() != h * w {
-        return Err(PyValueError::new_err("`bmap` must have the same shape as `d_e`"));
+        return Err(PyValueError::new_err(
+            "`bmap` must have the same shape as `d_e`",
+        ));
     }
     if !(sigma > 0.0) {
         return Err(PyValueError::new_err("`sigma` must be positive"));
     }
-    Ok(Frame { d_e, bmap, h, w, sigma, k_max })
+    Ok(Frame {
+        d_e,
+        bmap,
+        h,
+        w,
+        sigma,
+        k_max,
+    })
 }
 
 // ------------------------------------------------------------------ passes
@@ -122,12 +130,12 @@ fn add_pass(
     let c = slice2(&cand, "cand")?;
     let ca = slice1(&cand_amp, "cand_amp")?;
     if cand.shape()[1] != 2 || cand.shape()[0] != ca.len() {
-        return Err(PyValueError::new_err("`cand` must be (M, 2) matching `cand_amp`"));
+        return Err(PyValueError::new_err(
+            "`cand` must be (M, 2) matching `cand_amp`",
+        ));
     }
     let mut s = Solver::new();
-    let n = py.detach(|| {
-        passes::add_pass(&mut s, &frame, &mut em, c, ca, Prior { lam, a_s })
-    });
+    let n = py.detach(|| passes::add_pass(&mut s, &frame, &mut em, c, ca, Prior { lam, a_s }));
     let (p, a) = give_emitters(py, em);
     Ok((p, a, n))
 }
@@ -158,12 +166,13 @@ fn split_pass(
     let m = slice2(&model, "model")?;
     let frame = make_frame(d, b, [d_e.shape()[0], d_e.shape()[1]], sigma, k_max)?;
     if m.len() != frame.h * frame.w {
-        return Err(PyValueError::new_err("`model` must have the same shape as `d_e`"));
+        return Err(PyValueError::new_err(
+            "`model` must have the same shape as `d_e`",
+        ));
     }
     let mut em = take_emitters(&positions, &amplitudes)?;
     let mut s = Solver::new();
-    let n =
-        py.detach(|| passes::split_pass(&mut s, &frame, &mut em, m, Prior { lam, a_s }));
+    let n = py.detach(|| passes::split_pass(&mut s, &frame, &mut em, m, Prior { lam, a_s }));
     let (p, a) = give_emitters(py, em);
     Ok((p, a, n))
 }
@@ -196,7 +205,16 @@ fn refine(
     let b = slice2(&bmap, "bmap")?;
     let frame = make_frame(d, b, [d_e.shape()[0], d_e.shape()[1]], sigma, k_max)?;
     let mut em = take_emitters(&positions, &amplitudes)?;
-    let se = py.detach(|| passes::refine(&mut Solver::new(), &frame, &mut em, max_iter, max_sweeps, tol));
+    let se = py.detach(|| {
+        passes::refine(
+            &mut Solver::new(),
+            &frame,
+            &mut em,
+            max_iter,
+            max_sweeps,
+            tol,
+        )
+    });
     let n = em.len();
     let (p, a) = give_emitters(py, em);
     let se = se.into_pyarray(py).reshape([n, 3]).unwrap().unbind();
@@ -246,7 +264,16 @@ fn render_model(
 ) -> PyResult<Arr2> {
     let em = take_emitters(&positions, &amplitudes)?;
     let (h, w) = shape;
-    let m = render::render_model(&em.pos, &em.amp, em.len(), sigma, h, w, background, truncate);
+    let m = render::render_model(
+        &em.pos,
+        &em.amp,
+        em.len(),
+        sigma,
+        h,
+        w,
+        background,
+        truncate,
+    );
     Ok(m.into_pyarray(py).reshape([h, w]).unwrap().unbind())
 }
 
@@ -301,7 +328,10 @@ fn psf_model_jac(
     let mut f = psf::Factors::new(h, w, psf::n_emitters(t).max(1));
     let (mut m, mut j) = (vec![0.0; n], vec![0.0; p * n]);
     psf::model_and_jac_ax(t, &ay, &ax, sigma, None, &mut f, &mut m, &mut j);
-    let jt: Vec<f64> = (0..n).flat_map(|i| (0..p).map(move |q| (q, i))).map(|(q, i)| j[q * n + i]).collect();
+    let jt: Vec<f64> = (0..n)
+        .flat_map(|i| (0..p).map(move |q| (q, i)))
+        .map(|(q, i)| j[q * n + i])
+        .collect();
     Ok((
         m.into_pyarray(py).reshape([h, w]).unwrap().unbind(),
         jt.into_pyarray(py).reshape([n, p]).unwrap().unbind(),
@@ -332,13 +362,89 @@ fn lmcl_fit(
     let p = t.len();
     let mut ws = lmcl::FitWorkspace::new();
     let info = lmcl::fit(
-        &mut ws, t, h, w, sigma, data, &bounds, None,
-        lmcl::FitOpts { max_iter, ..Default::default() },
+        &mut ws,
+        t,
+        h,
+        w,
+        sigma,
+        data,
+        &bounds,
+        None,
+        lmcl::FitOpts {
+            max_iter,
+            ..Default::default()
+        },
     );
     Ok((
         ws.theta().to_vec().into_pyarray(py).unbind(),
         info.i_div,
-        ws.fisher(p).to_vec().into_pyarray(py).reshape([p, p]).unwrap().unbind(),
+        ws.fisher(p)
+            .to_vec()
+            .into_pyarray(py)
+            .reshape([p, p])
+            .unwrap()
+            .unbind(),
+        info.n_iter,
+        info.converged,
+        info.stalled,
+    ))
+}
+
+/// One bounded variable-sigma fit.
+///
+/// `theta0` has length `4K+1`: `[b, A0, y0, x0, sigma0, ...]`. `halo` is the
+/// parameter-free local contribution, matching the Python filtering scripts.
+#[pyfunction]
+#[pyo3(signature = (theta0, h, w, d, halo, lower, upper, max_iter=180))]
+#[allow(clippy::too_many_arguments)]
+fn lmcl_fit_var_sigma(
+    py: Python<'_>,
+    theta0: PyReadonlyArray1<'_, f64>,
+    h: usize,
+    w: usize,
+    d: PyReadonlyArray2<'_, f64>,
+    halo: PyReadonlyArray2<'_, f64>,
+    lower: PyReadonlyArray1<'_, f64>,
+    upper: PyReadonlyArray1<'_, f64>,
+    max_iter: usize,
+) -> PyResult<(Arr1, f64, Arr2, usize, bool, bool)> {
+    let t = slice1(&theta0, "theta0")?;
+    if t.len() % 4 != 1 {
+        return Err(PyValueError::new_err("`theta0` must have length 4K+1"));
+    }
+    let data = slice2(&d, "d")?;
+    let halo = slice2(&halo, "halo")?;
+    let bounds = lmcl::Bounds::new(slice1(&lower, "lower")?, slice1(&upper, "upper")?);
+    if data.len() != h * w {
+        return Err(PyValueError::new_err("`d` does not match (h, w)"));
+    }
+    if halo.len() != h * w {
+        return Err(PyValueError::new_err("`halo` does not match (h, w)"));
+    }
+    let p = t.len();
+    let mut ws = lmcl::FitWorkspace::new();
+    let info = lmcl::fit_var_sigma(
+        &mut ws,
+        t,
+        h,
+        w,
+        data,
+        &bounds,
+        Some(halo),
+        lmcl::FitOpts {
+            max_iter,
+            ..Default::default()
+        },
+    );
+    Ok((
+        ws.theta().to_vec().into_pyarray(py).unbind(),
+        info.i_div,
+        ws.fisher(p)
+            .to_vec()
+            .into_pyarray(py)
+            .reshape([p, p])
+            .unwrap()
+            .unbind(),
         info.n_iter,
         info.converged,
         info.stalled,
@@ -375,8 +481,17 @@ fn log_bf_add(
     let (fb, fa) = (slice2(&f_before, "F_before")?, slice2(&f_after, "F_after")?);
     let (nb, na) = (f_before.shape()[0], f_after.shape()[0]);
     Ok(Evidence::new().log_bf_add(
-        i_before, i_after, fb, fa, nb, na, sum_a_before, sum_a_after, k_before,
-        Prior { lam, a_s }, None,
+        i_before,
+        i_after,
+        fb,
+        fa,
+        nb,
+        na,
+        sum_a_before,
+        sum_a_after,
+        k_before,
+        Prior { lam, a_s },
+        None,
     ))
 }
 
@@ -400,8 +515,17 @@ fn log_bf_remove(
     let (ff, fr) = (slice2(&f_full, "F_full")?, slice2(&f_reduced, "F_reduced")?);
     let (nf, nr) = (f_full.shape()[0], f_reduced.shape()[0]);
     Ok(Evidence::new().log_bf_remove(
-        i_full, i_reduced, ff, fr, nf, nr, sum_a_full, sum_a_reduced, k_full,
-        Prior { lam, a_s }, None,
+        i_full,
+        i_reduced,
+        ff,
+        fr,
+        nf,
+        nr,
+        sum_a_full,
+        sum_a_reduced,
+        k_full,
+        Prior { lam, a_s },
+        None,
     ))
 }
 
@@ -420,6 +544,7 @@ fn spotsolve_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(emitter_free_mask, m)?)?;
     m.add_function(wrap_pyfunction!(psf_model_jac, m)?)?;
     m.add_function(wrap_pyfunction!(lmcl_fit, m)?)?;
+    m.add_function(wrap_pyfunction!(lmcl_fit_var_sigma, m)?)?;
     m.add_function(wrap_pyfunction!(logdet_cond, m)?)?;
     m.add_function(wrap_pyfunction!(log_bf_add, m)?)?;
     m.add_function(wrap_pyfunction!(log_bf_remove, m)?)?;

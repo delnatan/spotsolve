@@ -48,7 +48,9 @@ SQRTPI = math.sqrt(math.pi)
 
 __all__ = ["peak_factor", "axes", "model", "model_ax", "jac",
            "model_and_jac", "model_and_jac_ax",
-           "model_free_sigma", "jac_free_sigma", "pack", "unpack"]
+           "model_free_sigma", "jac_free_sigma",
+           "pack_var_sigma", "unpack_var_sigma",
+           "model_var_sigma", "jac_var_sigma", "pack", "unpack"]
 
 
 def peak_factor(sigma):
@@ -206,6 +208,65 @@ def jac_free_sigma(theta, yy, xx, halo=0.0):
     J[:, :, -1] = np.einsum(
         "k,ik,jk->ij", A, dEy_s, Ex
     ) + np.einsum("k,ik,jk->ij", A, Ey, dEx_s)
+    return J
+
+
+def pack_var_sigma(b, A, cy, cx, sigma):
+    """Build theta with one sigma per emitter.
+
+    Layout is [b, A0, y0, x0, sigma0, A1, y1, x1, sigma1, ...]. This is used by
+    post-hoc diagnostics, not by the fixed-sigma detector.
+    """
+    A = np.atleast_1d(np.asarray(A, dtype=float))
+    cy = np.atleast_1d(np.asarray(cy, dtype=float))
+    cx = np.atleast_1d(np.asarray(cx, dtype=float))
+    sigma = np.atleast_1d(np.asarray(sigma, dtype=float))
+    return np.concatenate([[float(b)], np.stack([A, cy, cx, sigma], axis=-1).ravel()])
+
+
+def unpack_var_sigma(theta):
+    """(b, A, cy, cx, sigma) for per-emitter-sigma theta."""
+    theta = np.asarray(theta, dtype=float)
+    rest = theta[1:].reshape(-1, 4)
+    return float(theta[0]), rest[:, 0], rest[:, 1], rest[:, 2], rest[:, 3]
+
+
+def model_var_sigma(theta, yy, xx, halo=0.0):
+    """Render a model with one sigma per emitter."""
+    ay, ax = axes(yy, xx)
+    b, A, cy, cx, sigma = unpack_var_sigma(theta)
+    out = np.full((ay.size, ax.size), b) + halo
+    for a, y, x, s in zip(A, cy, cx, sigma):
+        Ey = _shape(ay, np.array([y]), float(s))[:, 0]
+        Ex = _shape(ax, np.array([x]), float(s))[:, 0]
+        out += a * Ey[:, None] * Ex[None, :]
+    return out
+
+
+def jac_var_sigma(theta, yy, xx, halo=0.0):
+    """d(model)/d(theta) for one sigma per emitter, shape (h,w,4K+1)."""
+    ay, ax = axes(yy, xx)
+    _, A, cy, cx, sigma = unpack_var_sigma(theta)
+    h, w, K = ay.size, ax.size, A.size
+    J = np.empty((h, w, 4 * K + 1))
+    J[:, :, 0] = 1.0
+    for k, (a, y, x, s) in enumerate(zip(A, cy, cx, sigma)):
+        Ey, dEy, dEy_s = _factors_sigma(ay, np.array([y]), float(s))
+        Ex, dEx, dEx_s = _factors_sigma(ax, np.array([x]), float(s))
+        Ey = Ey[:, 0]
+        dEy = dEy[:, 0]
+        dEy_s = dEy_s[:, 0]
+        Ex = Ex[:, 0]
+        dEx = dEx[:, 0]
+        dEx_s = dEx_s[:, 0]
+        j0 = 1 + 4 * k
+        J[:, :, j0] = Ey[:, None] * Ex[None, :]
+        J[:, :, j0 + 1] = a * dEy[:, None] * Ex[None, :]
+        J[:, :, j0 + 2] = a * Ey[:, None] * dEx[None, :]
+        J[:, :, j0 + 3] = (
+            a * dEy_s[:, None] * Ex[None, :]
+            + a * Ey[:, None] * dEx_s[None, :]
+        )
     return J
 
 
