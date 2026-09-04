@@ -72,3 +72,7 @@ exclude = ["rust/target", "rust/dist"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# The shared microscopy environment exposes napari pytest plugins globally.
+# spotsolve does not use napari; prevent those plugins from importing it (and
+# writing its GUI theme cache) during this project's tests.
+addopts = ["-p", "no:napari", "-p", "no:napari-plugin-engine"]
