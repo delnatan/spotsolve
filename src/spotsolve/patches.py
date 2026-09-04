@@ -143,13 +143,25 @@ def build_halo_image(positions, amplitudes, frozen_indices, sigma, yy, xx, y0, x
     `yy, xx` are the patch's LOCAL grids (see patch_grids); `positions` are
     global, so they are converted to local coordinates here via (y0, x0)
     -- the same origin passed to patch_grids for this patch.
+
+    `sigma` is a scalar, or one width per emitter over ALL of `positions`
+    (indexed by `frozen_indices`, not pre-selected).
     """
     if frozen_indices.size == 0:
         return 0.0
     A = np.asarray(amplitudes)[frozen_indices]
     pos = np.asarray(positions)[frozen_indices]
-    theta = psf.pack(0.0, A, pos[:, 0] - y0, pos[:, 1] - x0)
-    return psf.model(theta, yy, xx, sigma)
+    w = np.asarray(sigma, dtype=float)
+    if w.ndim == 0:
+        theta = psf.pack(0.0, A, pos[:, 0] - y0, pos[:, 1] - x0)
+        return psf.model(theta, yy, xx, float(w))
+    # Per-emitter widths: `psf.model` takes one sigma for all of them, so the
+    # frozen neighbours are rendered one at a time. A halo is a handful of
+    # emitters, and rendering a defocused one at the in-focus width would put
+    # flux it does not have into the patch's own fit.
+    theta = psf.pack_var_sigma(0.0, A, pos[:, 0] - y0, pos[:, 1] - x0,
+                               w.ravel()[frozen_indices])
+    return psf.model_var_sigma(theta, yy, xx)
 
 
 def patch_grids(patch):

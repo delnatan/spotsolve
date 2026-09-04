@@ -23,7 +23,6 @@ import numpy as np
 import scipy.ndimage as ndi
 
 import spotsolve
-from spotsolve import core
 from spotsolve import backend, simulate
 
 SIGMA, GAIN, OFFSET, BG_E = 1.2, 4.23, 100.0, 4.0
@@ -270,15 +269,24 @@ def main(args):
     # round loop, `find_candidates`, and `background_map`'s convolutions. So a
     # difference between the `spotsolve` and `spotsolve-rs` columns is a difference in
     # the passes and nowhere else.
+    # `spotsolve` and `spotsolve-rs` both pass `slack=None`: the Rust core
+    # implements the FIXED-width layout only, so leaving the default free
+    # width on would silently run the Python passes in both columns and the
+    # comparison would be between one program and itself. `spotsolve-slack`
+    # is the free-width pipeline, Python by construction -- and this
+    # benchmark's arms all render at the model's own sigma, so it is the
+    # arm where slack has the least to show; see `bench_sim.py` for the
+    # measurement that motivates it.
     methods = {
         "spotsolve-flatbg": lambda adu: spotsolve.detect(
             adu, sigma=SIGMA, offset=OFFSET, gain=GAIN, bg_kernel=None,
-            verbose=0),
+            verbose=0, slack=None),
         "spotsolve": lambda adu: spotsolve.detect(
-            adu, sigma=SIGMA, offset=OFFSET, gain=GAIN, verbose=0),
+            adu, sigma=SIGMA, offset=OFFSET, gain=GAIN, verbose=0, slack=None),
         "spotsolve-rs": lambda adu: spotsolve.detect(
-            adu, sigma=SIGMA, offset=OFFSET, gain=GAIN, verbose=0, impl="rs"),
-        "spotsolve-roi": lambda adu: core.detect_local(
+            adu, sigma=SIGMA, offset=OFFSET, gain=GAIN, verbose=0, impl="rs",
+            slack=None),
+        "spotsolve-slack": lambda adu: spotsolve.detect(
             adu, sigma=SIGMA, offset=OFFSET, gain=GAIN, verbose=0),
     }
     if args.methods:

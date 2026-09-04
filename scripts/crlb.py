@@ -55,7 +55,30 @@ BINS = [(0.0, 1.0, "<1s"), (1.0, 2.0, "1-2s"), (2.0, 3.0, "2-3s"),
         (3.0, np.inf, ">3s"), (0.0, np.inf, "all")]
 
 
-def collect(size, densities, seeds, radius, bg, impl="py"):
+# Four arms, and the pairs between them are the point: `oracle`->`oracle-w`
+# prices the extra width parameter at the ESTIMATOR'S FLOOR, where no search is
+# involved at all; `fixed`->`mix` prices it end to end; and `mix`->`oracle-w`
+# is what the search costs under the shipped model. Comparing a free-width
+# pipeline against a fixed-width oracle -- which is what this script did while
+# it had only two arms -- charges the extra parameter to the search.
+ARMS = ("oracle", "oracle-w", "fixed", "mix")
+
+
+def _oracle(d_e, sim, truth, amps, impl, free):
+    """`refine` from the TRUE positions, N and background. No search."""
+    if not free:
+        p, a, se = backend.get(impl).refine(
+            d_e, truth.copy(), amps.copy(), SIGMA, sim.background, 12,
+            spotsolve.REFINE_SWEEPS)
+        return p, a, se
+    p, a, se, _ = spotsolve.refine(
+        d_e, truth.copy(), amps.copy(), SIGMA, sim.background, k_max=12,
+        max_sweeps=spotsolve.REFINE_SWEEPS,
+        sigmas=np.full(len(amps), SIGMA), slack=spotsolve.SIGMA_SLACK)
+    return p, a, se
+
+
+def collect(size, densities, seeds, radius, bg, impl="py", arms=ARMS):
     recs = []
     for dens in densities:
         for seed in range(seeds):
@@ -64,48 +87,46 @@ def collect(size, densities, seeds, radius, bg, impl="py"):
             truth, amps = sim.positions, sim.amplitudes
             nn = bench.nn_distance(truth)
 
-            # oracle: no search, true N, true background
-            # The oracle arm: refine from the TRUE positions at the true N
-            # with the true background, so a deficit can be attributed to the
-            # estimator or to the search instead of guessed at. Without it "the
-            # pull spread is 1.4" is uninterpretable.
-            p, a, se = backend.get(impl).refine(
-                d_e, truth.copy(), amps.copy(), SIGMA, sim.background, 12,
-                spotsolve.REFINE_SWEEPS)
-            dnn = nearest(truth, p)
-            for j in range(len(truth)):
-                ok = np.all(np.isfinite(se[j, 1:]))
-                recs.append(dict(
-                    arm="oracle", dens=dens, nn=nn[j], matched=bool(ok),
-                    dnn=dnn[j],
-                    zy=(p[j, 0] - truth[j, 0]) / se[j, 1] if ok else np.nan,
-                    zx=(p[j, 1] - truth[j, 1]) / se[j, 2] if ok else np.nan,
-                    za=(a[j] - amps[j]) / se[j, 0] if ok else np.nan,
-                    d=float(np.linalg.norm(p[j] - truth[j])) if ok else np.nan,
-                    se=0.5 * (se[j, 1] + se[j, 2]) if ok else np.nan))
+            for arm in arms:
+                if arm.startswith("oracle"):
+                    # No search: the estimator's floor, so a deficit can be
+                    # attributed to the estimator or to the search instead of
+                    # guessed at. Without it "the pull spread is 1.4" is
+                    # uninterpretable.
+                    p, a, se = _oracle(d_e, sim, truth, amps, impl,
+                                       free=arm.endswith("-w"))
+                    # One row per truth, in emitter order -- the oracle never
+                    # loses one, so no matching is needed or wanted.
+                    idx = {j: j for j in range(len(truth))}
+                    dist = {j: float(np.linalg.norm(p[j] - truth[j]))
+                            for j in range(len(truth))}
+                else:
+                    kw = (dict(slack=None) if arm == "fixed" else
+                          dict(slack=spotsolve.SIGMA_SLACK,
+                               band=spotsolve.FOCUS_BAND))
+                    r = spotsolve.detect(raw, sigma=SIGMA, offset=OFFSET,
+                                         gain=GAIN, verbose=0, impl=impl, **kw)
+                    p, a, se = r.positions, r.amplitudes, r.se
+                    # `hit` is keyed by the TRUTH index, which is what the
+                    # greedy matcher assigns; truths it never reached fall
+                    # through as unmatched rows rather than vanishing.
+                    hits = bench.greedy_match(p, truth, radius)
+                    idx = {j: i for i, j, _ in hits}
+                    dist = {j: d for _, j, d in hits}
 
-            r = spotsolve.detect(raw, sigma=SIGMA, offset=OFFSET, gain=GAIN,
-                              verbose=0, impl=impl)
-            # One row per TRUTH, so the denominator is the bin's emitter count
-            # in both arms. `hit` is keyed by the truth index, which is what
-            # the greedy matcher assigns; truths it never reached fall through
-            # as unmatched rows rather than vanishing from the table.
-            hit = {j: (i, dist)
-                   for i, j, dist in bench.greedy_match(r.positions, truth,
-                                                        radius)}
-            dnn = nearest(truth, r.positions)
-            for j in range(len(truth)):
-                i, dist = hit.get(j, (None, np.nan))
-                ok = (i is not None and r.se is not None
-                      and np.all(np.isfinite(r.se[i, 1:])))
-                recs.append(dict(
-                    arm="pipeline", dens=dens, nn=nn[j], matched=bool(ok),
-                    dnn=dnn[j],
-                    zy=(r.positions[i, 0] - truth[j, 0]) / r.se[i, 1] if ok else np.nan,
-                    zx=(r.positions[i, 1] - truth[j, 1]) / r.se[i, 2] if ok else np.nan,
-                    za=(r.amplitudes[i] - amps[j]) / r.se[i, 0] if ok else np.nan,
-                    d=dist if ok else np.nan,
-                    se=0.5 * (r.se[i, 1] + r.se[i, 2]) if ok else np.nan))
+                dnn = nearest(truth, p)
+                for j in range(len(truth)):
+                    i = idx.get(j)
+                    ok = (i is not None and se is not None
+                          and np.all(np.isfinite(se[i, 1:])))
+                    recs.append(dict(
+                        arm=arm, dens=dens, nn=nn[j], matched=bool(ok),
+                        dnn=dnn[j],
+                        zy=(p[i, 0] - truth[j, 0]) / se[i, 1] if ok else np.nan,
+                        zx=(p[i, 1] - truth[j, 1]) / se[i, 2] if ok else np.nan,
+                        za=(a[i] - amps[j]) / se[i, 0] if ok else np.nan,
+                        d=dist.get(j, np.nan) if ok else np.nan,
+                        se=0.5 * (se[i, 1] + se[i, 2]) if ok else np.nan))
     return recs
 
 
@@ -163,7 +184,7 @@ HDR = (f"{'arm / bin':>16s} {'n':>6} {'match%':>7} {'mean z':>7} {'sd z':>7} "
 
 def main(args):
     recs = collect(args.size, args.densities, args.seeds, args.radius, args.bg,
-                   args.impl)
+                   args.impl, args.arms)
     print(f"\n{args.size}x{args.size}, sigma {SIGMA}, background '{args.bg}', "
           f"{args.seeds} seeds/density, match radius {args.radius} px")
     print("pull z = (estimate - truth)/SE per axis; rsd 1.00 = at the CRLB, "
@@ -179,7 +200,7 @@ def main(args):
         print(f"\n=== density {dens} ===")
         print(HDR)
         print("-" * len(HDR))
-        for arm in ("oracle", "pipeline"):
+        for arm in args.arms:
             for lo, hi, nm in BINS:
                 sel = [r for r in recs if r["arm"] == arm
                        and r["dens"] == dens
@@ -200,4 +221,7 @@ if __name__ == "__main__":
                          "(see backend.py); both arms use it")
     ap.add_argument("--bg", choices=["flat", "gradient", "blobs"],
                     default="flat")
+    ap.add_argument("--arms", nargs="*", default=list(ARMS), choices=ARMS,
+                    help="oracle/oracle-w are the fixed- and free-width "
+                         "estimator floors; fixed/mix are the pipelines")
     main(ap.parse_args())

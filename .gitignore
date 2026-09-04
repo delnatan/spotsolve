@@ -41,6 +41,18 @@ data/hyp7_locs/
 !data/beads_60x_still.tif
 !data/beads_60x_still_02.tif
 
+# `data/sim_out/` is the psfkit confocal simulation the width work is measured
+# on -- 2.2 MB of .npy stacks and truth CSVs, and an OUTPUT like everything
+# else here. Regenerate from the sibling repo:
+#     python examples/simulate_spinning_disk_spots.py \
+#         --instrument bc43 --magnification 100 --pixel-size 0.085 \
+#         --size 64 --frames 20 --seed 0 --outdir sim_out
+# `--instrument widefield` builds the bright-out-of-focus arm (README 12).
+# Nothing in the test suite needs it: `04_end_to_end.json` bakes the pixels of
+# the frames it asserts on straight into the fixture, precisely so a reader
+# without this directory can still run the port against it.
+data/sim_out/
+
 # Figures, logs and scratch. `docs/*.md` is tracked; nothing binary is.
 *.png
 *.pdf

@@ -48,7 +48,6 @@ def main(args):
                         impl=args.impl,
                         gain=args.gain, k_max=args.k_max,
                         bg_kernel=None if args.flat_bg else spotsolve.BG_KERNEL,
-                        reject_aggregates=args.reject_aggregates,
                         verbose=1)
     dt = time.time() - t
 
@@ -81,8 +80,8 @@ def main(args):
                   f"{o['ratio']:9.1f} {o['n']:5d}")
 
     if res.aggregates is not None and len(res.aggregates):
-        print(f"\naggregates EXCLUDED pre-search: {len(res.aggregates)}, "
-              f"{100*res.aggregate_fraction:.1f}% of the frame")
+        print(f"\nwide objects (modelled, not reported as detections): "
+              f"{len(res.aggregates)}")
         print(f"{'y':>8} {'x':>8} {'sigma':>7} {'flux e-':>10} {'radius':>7}")
         for g in np.sort(res.aggregates, order="flux")[::-1]:
             print(f"{g['y']:8.2f} {g['x']:8.2f} {g['sigma']:7.2f} "
@@ -93,16 +92,15 @@ def main(args):
     if len(res.positions):
         ax[0].plot(res.positions[:, 1], res.positions[:, 0], "r+", ms=8, mew=1.3)
     if res.aggregates is not None and len(res.aggregates):
-        # Drawn at the masked radius, so what was excluded is visible rather
-        # than merely tabulated.
+        # Drawn at the object's own support, so what the model absorbed as a
+        # non-point-source is visible rather than merely tabulated.
         for g in res.aggregates:
             ax[0].add_patch(plt.Circle((g["x"], g["y"]), g["radius"],
                                        fill=False, ec="orange", lw=1.4,
                                        ls="--"))
     ttl = f"{args.image}\nN={len(res.positions)}"
     if res.aggregates is not None and len(res.aggregates):
-        ttl += (f"  ({len(res.aggregates)} aggregates, "
-                f"{100*res.aggregate_fraction:.0f}% masked)")
+        ttl += f"  (+{len(res.aggregates)} wide)"
     ax[0].set_title(ttl, fontsize=9)
     ax[1].imshow(res.model_image, cmap="gray")
     ax[1].set_title("model", fontsize=9)
@@ -148,11 +146,6 @@ if __name__ == "__main__":
     ap.add_argument("--agg-ratio", type=float, default=spotsolve.AGG_AMP_RATIO,
                     help="post-hoc aggregate flag: flux as a multiple of the "
                          "frame's median detection (reported, never removed)")
-    ap.add_argument("--reject-aggregates", action="store_true",
-                    help="find bright over-wide objects before the search, "
-                         "freeze them into the model and report them in "
-                         "result.aggregates (off by default: it also flags "
-                         "~6%% of ordinary close pairs)")
     ap.add_argument("--flat-bg", action="store_true",
                     help="one background scalar for the frame, no surface")
     ap.add_argument("--out", default="result.png")

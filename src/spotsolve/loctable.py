@@ -52,7 +52,8 @@ diffusion coefficients from without saying so.
 import numpy as np
 import polars as pl
 
-from . import core, infocus
+from . import core
+from .structs import WIDTH_REJECT_DTYPE
 
 LOCALIZATION_SCHEMA = {
     "loc_id": pl.UInt32,      # unique over the whole movie; a stable handle
@@ -242,7 +243,7 @@ def width_reject_table(result, frame, t=0.0, pixel_size=1.0):
     rec = result.width_rejects
     ps = float(pixel_size)
     if rec is None:
-        rec = np.empty(0, dtype=infocus.WIDTH_REJECT_DTYPE)
+        rec = np.empty(0, dtype=WIDTH_REJECT_DTYPE)
     return pl.DataFrame(
         {
             "frame": np.full(len(rec), frame),

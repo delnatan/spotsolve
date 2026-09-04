@@ -26,6 +26,12 @@ Poisson point process on emitters, p(K) = Poisson(lam*Area); positions
 uniform on the patch; amplitudes A_k ~ Exp(1/A_s); background
 b ~ Uniform[0, b_max].
 
+With free per-emitter widths the process is a SUPERPOSITION of two such
+processes -- in-focus emitters and defocused nuisance objects, distinguished
+only by the support of their width prior and by their rate. That changes no
+term here except the count-and-width prior, which `_count_width_delta` then
+takes from a `prior.WidthPrior` rather than from `lam` alone. See `prior.py`.
+
 For a K -> K+1 move the Area factors cancel exactly: the prior odds
 contribute lam*Area/(K+1) and the new emitter's position prior contributes
 1/Area. What survives is area-free:
@@ -47,7 +53,7 @@ import numpy as np
 from scipy.linalg import cho_factor, LinAlgError
 
 __all__ = ["COND_GUARD", "logdet", "logdet_cond",
-           "log_bf_add", "log_bf_remove", "log_bf_wide"]
+           "log_bf_add", "log_bf_remove"]
 
 
 COND_GUARD = 1e3
@@ -174,8 +180,35 @@ def _d_log_amplitude_prior(A_before, A_after, prior):
     return float(la - lb)
 
 
+def _count_width_delta(K_before, lam, widths):
+    """The prior terms that depend on how many emitters there are and how wide.
+
+    Two layouts:
+
+    `widths=None` -- fixed width. `log(lam) - log(K+1)`, the point process's
+    prior odds and nothing else, because there are no widths to price.
+
+    `widths=(prior, sigmas_before, sigmas_after)` -- a `prior.WidthPrior`. The
+    whole configuration is scored on each side and differenced, exactly as
+    `_d_log_amplitude_prior` scores the whole amplitude vector, and for the same
+    reason: under a mixture the incumbents do NOT cancel, because a neighbour
+    that widens across a class boundary during the joint refit moves between
+    two Poisson processes and changes both their counts.
+
+    A single uniform band is `prior.UniformWidth`, whose difference reduces
+    algebraically to `log(lam) - log(K+1) - log(sigma_width)` -- the expression
+    this function computed inline while a scalar `sigma_width` was a third
+    layout of its own.
+    """
+    if widths is None:
+        return np.log(lam) - np.log(K_before + 1)
+    wp, sig_before, sig_after = widths
+    return wp.log_config(sig_after) - wp.log_config(sig_before)
+
+
 def _log_bf_add_from_logdet(I_before, I_after, ld_before, ld_after,
-                            A_before, A_after, K_before, lam, prior):
+                            A_before, A_after, K_before, lam, prior,
+                            widths=None):
     """The Bayes factor itself, once both log-determinants are in hand.
 
     Split out so `log_bf_remove` can reuse it. Removal is the exact negation of
@@ -183,19 +216,26 @@ def _log_bf_add_from_logdet(I_before, I_after, ld_before, ld_after,
     re-factorized both Fisher matrices it had already factorized itself -- four
     Cholesky decompositions and four condition numbers per death or merge
     proposal where two suffice.
+
+    A free width -- signalled by `widths` being given -- changes two terms and
+    only two. The added emitter carries FOUR new parameters rather than three,
+    so the Laplace volume is `2 log(2pi)`; and the count-and-width prior comes
+    from `_count_width_delta`. Everything else -- the amplitude prior, the Occam
+    factor -- is the same expression either way.
     """
+    free_width = widths is not None
     return float(
         (I_before - I_after)
-        + np.log(lam)
-        - np.log(K_before + 1)
+        + _count_width_delta(K_before, lam, widths)
         + _d_log_amplitude_prior(A_before, A_after, prior)
-        + 1.5 * np.log(2.0 * np.pi)
+        + (2.0 if free_width else 1.5) * np.log(2.0 * np.pi)
         - 0.5 * (ld_after - ld_before)
     )
 
 
 def log_bf_add(I_before, I_after, F_before, F_after,
-               A_before, A_after, K_before, lam, prior, before=None):
+               A_before, A_after, K_before, lam, prior, before=None,
+               widths=None):
     """log BF for K_before -> K_before+1 (an ADD; legacy BIRTH or SPLIT).
 
     Positive favours the larger model. Returns (log_bf, scaled_cond_after)
@@ -217,11 +257,12 @@ def log_bf_add(I_before, I_after, F_before, F_after,
         return -np.inf, cond_a
     return _log_bf_add_from_logdet(I_before, I_after, ld_b, ld_a,
                                    A_before, A_after, K_before,
-                                   lam, prior), cond_a
+                                   lam, prior, widths), cond_a
 
 
 def log_bf_remove(I_full, I_reduced, F_full, F_reduced,
-                  A_full, A_reduced, K_full, lam, prior, full=None):
+                  A_full, A_reduced, K_full, lam, prior, full=None,
+                  widths=None):
     """log BF for K_full -> K_full-1 (DEATH or MERGE).
 
     Positive favours the smaller model. This is the exact negation of the
@@ -231,6 +272,10 @@ def log_bf_remove(I_full, I_reduced, F_full, F_reduced,
 
     Neither condition number is read here, so both determinants come from
     `logdet`. `full` is the incumbent's precomputed one, as in `log_bf_add`.
+
+    `widths`, when given, is `(width_prior, sigmas_reduced, sigmas_full)` -- in
+    that order, because this is the negation of the ADD whose "before" is the
+    reduced configuration.
     """
     ld_full, ok_full = logdet(F_full) if full is None else full
     ld_reduced, ok_reduced = logdet(F_reduced)
@@ -240,48 +285,5 @@ def log_bf_remove(I_full, I_reduced, F_full, F_reduced,
         return np.inf       # the current model is degenerate; removal is right
     return -_log_bf_add_from_logdet(
         I_reduced, I_full, ld_reduced, ld_full,
-        A_reduced, A_full, K_full - 1, lam, prior,
-    )
-
-
-def log_bf_wide(I_narrow, I_wide, F_narrow, F_wide, A_narrow, A_wide,
-                K_narrow, lam, prior, sigma_width, narrow=None):
-    """log BF for "one emitter of free width" against "K emitters at the PSF
-    width". Positive favours the ONE WIDE object.
-
-    The two models are NOT nested -- H_wide is not H_K with a parameter fixed --
-    which is exactly why this is an evidence and not a likelihood-ratio test.
-    Each side's Laplace evidence is computed on its own and differenced:
-
-        log P(d|H) = -I + log pi(theta_hat) + (p/2) log(2pi) - 0.5 log|F|
-
-    `I` is an I-divergence, so the data-only constant separating it from the
-    negative log-likelihood is the same on both sides and cancels. So does
-    `b`'s uniform prior (same range), and so does the point process's
-    `exp(-lam*Area)`: the Poisson count prior contributes `(lam*Area)^K/K!` and
-    the K uniform positions contribute `Area^-K`, leaving `lam^K/K!` and no
-    area anywhere -- the same cancellation `log_bf_add` relies on.
-
-    H_wide pays for its extra width parameter three times over, which is what
-    stops it swallowing ordinary close pairs: one more Laplace dimension, one
-    more Occam factor in `|F_wide|`, and `-log(sigma_width)` for the uniform
-    prior over the widths it was allowed to choose from.
-
-    Fails CLOSED in both directions: a non-positive-definite Fisher matrix on
-    either side is "this model is ill-posed", never evidence for the other.
-    """
-    ld_n, ok_n = logdet(F_narrow) if narrow is None else narrow
-    ld_w, ok_w = logdet(F_wide)
-    if not (ok_n and ok_w):
-        return -np.inf
-    K = int(K_narrow)
-    from scipy.special import gammaln
-    return float(
-        (I_narrow - I_wide)
-        + (1 - K) * np.log(lam)
-        + gammaln(K + 1)
-        + _d_log_amplitude_prior(A_narrow, [A_wide], prior)
-        - np.log(sigma_width)
-        + 0.5 * (4 - 3 * K) * np.log(2.0 * np.pi)
-        - 0.5 * (ld_w - ld_n)
+        A_reduced, A_full, K_full - 1, lam, prior, widths,
     )

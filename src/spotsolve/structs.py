@@ -27,6 +27,38 @@ from dataclasses import dataclass, field
 import numpy as np
 
 
+WIDTH_REJECT_DTYPE = np.dtype([
+    ("source_index", np.int64),
+    ("y", np.float64),
+    ("x", np.float64),
+    ("flux", np.float64),
+    ("sigma", np.float64),
+    ("sigma_ratio", np.float64),
+    ("reason", "U12"),
+])
+"""One object the model fitted but the reporting band does not accept.
+
+Emitted by `core.detect`, which decides it during the search, and by
+`core.detect`, which decides it during the search. `reason` is `"too_narrow"`
+or `"too_wide"`; `source_index` indexes the working configuration the rejection
+was made against. It lives here rather than in `core` because it is a contract
+between modules, which is what this file is for.
+"""
+
+
+def width_reject_records(source, positions, amplitudes, sigmas, sigma, reason):
+    """`WIDTH_REJECT_DTYPE` rows for objects the reporting band refused."""
+    rec = np.empty(len(source), dtype=WIDTH_REJECT_DTYPE)
+    rec["source_index"] = source
+    rec["y"] = positions[:, 0] if len(positions) else np.empty(0)
+    rec["x"] = positions[:, 1] if len(positions) else np.empty(0)
+    rec["flux"] = amplitudes
+    rec["sigma"] = sigmas
+    rec["sigma_ratio"] = sigmas / sigma if len(sigmas) else sigmas
+    rec["reason"] = reason
+    return rec
+
+
 @dataclass
 class Patch:
     """A group of emitters fitted jointly, plus its pixel bounding box.
@@ -78,29 +110,27 @@ class DetectResult:
     se: np.ndarray = None      # (N,3) CRLB (SE_A, SE_y, SE_x) where available
     history: list = field(default_factory=list)   # per-pass convergence record
     aggregates: np.ndarray = None
-    """Bright, over-wide objects found and EXCLUDED before the search.
+    """The WIDE CLASS: objects the search fitted at a width above `FOCUS_BAND`.
 
     A structured array with fields `y`, `x`, `sigma`, `flux`, `radius`, or
-    `None` when aggregate rejection was not run. Always reported rather than
-    silently dropped: an aggregate is a data-quality fact about the frame, and
-    a detector that quietly deletes bright regions cannot be debugged on real
-    data. `aggregate_fraction` is the masked share of the frame -- a frame
-    that is 30% aggregate is a frame to be suspicious of, not one to trust the
-    emitter count from.
+    `None` when the frame held none. These are NOT localizations -- `sigma` is
+    the object's fitted width and `flux` its total, and neither is comparable
+    to `amplitudes`, which are point emitters inside the band.
 
-    These are NOT localizations. `sigma` is the free-sigma fit at the object's
-    peak on the raw frame and `flux` its total; both describe the excluded
-    object, and neither is comparable to `amplitudes`, which are point
-    emitters fitted at the PSF sigma.
+    They are modelled to the end and ARE in `model_image` and `residual`, which
+    is the whole point: a defocused object whose flux is left in the residual
+    refills FIND's candidate list and gets tiled. Reported rather than silently
+    dropped, because what a frame contains that is not a point emitter is a
+    data-quality fact about that frame. See README section 8b.
     """
-    aggregate_fraction: float = 0.0   # masked share of the frame, 0..1
     fit_sigma: np.ndarray = None
-    """Optional per-emitter sigma from a post-hoc physical-width fit.
+    """Per-emitter fitted sigma, aligned with `positions`.
 
-    `sigma` remains the in-focus PSF width used for the reported final
-    positions, amplitudes and CRLBs. This field is diagnostic: it records the
-    variable-sigma fit that decided whether each retained emitter was
-    physically plausible.
+    A RESULT, not a diagnostic: with a free width these are the widths that
+    produced the reported positions, amplitudes and CRLBs, and `sigma_ratio`
+    is a per-emitter defocus readout. Note it is a SHRUNK estimate of defocus,
+    not an unbiased one -- the width prior pulls it toward the PSF width, which
+    is what makes close pairs resolvable; see README section 15.
     """
     sigma_ratio: np.ndarray = None
     width_rejects: np.ndarray = None

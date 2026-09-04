@@ -130,6 +130,14 @@ def _to_interior(theta, lower, upper, frac=_INTERIOR_FRAC):
     return np.minimum(np.maximum(theta, lower + margin), upper - margin)
 
 
+def _pen_zero_val(theta):
+    return 0.0
+
+
+def _pen_zero_vec(theta):
+    return 0.0
+
+
 def _coleman_li_scale(theta, grad, lower, upper):
     """sqrt of the distance to whichever bound the step is heading toward.
 
@@ -159,13 +167,37 @@ def fit(
     tol_step=1e-10,
     lambda0=1e-2,
     free_sigma=False,
+    penalty=None,
 ):
-    """Fit theta by bounded Fisher-scoring LM.
+    """Fit theta by bounded Fisher-scoring LM (MAP when `penalty` is given).
 
     If `free_sigma` is True, `theta` includes sigma as its last entry and
     `sigma` (the scalar argument) is ignored; the model used is
     psf.model_free_sigma. If `free_sigma == "per_emitter"`, theta carries one
     sigma per emitter using psf.pack_var_sigma.
+
+    `penalty` and what it makes this
+    --------------------------------
+    With `penalty=None` this maximizes the likelihood. Given one -- any object
+    exposing `value(theta)`, `grad(theta)` and `hess_diag(theta)`, all in nats
+    and in theta's own coordinates -- it maximizes the POSTERIOR instead: the
+    penalty's value joins the objective, its gradient joins `grad`, and its
+    curvature joins the Gauss-Newton matrix.
+
+    Two consequences that callers depend on, and they pull in opposite
+    directions, so both are deliberate:
+
+    `I` is returned WITHOUT the penalty -- the data term alone. Everything
+    downstream differences `I` against another fit's and then adds the prior
+    itself (`evidence`, via its width and flux priors), so returning a
+    penalized `I` would charge the prior twice.
+
+    `F` is returned WITH it. The Laplace evidence wants the Hessian of the log
+    POSTERIOR, `F + Lambda`, not the likelihood Fisher -- README section 15
+    recorded that omission, and this is where it is repaired: a curved prior's
+    curvature belongs in the matrix whose log-determinant becomes the Occam
+    factor. With a flat prior `hess_diag` is zero and `F` is what it always
+    was.
 
     Convergence: `tol_obj` in NATS
     ------------------------------
@@ -225,17 +257,30 @@ def fit(
         term = np.where(d_pos, d_safe * np.log(d_safe / m), 0.0)
         return float(np.sum(term - (d_flat - m)))
 
+    # The penalty is optional and diagonal; `_zeros` keeps the hot loop free
+    # of `if penalty is None` branches without allocating when there is none.
+    if penalty is None:
+        pen_val = _pen_zero_val
+        pen_grad = pen_diag = _pen_zero_vec
+    else:
+        pen_val, pen_grad, pen_diag = (penalty.value, penalty.grad,
+                                       penalty.hess_diag)
+
     m, J = eval_model_jac(theta)
     m = np.maximum(m, 1e-9)
-    I_cur = idiv(m)
+    # `I_cur` is the PENALIZED objective while the loop runs -- that is what LM
+    # must decrease monotonically -- and the data term alone is recovered at
+    # the end for the caller.
+    I_cur = idiv(m) + pen_val(theta)
 
     converged = False
     stalled = False
     it = 0
     for it in range(1, max_iter + 1):
         W = 1.0 / m
-        grad = J.T @ (W * (m - d_flat))  # dI/dtheta
+        grad = J.T @ (W * (m - d_flat)) + pen_grad(theta)   # d(objective)/dtheta
         F = J.T @ (W[:, None] * J)
+        F.reshape(-1)[:: p + 1] += pen_diag(theta)
 
         if np.max(np.abs(grad)) < tol_grad:
             converged = True
@@ -313,7 +358,7 @@ def fit(
             theta_trial = _to_interior(theta + delta, lower, upper)
             m_trial, J_trial = eval_model_jac(theta_trial)
             m_trial = np.maximum(m_trial, 1e-9)
-            I_trial = idiv(m_trial)
+            I_trial = idiv(m_trial) + pen_val(theta_trial)
 
             actual_dec = I_cur - I_trial
             # LM gain ratio: how much of the promised improvement was real.
@@ -363,10 +408,11 @@ def fit(
 
     W = 1.0 / np.maximum(m, 1e-9)
     F_final = J.T @ (W[:, None] * J)
+    F_final.reshape(-1)[:: p + 1] += pen_diag(theta)
 
     return FitResult(
         theta=theta,
-        I=I_cur,
+        I=idiv(np.maximum(m, 1e-9)),
         F=F_final,
         n_iter=it,
         converged=converged,

@@ -41,7 +41,6 @@ import json
 import time
 from pathlib import Path
 
-import numpy as np
 import polars as pl
 import tifffile
 
@@ -86,14 +85,6 @@ def main(args):
         res = spotsolve.detect(raw, sigma=args.sigma, offset=CAMERA_OFFSET,
                             gain=args.gain, k_max=args.k_max, impl=args.impl,
                             verbose=0)
-        if args.filter_in_focus:
-            res = spotsolve.filter_in_focus(
-                raw, res, offset=CAMERA_OFFSET, gain=args.gain,
-                sigma_ratio_min=args.sigma_ratio_min,
-                sigma_ratio_max=args.sigma_ratio_max,
-                sigma_lo_ratio=args.var_sigma_lo_ratio,
-                sigma_hi_ratio=args.var_sigma_hi_ratio,
-                k_max=args.k_max, impl=args.impl)
         dt = time.time() - t0
 
         locs, row, aggs = loctable.frame_tables(
@@ -167,11 +158,6 @@ def main(args):
         "camera_offset_adu": CAMERA_OFFSET,
         "pixel_size_um": args.pixel_size, "frame_interval_s": args.interval,
         "k_max": args.k_max, "impl": args.impl,
-        "filter_in_focus": args.filter_in_focus,
-        "sigma_ratio_min": args.sigma_ratio_min if args.filter_in_focus else None,
-        "sigma_ratio_max": args.sigma_ratio_max if args.filter_in_focus else None,
-        "var_sigma_lo_ratio": args.var_sigma_lo_ratio if args.filter_in_focus else None,
-        "var_sigma_hi_ratio": args.var_sigma_hi_ratio if args.filter_in_focus else None,
         "agg_ratio": args.agg_ratio if args.agg_ratio is not None
         else spotsolve.AGG_AMP_RATIO,
         "flux_units": "photoelectrons", "position_units": "px (y, x)",
@@ -201,20 +187,6 @@ if __name__ == "__main__":
     ap.add_argument("--agg-ratio", type=float, default=None,
                     help=f"over-bright cut, flux / the frame's median "
                          f"detection (default {spotsolve.AGG_AMP_RATIO:.0f})")
-    ap.add_argument("--filter-in-focus", action="store_true",
-                    help="post-detect variable-sigma physical-width filter")
-    ap.add_argument("--sigma-ratio-min", type=float,
-                    default=spotsolve.INF_FOCUS_SIGMA_RATIO_MIN,
-                    help="minimum fitted sigma / in-focus sigma to keep")
-    ap.add_argument("--sigma-ratio-max", type=float,
-                    default=spotsolve.INF_FOCUS_SIGMA_RATIO_MAX,
-                    help="maximum fitted sigma / in-focus sigma to keep")
-    ap.add_argument("--var-sigma-lo-ratio", type=float,
-                    default=spotsolve.VAR_SIGMA_RATIO_LO,
-                    help="lower variable-sigma fit bound, relative to sigma")
-    ap.add_argument("--var-sigma-hi-ratio", type=float,
-                    default=spotsolve.VAR_SIGMA_RATIO_HI,
-                    help="upper variable-sigma fit bound, relative to sigma")
     ap.add_argument("--out",
                     default=str(Path(__file__).resolve().parent.parent
                                 / "data" / "hyp7_locs"))

@@ -54,25 +54,38 @@ class PythonBackend:
 
     name = "py"
 
+    # The four passes carry per-emitter widths internally; this contract does
+    # not, because the Rust core does not implement them yet. Every emitter is
+    # handed in at the PSF width and the widths that come back are discarded,
+    # which is exactly the fixed-width pipeline. `core.detect(slack=...)`
+    # bypasses this backend and calls the passes directly -- see its `impl`
+    # note.
+
     def add_pass(self, d_e, bmap, pos, amp, cand, camp, sigma, lam, A_s, k_max):
         from . import core
-        return core._add_pass(d_e, bmap, pos, amp, cand, camp,
-                                sigma, lam, A_s, k_max)
+        sig = np.full(len(np.asarray(amp).ravel()), float(sigma))
+        pos, amp, _, n = core._add_pass(d_e, bmap, pos, amp, sig, cand, camp,
+                                        sigma, lam, A_s, k_max)
+        return pos, amp, n
 
     def split_pass(self, d_e, bmap, pos, amp, model, sigma, lam, A_s, k_max):
         from . import core
-        return core._split_pass(d_e, pos, amp, bmap, sigma, lam, A_s,
-                                  k_max, model)
+        sig = np.full(len(np.asarray(amp).ravel()), float(sigma))
+        pos, amp, _, n = core._split_pass(d_e, pos, amp, sig, bmap, sigma,
+                                          lam, A_s, k_max, model)
+        return pos, amp, n
 
     def refine(self, d_e, pos, amp, sigma, bmap, k_max, max_sweeps):
         from . import core
         return core.refine(d_e, pos, amp, sigma, bmap, k_max=k_max,
-                             max_sweeps=max_sweeps)
+                             max_sweeps=max_sweeps)[:3]
 
     def prune(self, d_e, bmap, pos, amp, sigma, lam, A_s, k_max):
         from . import core
         n0 = len(pos)
-        pos, amp = core._prune(d_e, pos, amp, bmap, sigma, lam, A_s, k_max)
+        sig = np.full(len(np.asarray(amp).ravel()), float(sigma))
+        pos, amp, _ = core._prune(d_e, pos, amp, sig, bmap, sigma, lam, A_s,
+                                  k_max)
         return pos, amp, n0 - len(pos)
 
     def fit_var_sigma(self, theta0, h, w, d, halo, lower, upper, max_iter):

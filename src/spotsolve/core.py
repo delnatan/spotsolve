@@ -37,7 +37,6 @@ errors are produced.
 import numpy as np
 import scipy.ndimage as ndi
 
-from . import aguet
 from . import backend as backend_mod
 from . import calibrate
 from . import evidence
@@ -46,18 +45,22 @@ from . import moves
 from . import patches as patch_mod
 from . import prior as prior_mod
 from . import psf
-from .structs import DetectResult
+from .structs import DetectResult, width_reject_records
 
-__all__ = ["detect", "detect_local", "solve_roi", "find_candidates",
-           "background_map", "refine",
-           "log_kernel_l2", "find_aggregates", "flag_aggregates",
-           "aggregate_report"]
+__all__ = ["detect", "refine", "find_candidates", "background_map",
+           "log_kernel_l2", "flag_aggregates", "aggregate_report"]
 
 
 LINK_FACTOR = 2.5   # emitters within this many sigma are fitted jointly
 HALO_FACTOR = 5.0   # ... and beyond it are frozen into the model as a constant
 BBOX_PAD = 3.0      # sigma of pixel context around a group's extreme emitters
+SEED_ALPHA = calibrate.SEED_ALPHA
 CAND_THRESHOLD = calibrate.LOG_SEED_Z
+# The historical constant. `detect(threshold=None)` DERIVES the cut from the
+# frame and the PSF instead -- see `calibrate.seed_threshold`, and note that it
+# is not a constant at all: it scales with frame size and sigma, which is why
+# carrying one number silently gave every instrument a different detector.
+# This name survives so the old behaviour stays reachable and attributable.
 
 PRUNE_TAU = 2.0
 # A / SE(A), measured on the joint fit, below which `_prune` removes an emitter
@@ -111,7 +114,124 @@ PRUNE_TAU = 2.0
 # it. Validity alone would argue for 3.0; raising it that far costs
 # localization as well as recall, because removing one member of a real close
 # pair leaves the survivor absorbing both fluxes and sitting between them.
-# 2.0 is the measured optimum on both bead frames.
+# 2.0 was the measured optimum on both bead frames -- under the fixed-width,
+# single-class, ML-fitted pipeline, all three of which have since changed.
+# RE-SWEPT on the confocal simulation under the current algorithm (moderate,
+# 6 frames):
+#
+#   tau   recall   med err    RMSE   rsd z   |z|>3   tiles
+#   1.5    93.4%     0.077   0.217    1.30    6.1%    3.33
+#   2.0    92.6%     0.076   0.220    1.25    7.0%    2.33
+#   2.5    92.3%     0.076   0.220    1.29    8.1%    2.83
+#   3.0    89.4%     0.079   0.224    1.39   10.4%    1.67
+#
+# 2.0 survives: best pull spread, fewest tiles, and within a point of 1.5's
+# recall. 3.0 is clearly wrong. This matters beyond the dial itself --
+# `backend.RustBackend` asserts on this constant at load, so a stale value
+# would be frozen into a second implementation.
+
+SIGMA_SLACK = (0.70, 2.2)
+FOCUS_BAND = (0.80, 2.0)
+# `SIGMA_SLACK` is the MODEL SPACE: the widths a fit may represent, as
+# multiples of the PSF sigma. `FOCUS_BAND` is the REPORTING BAND: the widths
+# that count as an in-focus detection. `None` for the slack fixes every emitter
+# at the PSF width, which is what the pipeline did before 2026-09-03.
+#
+# Until 2026-09-03 these were ONE constant, `(0.95, 2.0)`, and that conflation
+# is what made the detector tile defocused sources. The model space has to
+# cover every photon on the sensor or the light it cannot represent gets tiled;
+# the reporting band is a downstream contract about what the caller is handed.
+# Clipping the first to the second manufactured the tiles. What makes the two
+# affordable at once is the MIXTURE width prior -- see `prior.WidthPrior`,
+# which carries the argument and the arithmetic. In short: under one uniform
+# prior over [0.95, 8.0] every in-focus add would pay 1.9 nats for the
+# enlargement, and a wide fit swallowing a real neighbour would pay almost
+# nothing for the privilege; under the mixture an in-focus add pays exactly
+# what it paid before, and a wide one pays against its own rarer rate.
+#
+# The band's edges are asymmetric in KIND, which is why they are enforced in
+# different places. `FOCUS_BAND[1]` is a class boundary between two populations
+# that are both real, so it lives in the prior and is decided during the
+# search, while the flux is still undivided. `FOCUS_BAND[0]` is not a class:
+# nothing images narrower than the PSF, so a fit below it is a fit that has
+# BROKEN, and there is no information about that which the search destroys.
+# It is a post-fit check on the survivors, and `SIGMA_SLACK[0]` sits below it
+# so that a broken fit can reveal itself instead of being clipped to the bound
+# and reported. A post-hoc filter used to make the same two cuts with the same
+# two values, after the search rather than during it; see README section 13 for
+# why that could not work and where it went.
+#
+# Why the model needs slack at all. A fixed-sigma model meets a source it
+# cannot represent -- anything out of focus -- by TILING it: the residual a
+# single narrow PSF leaves on a broad blob has lobes, SPLIT proposes into
+# them, and the evidence correctly prefers two narrow Gaussians to one,
+# because two narrow Gaussians genuinely do fit a wide blob better. The
+# decision rule is right and the model space is wrong, so no threshold fixes
+# it. Measured on a confocal simulation with emitters uniform in +/- 0.5 um
+# (`scripts/bench_sim.py`), at 1 emitter/um^2 the fixed-sigma search returned
+# 7.2 extra detections per frame against 13.4 in-focus emitters -- and every
+# one of them sat within 3 sigma(z) of a REAL emitter. Not one was invented.
+#
+# The band's UPPER edge is how far out of focus an emitter may still be
+# reported as a detection. In this simulation a point source images at 1.26x
+# the in-focus width at |z| = 0.25 um, 1.95x at 0.35 and 3.2x at 0.50, so 2.0
+# is everything inside |z| ~ 0.36 um.
+#
+# The MODEL's upper bound is a different question -- what "one object" can
+# still mean. Beyond that the thing is not a defocused point source and
+# belongs to the background, or to `find_aggregates` if it is bright enough to
+# be worth excluding by hand.
+#
+# The sweep below is why those two cannot be the same number, and it is the
+# measurement that used to be read as an argument for the hard bound at 2.0.
+# It was taken with a SINGLE uniform width prior, where raising the bound
+# charges a wide fit only log(2.25/1.05) = 0.76 nats for the whole enlargement
+# -- so a wide emitter swallowing a genuine close pair was charged essentially
+# nothing, and the residual degraded monotonically past 2.0 for that reason
+# and not because 2.0 is where the optics stop. 4 frames per density, sweeping
+# the bound alone (`residrsd` is the normalized residual's robust spread, 1.0
+# being a model that explains the frame):
+#
+#            sparse                 moderate               dense
+#   hi    tile  recall residrsd  tile recall residrsd  tile recall residrsd
+#  fixed  9.50   98.0%   1.165   42.0  96.3%   1.240   79.2  92.1%   1.153
+#   1.3   4.75   98.0%   1.144   20.2  92.3%   1.235   27.8  85.8%   1.315
+#   1.6   2.00   98.0%   1.142   10.8  93.9%   1.229   14.5  85.2%   1.372
+#   2.0   1.75   96.1%   1.128    8.8  93.5%   1.211   15.5  85.1%   1.288
+#   2.5   1.75   98.0%   1.138    6.2  93.9%   1.239   10.8  81.9%   1.420
+#   3.2   1.00   96.1%   1.170    3.5  91.9%   1.318   12.0  79.8%   1.680
+#
+# 2.0 was the best residual at every density and the best pull tail at two of
+# three. Read again with the mixture prior in hand, what this table measures
+# is the cost of an UNPRICED enlargement, not the location of a physical edge:
+# the tiling column falls monotonically all the way to 3.2 -- the model space
+# doing its job -- while the residual turns over at 2.0, which is the wide
+# class going unpaid for.
+#
+# RE-SWEPT under the MAP width fit, which is the pipeline this constant now
+# lives in (moderate arm, 6 frames, band fixed at (0.8, 2.0)):
+#
+#    hi    recall   med err    RMSE   rsd z   |z|>3   tiles
+#   2.2     92.6%     0.076   0.220    1.25    7.0%    2.33
+#   2.6     91.1%     0.078   0.201    1.31    8.0%    2.33
+#   3.2     90.8%     0.078   0.183    1.27    8.7%    4.00
+#   4.0     90.5%     0.078   0.194    1.32    8.1%    2.50
+#
+# 2.2 survives, and the prediction that the MAP fit would let the bound rise
+# toward the optics' own 3.2 was WRONG: recall falls monotonically past 2.2
+# while RMSE improves, which is a larger model space buying better parameters
+# for the objects it keeps and losing the close neighbours it swallows. The
+# trade does not reverse; it just gets priced honestly.
+#
+# Note what the sweep also says, and section 15 records: most of the recall
+# cost at high density is paid by the FIRST step away from a fixed width --
+# 1.3 already costs 6 points at 10 emitters/um^2 while only halving the
+# tiling. That is not the bound's fault, it is the search order's; see
+# "A widened emitter can hide its own neighbour".
+#
+# The trade is priced by the evidence rather than assumed: the extra width
+# parameter pays a Laplace dimension, an Occam factor and its own width
+# prior's mass on every emitter that carries it.
 
 SPLIT_DISPS = (1.0, 1.6)
 # Displacements, in sigma, at which a split is proposed. Below ~1 sigma a pair
@@ -243,7 +363,9 @@ def background_map(d_e, positions, sigma, kernel=BG_KERNEL,
 
 
 def render(positions, amplitudes, sigma, bmap):
-    """Full model image: the background surface plus every emitter's PSF."""
+    """Full model image: the background surface plus every emitter's PSF.
+
+    `sigma` is a scalar or one width per emitter."""
     bmap = np.asarray(bmap, float)
     return bmap + calibrate.render_model(positions, amplitudes, sigma,
                                          bmap.shape, 0.0)
@@ -266,9 +388,9 @@ def _window_bg(bmap, y0, x0, y1, x1):
     return level, win - level
 
 
-def _refine_sweep(d_e, positions, amplitudes, sigma, bmap, k_max,
+def _refine_sweep(d_e, positions, amplitudes, sigmas, sigma, bmap, k_max,
                   link_radius_factor, max_iter, dirty=None, se=None,
-                  move_eps=0.0):
+                  move_eps=0.0, slack=None, wprior=None):
     """One block-Jacobi pass over the patch decomposition.
 
     Jacobi, not Gauss-Seidel: the halo is built from the sweep's INPUT state
@@ -287,8 +409,10 @@ def _refine_sweep(d_e, positions, amplitudes, sigma, bmap, k_max,
         se = np.full((len(amplitudes), 3), np.nan)
     out_pos = positions.copy()
     out_amp = amplitudes.copy()
+    out_sig = sigmas.copy()
     moved = np.zeros(len(amplitudes), dtype=bool)
     n_fitted = 0
+    stride = _stride(slack)
     pset = patch_mod.build_patches(positions, sigma, d_e.shape,
                                    link_radius_factor=link_radius_factor,
                                    k_max=k_max)
@@ -306,17 +430,18 @@ def _refine_sweep(d_e, positions, amplitudes, sigma, bmap, k_max,
         n_fitted += 1
         yy, xx = patch_mod.patch_grids(p)
         halo = patch_mod.build_halo_image(positions, amplitudes,
-                                          p.frozen_indices, sigma, yy, xx,
+                                          p.frozen_indices, sigmas, yy, xx,
                                           p.y0, p.x0)
         level, shape_ = _window_bg(bmap, p.y0, p.x0, p.y1, p.x1)
         halo = halo + shape_
         sub = np.asarray(d_e[p.y0:p.y1, p.x0:p.x1])
         loc = positions[p.indices] - np.array([p.y0, p.x0])
-        theta0 = psf.pack(level, amplitudes[p.indices], loc[:, 0], loc[:, 1])
-        r = _fit_window(sub, yy, xx, sigma, halo, theta0, max_iter=max_iter,
-                        tol_obj=REFINE_TOL_OBJ)
-        _, A, cy, cx = psf.unpack(r.theta)
+        r, _, A, cy, cx, sg = _fit_any(
+            sub, yy, xx, sigma, halo, level, amplitudes[p.indices],
+            loc[:, 0], loc[:, 1], sigmas[p.indices], slack,
+            max_iter=max_iter, tol_obj=REFINE_TOL_OBJ, wprior=wprior)
         out_amp[p.indices] = A
+        out_sig[p.indices] = sg
         out_pos[p.indices, 0] = cy + p.y0
         out_pos[p.indices, 1] = cx + p.x0
         moved[p.indices] = np.hypot(
@@ -327,21 +452,29 @@ def _refine_sweep(d_e, positions, amplitudes, sigma, bmap, k_max,
         except np.linalg.LinAlgError:
             continue
         v = np.where(var > 0, var, np.nan)
-        se[p.indices, 0] = np.sqrt(v[1::3])
-        se[p.indices, 1] = np.sqrt(v[2::3])
-        se[p.indices, 2] = np.sqrt(v[3::3])
-    return out_pos, out_amp, se, moved, n_fitted
+        # (A, y, x) are the first three of each emitter's block in BOTH
+        # layouts, so only the stride changes; a free width is the fourth and
+        # is reported separately, not folded into `se`.
+        se[p.indices, 0] = np.sqrt(v[1::stride])
+        se[p.indices, 1] = np.sqrt(v[2::stride])
+        se[p.indices, 2] = np.sqrt(v[3::stride])
+    return out_pos, out_amp, out_sig, se, moved, n_fitted
 
 
 def refine(d_e, positions, amplitudes, sigma, bmap, k_max=12,
            link_radius_factor=LINK_FACTOR, max_iter=None,
-           max_sweeps=REFINE_SWEEPS, tol=REFINE_TOL):
+           max_sweeps=REFINE_SWEEPS, tol=REFINE_TOL, sigmas=None, slack=None,
+           wprior=None):
     """Joint re-fit at fixed N in connected groups, plus per-emitter CRLBs.
 
-    Returns (positions, amplitudes, se) with `se` an (N,3) array of
+    Returns (positions, amplitudes, se, sigmas) with `se` an (N,3) array of
     (SE_A, SE_y, SE_x) from the Fisher matrix of the fit whose parameters are
-    reported. The background is not returned: it is a surface owned by the
-    caller, re-estimated between rounds.
+    reported, and `sigmas` the per-emitter widths -- all at `sigma` unless
+    `slack` let them move. `wprior` makes those widths MAP estimates under
+    that prior instead of ML ones, and is where most of the free width's cost
+    to a close pair is repaid -- see `_WidthPenalty`. The background is not
+    returned: it is a surface owned by the caller, re-estimated between
+    rounds.
 
     Scheduled group-wise, not globally. A group is refitted only when an
     emitter it reads -- its own or one in its frozen halo -- moved more than
@@ -374,19 +507,22 @@ def refine(d_e, positions, amplitudes, sigma, bmap, k_max=12,
         max_iter = REFINE_MAX_ITER
     positions = np.atleast_2d(np.asarray(positions, float))
     amplitudes = np.asarray(amplitudes, float).ravel()
+    sigmas = (np.full(len(amplitudes), float(sigma)) if sigmas is None
+              else np.asarray(sigmas, float).ravel())
     if len(amplitudes) == 0:
-        return positions, amplitudes, np.empty((0, 3))
+        return positions, amplitudes, np.empty((0, 3)), sigmas
 
     se = np.full((len(amplitudes), 3), np.nan)
     dirty = np.ones(len(amplitudes), dtype=bool)
     for _ in range(max(1, int(max_sweeps))):
-        positions, amplitudes, se, moved, n_fitted = _refine_sweep(
-            d_e, positions, amplitudes, sigma, bmap, k_max,
-            link_radius_factor, max_iter, dirty=dirty, se=se, move_eps=tol)
+        positions, amplitudes, sigmas, se, moved, n_fitted = _refine_sweep(
+            d_e, positions, amplitudes, sigmas, sigma, bmap, k_max,
+            link_radius_factor, max_iter, dirty=dirty, se=se, move_eps=tol,
+            slack=slack, wprior=wprior)
         if n_fitted == 0 or not moved.any():
             break
         dirty = moved
-    return positions, amplitudes, se
+    return positions, amplitudes, se, sigmas
 
 
 _LOG_L2_CACHE = {}
@@ -425,7 +561,29 @@ def log_kernel_l2(sigma):
     return _LOG_L2_CACHE[key]
 
 
-def find_candidates(d_e, model, sigma, positions, threshold=CAND_THRESHOLD):
+def veto_radius(sigma, sigmas, band):
+    """How close a candidate may come to an incumbent before it is refused.
+
+    The incumbent's OWN width, because a defocused source fitted at 2 sigma
+    reaches twice as far and a candidate 1.2 px off its centre is a piece of
+    it -- but CAPPED at the reporting band's upper edge, which is not a detail.
+    The veto exists to stop one object being proposed twice, and that is a
+    question about RESOLVABILITY. Past the band the object is not a point
+    source any more, and its centre has no claim on a peak that a linear
+    detector still resolves on top of it: measured at 5 emitters/um^2, letting
+    the radius run to the model's full 8 sigma cost 8.3 points of in-focus
+    recall, because a wide object vetoed a disc big enough to hold several real
+    emitters. Nothing is lost by capping it -- what suppresses tiles is the
+    model being able to REPRESENT the broad source, not the veto.
+    """
+    if sigmas is None:
+        return sigma
+    r = np.asarray(sigmas, dtype=float)
+    return r if band is None else np.minimum(r, band[1] * sigma)
+
+
+def find_candidates(d_e, model, sigma, positions,
+                    threshold=CAND_THRESHOLD, sigmas=None, band=None):
     """LoG peaks on the variance-normalized residual, brightest first.
 
     Runs on the residual of the current model, not on the image, so an emitter
@@ -456,10 +614,10 @@ def find_candidates(d_e, model, sigma, positions, threshold=CAND_THRESHOLD):
     cand = np.stack([ys, xs], axis=1).astype(float)
     strength = log_f[ys, xs]
     if len(positions):
-        d = np.min(np.linalg.norm(
-            cand[:, None, :] - np.atleast_2d(positions)[None, :, :], axis=-1),
-            axis=1)
-        keep = d > sigma
+        d = np.linalg.norm(
+            cand[:, None, :] - np.atleast_2d(positions)[None, :, :], axis=-1)
+        radius = veto_radius(sigma, sigmas, band)
+        keep = ~np.any(d <= np.atleast_1d(radius)[None, :], axis=1)
         cand, strength = cand[keep], strength[keep]
         ys, xs = ys[keep], xs[keep]
     if len(cand) == 0:
@@ -470,12 +628,7 @@ def find_candidates(d_e, model, sigma, positions, threshold=CAND_THRESHOLD):
     return cand[order], amp[order], strength[order]
 
 
-AGG_FLUX_RATIO = 10.0   # over-wide cut: fitted flux / the median candidate's
-AGG_SIGMA_LO = 0.9      # fitted sigma / PSF sigma: plausibility band, not a
-AGG_SIGMA_HI = 5.0      # discriminator -- see `find_aggregates`
 AGG_MASK_RADIUS = 3.0   # sigma_fit of excluded support around each aggregate
-AGG_FIT_PAD = 7         # px half-window for the free-sigma fit
-AGG_SIGMA_MAX = 8.0     # upper bound on the free sigma; also the widest object
                         # this test can describe
 
 
@@ -483,190 +636,957 @@ AGGREGATE_DTYPE = np.dtype([("y", float), ("x", float), ("sigma", float),
                             ("flux", float), ("radius", float)])
 
 
-def find_aggregates(d_e, sigma, b0, threshold=CAND_THRESHOLD,
-                    flux_ratio=AGG_FLUX_RATIO, sigma_lo=AGG_SIGMA_LO,
-                    sigma_hi=AGG_SIGMA_HI, mask_radius=AGG_MASK_RADIUS,
-                    pad=AGG_FIT_PAD):
-    """OVER-WIDE objects -- wider than the PSF can represent -- and their mask.
+def _wide_records(pos, amp, sig):
+    """The nuisance class as `AGGREGATE_DTYPE` rows.
 
-    Returns `(records, mask)`: a structured array of `AGGREGATE_DTYPE` and a
-    boolean `(H, W)` array that is True where such an object's support lies.
-
-    This is one of three regimes, and the ONLY one that needs a pre-search
-    pass. See README section 10b for the vocabulary:
-
-        ordinary point source   sigma_fit ~ sigma,  flux ~ median
-        OVER-BRIGHT             sigma_fit ~ sigma,  flux >> median
-                                -> representable; `flag_aggregates`, post hoc
-        OVER-WIDE               sigma_fit >> sigma
-                                -> not representable; THIS function
-
-    Note the word "aggregate" does not decide which one you have -- optics
-    does. A sub-diffraction aggregate is over-BRIGHT, not over-wide, and
-    belongs to `flag_aggregates`.
-
-    Why this runs BEFORE the search
-    -------------------------------
-    The model has a FIXED sigma, so a genuinely wider object cannot be one
-    wide emitter -- the search tiles it with PSF-sized ones. Measured on three
-    over-wide objects (flux 20-60k e-, sigma 2.4-4.0): **84 detections**, and the
-    pieces are not identifiable afterwards by any per-detection statistic.
-    Their amplitudes point the WRONG WAY (median 1249 e- against 1370 for
-    ordinary emitters, with 69 of 84 dimmer than the brightest real one), and
-    a post-hoc free-sigma refit gives 1.22 against 1.20 -- because locally a
-    tile IS a PSF-sized bump, and the neighbours are frozen into its halo.
-
-    There is also frame-level damage that no downstream filter can undo:
-    those three objects inflated `lam`, the density prior inside every
-    Bayes factor, by 2.3x (0.00662 -> 0.01552), making the detector more
-    permissive across the WHOLE frame. The information needed to reject an
-    over-wide object exists only while it is still one object.
-
-    The test
-    --------
-    A free-sigma fit at each round-0 candidate on the raw frame, accepted as
-    an aggregate when
-
-        flux_fit > flux_ratio * median(flux_fit over candidates)   and
-        sigma_lo * sigma  <  sigma_fit  <  sigma_hi * sigma
-
-    **Flux is the discriminator; sigma is only a plausibility band.** That
-    ordering is the opposite of the obvious one and it comes from real data.
-    On `hyp7gem_wt_crop.tif` (sigma 1.45) the four visible bright objects fit
-    at sigma 1.47-1.65 -- 1.01 to 1.14 times the PSF width, not wider in any
-    useful sense, i.e. over-BRIGHT and not over-wide -- while carrying 65 to
-    137 times the median candidate's flux:
-
-        peak e-   sigma_fit   flux/median
-          6449      1.59         137
-          5078      1.50          95
-          4591      1.65          97
-          3483      1.47          65
-
-    An aggregate of a few thousand fluorophores is still a sub-diffraction
-    object, so it images at the PSF width and is merely BRIGHT. It only looks
-    wide on screen because the display saturates. An earlier version of this
-    test required `sigma_fit > 1.5 * sigma` and found none of these.
-
-    The sigma band exists to reject fits that are not describing an object at
-    all. On the same frame 79 of 246 fits ran to a bound over dim diffuse
-    regions, where a wide Gaussian accumulates large flux without any compact
-    source under it -- and one of those, not any real aggregate, was what the
-    earlier version reported. Bound-hitting fits are discarded outright and
-    the band catches the rest.
-
-    KNOWN FAILURE: a dense cluster reads as one over-wide object
-    ------------------------------------------------------------
-    **This test misfires on crowded fields, and `beads_60x_still_02.tif` is
-    one.** There it reports 2 objects and masks 24.8% of the frame; the masked
-    region contains 37 real beads whose amplitudes (median 978 e-) are
-    indistinguishable from those outside it (939 e-). The larger record fits
-    sigma=6.99 over a region the residual audit independently flags as
-    piled-up PSFs.
-
-    That frame provably contains nothing this pass should fire on: its flux
-    distribution is unimodal, max/median 1.58, with NO detection above 2x the
-    median (measured 2026-08-29; `beads_60x_still.tif` gives 1.34, likewise
-    none above 2x). There are no aggregates in the bead data -- a bright
-    diffraction-limited spot there is one bead, or beads sitting very close
-    together, which would show as an over-BRIGHT detection at ~2x and never as
-    a wide one.
-
-    The cause is the identifiability wall this whole pipeline lives against: a
-    single wide Gaussian fits "many close point sources" exactly as well as
-    "one genuinely wide object", and the flux condition cannot separate them
-    either, because 37 beads at ~950 e- carry an over-wide object's total flux.
-
-    So this is safe for ISOLATED over-wide objects on a sparse-to-moderate
-    field (measured: 3/3 found, parameters recovered to within 5%, clean fields
-    a strict no-op) and NOT safe on a dense field without a further test. The
-    discriminator that should work, and is not implemented: fit the wide
-    Gaussian, then look for PSF-scale structure in what is left. A genuinely
-    extended object leaves a smooth residual; a bead cluster leaves point-like
-    peaks that `audit.score_map` already detects. Until that exists, read
-    `result.aggregates` and check it against the image before trusting a run
-    with this enabled -- which is why it reports rather than silently drops,
-    and why it is off by default.
+    Wide objects go back in the same field `find_aggregates` uses, because a
+    caller asking "what did this frame contain that is not a point emitter"
+    wants one answer, not two. What differs is only WHEN each was decided,
+    which `history` records.
     """
-    d_e = np.asarray(d_e, float)
-    H, W = d_e.shape
-    empty = np.empty(0, dtype=AGGREGATE_DTYPE)
-    cand, _, _ = find_candidates(d_e, np.full((H, W), b0), sigma,
-                                 np.empty((0, 2)), threshold)
-    if len(cand) == 0:
-        return empty, np.zeros((H, W), bool)
+    rec = np.zeros(len(sig), dtype=AGGREGATE_DTYPE)
+    if len(sig):
+        rec["y"], rec["x"] = pos[:, 0], pos[:, 1]
+        rec["sigma"], rec["flux"] = sig, amp
+        rec["radius"] = AGG_MASK_RADIUS * sig
+    return rec
 
-    rows = []
-    for cy, cx in cand:
-        y0, y1 = max(0, int(cy) - pad), min(H, int(cy) + pad + 1)
-        x0, x1 = max(0, int(cx) - pad), min(W, int(cx) + pad + 1)
-        if y1 - y0 < 6 or x1 - x0 < 6:
+
+def _window(positions, cand, sigma, shape, k_max, sigmas=None):
+    """(free_indices, frozen_indices, bbox) for the local fit around `cand`.
+
+    Free: existing emitters close enough that adding `cand` changes their
+    estimates, capped at `k_max - 1` nearest so the joint Fisher matrix stays
+    small. Frozen: everything else near enough to contribute flux, folded in
+    as a constant. Both radii are `patches.py`'s.
+
+    `BBOX_PAD = 3 sigma` captures 100% of an isolated emitter's position
+    information and ~90% of its amplitude information; widening it changes no
+    measured outcome and costs runtime linearly in window area.
+
+    `sigmas` is the per-emitter width array when widths are free; every radius
+    then scales with the width of the emitter it is measured from, since that
+    is what sets how far its flux actually reaches.
+    """
+    n = len(positions)
+    widths = (np.full(n, float(sigma)) if sigmas is None
+              else np.asarray(sigmas, dtype=float))
+    if n == 0:
+        free = np.empty(0, dtype=int)
+    else:
+        d = np.linalg.norm(np.atleast_2d(positions) - cand, axis=1)
+        near = np.argsort(d)
+        # Each radius uses the LARGER of the two widths involved. A defocused
+        # emitter reaches further, so grouping it at the in-focus width would
+        # leave its flux out of both the joint fit and the frozen halo -- an
+        # unmodelled pedestal, which section 6 measured as the one thing the
+        # halo radius may not do.
+        link = LINK_FACTOR * np.maximum(widths[near], sigma)
+        free = near[d[near] <= link][:k_max - 1]
+
+    pts = np.vstack([np.atleast_2d(positions)[free], cand[None, :]]) \
+        if len(free) else cand[None, :]
+    pad = BBOX_PAD * (max(float(widths[free].max()), float(sigma))
+                      if len(free) else float(sigma))
+    y0 = max(0, int(np.floor(pts[:, 0].min() - pad)))
+    x0 = max(0, int(np.floor(pts[:, 1].min() - pad)))
+    y1 = min(shape[0], int(np.ceil(pts[:, 0].max() + pad)) + 1)
+    x1 = min(shape[1], int(np.ceil(pts[:, 1].max() + pad)) + 1)
+
+    if n:
+        others = np.setdiff1d(np.arange(n), free)
+        py = np.clip(positions[others, 0], y0, y1 - 1)
+        px = np.clip(positions[others, 1], x0, x1 - 1)
+        d = np.hypot(positions[others, 0] - py, positions[others, 1] - px)
+        frozen = others[d <= HALO_FACTOR * np.maximum(widths[others], sigma)]
+    else:
+        frozen = np.empty(0, dtype=int)
+    return free, frozen, (y0, x0, y1, x1)
+
+
+A_MIN_REL = 1e-6
+# The amplitude floor a fit may not go below, as a fraction of the window's own
+# `A_max`; `moves.A_MIN` is the absolute backstop. The floor has to be relative
+# because
+# what it protects is a RATIO. An emitter's position block of the Fisher
+# matrix scales as A^2, so at bead fluxes of ~2000 e- an amplitude of 1e-4
+# puts those entries at ~5.7e-12 against a largest diagonal of ~768 -- a ratio
+# of 3e-14, about 130x float64 epsilon. At that point log|F| is numerical
+# noise, the Occam term of every Bayes factor built on it is noise with it,
+# and the LM step along that direction is unbounded: traced on such a patch,
+# the fit predicted a 5.2e4 nat decrease, delivered 1.05e-3, and crawled for
+# 3000+ iterations still 364 nats above the optimum.
+#
+# Measured ratio of smallest to largest diag(F) with a second emitter parked
+# at the floor:
+#
+#     floor / A_max     min/max diag(F)
+#       0 (1e-4 abs)        3.0e-14      <- float64 noise
+#           1e-6            6.4e-10
+#           1e-4            4.8e-07      (saturates; a different parameter
+#           3e-3            4.8e-07       becomes the smallest)
+#
+# 1e-6 buys six orders of margin over epsilon while remaining physically
+# negligible -- on a bead patch it is a floor of ~0.02 e- of total flux. A
+# larger floor would start to express an opinion about how faint an emitter
+# may be, and that decision belongs to `_prune` and the Bayes factor, not to a
+# numerical guard. The absolute floor is only a backstop for a window whose
+# `A_max` is itself tiny.
+#
+# Note this cannot be enforced downstream in `evidence.logdet_cond` instead:
+# no test on F alone distinguishes an uninformed parameter from a well-posed
+# matrix in badly scaled units. Here the flux scale is known, so it can.
+
+
+def _bounds(K, h, w, b_max, A_max, sigma_bounds=None):
+    """Box constraints for one window's fit, in LOCAL coordinates.
+
+    Positions are confined to the sub-image. Letting a centre leave the frame
+    was tried -- it lets the fit put rim flux where it actually came from --
+    and measurably lost real detections elsewhere, so the bounds stay closed.
+
+    `sigma_bounds` adds a fourth parameter per emitter, its own width, bounded
+    to that (lo, hi) in pixels. Omit it for the fixed-width layout.
+    """
+    a_min = max(moves.A_MIN, A_MIN_REL * A_max)
+    lo = [0.0]
+    hi = [b_max]
+    for _ in range(K):
+        lo += [a_min, -0.5, -0.5]
+        hi += [A_max, h - 0.5, w - 0.5]
+        if sigma_bounds is not None:
+            lo.append(sigma_bounds[0])
+            hi.append(sigma_bounds[1])
+    return np.asarray(lo), np.asarray(hi)
+
+
+def _fit_window(sub, yy, xx, sigma, halo, theta0, max_iter=100,
+                tol_obj=EVIDENCE_TOL_OBJ):
+    K = (len(theta0) - 1) // 3
+    smax = max(float(sub.max()), 1.0)
+    b_max = max(smax * 4.0, 10.0)
+    A_max = 8.0 * smax / psf.peak_factor(sigma)
+    lo, hi = _bounds(K, sub.shape[0], sub.shape[1], b_max, A_max)
+    th0 = np.clip(np.asarray(theta0, float), lo + 1e-9, hi - 1e-9)
+    return lmga.fit(th0, yy, xx, sigma, sub, lo, hi, halo=halo,
+                    max_iter=max_iter, tol_obj=tol_obj)
+
+
+def _width_prior(slack, band, sigma, lam_focus, lam_wide,
+                 gamma=prior_mod.FOCUS_WIDTH_GAMMA):
+    """The count-and-width prior for the current configuration, or None at a
+    fixed width.
+
+    Neither rate is a knob: `detect` re-estimates both from the frame each
+    round, as it already does for `lam` and `A_s`.
+
+    `band=None` is the SINGLE-BAND pipeline: one class, one uniform width prior
+    over the whole model space. It is what ran before the mixture existed, kept
+    for the reason `prior.ExponentialFlux` is kept -- so a change in detections
+    is attributable to the mixture's shape rather than to the rewrite around
+    it. `slack=None` is the fixed-width pipeline and has no widths to price at
+    all, which is the one case `evidence` is told by a bare `None`.
+
+    This is the ONLY thing `evidence` needs to be told about the layout: it
+    sets the extra Laplace dimension and the whole count-and-width prior.
+    """
+    if slack is None:
+        return None
+    if band is None:
+        return prior_mod.UniformWidth(lam_focus, slack[0] * sigma,
+                                      slack[1] * sigma)
+    if not slack[0] < band[1] < slack[1]:
+        raise ValueError(
+            f"FOCUS_BAND's upper edge {band[1]} must lie strictly inside "
+            f"SIGMA_SLACK {slack}: it is the class boundary, and a boundary "
+            f"on a bound leaves one of the two classes empty by construction")
+    return prior_mod.FocusMixtureWidth(
+        lam_focus, lam_wide,
+        slack[0] * sigma, band[1] * sigma, slack[1] * sigma, sigma, gamma)
+
+
+class _WidthPenalty:
+    """`lmga`'s MAP penalty for the free widths: `-log pi(sigma_k)`, summed.
+
+    Only the width slots of `theta` are touched, so everything is a strided
+    view -- the amplitude and position priors are flat and contribute nothing,
+    and the background's uniform prior cancels in every comparison.
+
+    This is what makes the FIT and the EVIDENCE use the same prior. Before it,
+    `evidence` priced an emitter's width while `refine` chose that width by
+    maximum likelihood, and the two disagreed exactly where it mattered: at
+    1-2 sigma separation the ML fit is nearly indifferent between two narrow
+    emitters and one wide one, and with nothing to break the tie it took the
+    wide one and lost the neighbour.
+    """
+
+    __slots__ = ("wprior", "_sl")
+
+    def __init__(self, wprior, k):
+        self.wprior = wprior
+        self._sl = slice(4, 1 + 4 * k, 4)      # theta = [b, (A,y,x,s) * k]
+
+    def _sigmas(self, theta):
+        return theta[self._sl]
+
+    def value(self, theta):
+        return -float(np.sum(self.wprior.logpdf(self._sigmas(theta))))
+
+    def grad(self, theta):
+        g = np.zeros_like(theta)
+        s = self._sigmas(theta)
+        # -d/dsigma log pi. Central difference: the priors here are cheap
+        # scalar functions and an analytic gradient per prior class would be
+        # one more thing each must keep consistent with its own `logpdf`.
+        h = 1e-6 * np.maximum(np.abs(s), 1.0)
+        g[self._sl] = -(self.wprior.logpdf(s + h)
+                        - self.wprior.logpdf(s - h)) / (2.0 * h)
+        return g
+
+    def hess_diag(self, theta):
+        d = np.zeros_like(theta)
+        d[self._sl] = self.wprior.curvature(self._sigmas(theta))
+        return d
+
+
+def _fit_any(sub, yy, xx, sigma, halo, b, A, cy, cx, sig, slack,
+             max_iter=100, tol_obj=EVIDENCE_TOL_OBJ, wprior=None):
+    """One window fit, taken and returned in UNPACKED parameters.
+
+    Returns `(r, b, A, cy, cx, sig)`. The caller never sees a theta, which is
+    the point: the fixed-width layout is `3K+1` and the free-width one is
+    `4K+1`, and every pass above this line is written once for both. What the
+    caller MAY read off `r` is `I`, `F` and `converged` -- `r.F` is in the
+    layout that was fitted, and `evidence` is told which by its width prior.
+
+    `A_max` is raised by `slack[1]**2` when widths are free: it is derived
+    from the window's peak through `peak_factor(sigma)`, and a source at `n`
+    times the PSF width carries the same flux at `1/n^2` of the peak, so the
+    in-focus bound would clip exactly the defocused emitters this exists for.
+
+    `wprior` makes the free-width fit a MAP fit under that prior rather than an
+    ML fit -- see `_WidthPenalty`. It is the SAME object `evidence` scores the
+    move with, which is the point: a fit and an evidence that disagree about
+    what a width costs will disagree about what exists.
+    """
+    K = len(A)
+    smax = max(float(sub.max()), 1.0)
+    b_max = max(smax * 4.0, 10.0)
+    if slack is None:
+        A_max = 8.0 * smax / psf.peak_factor(sigma)
+        lo, hi = _bounds(K, sub.shape[0], sub.shape[1], b_max, A_max)
+        th0 = np.clip(psf.pack(b, A, cy, cx), lo + 1e-9, hi - 1e-9)
+        r = lmga.fit(th0, yy, xx, sigma, sub, lo, hi, halo=halo,
+                     max_iter=max_iter, tol_obj=tol_obj)
+        b_o, A_o, cy_o, cx_o = psf.unpack(r.theta)
+        return r, b_o, A_o, cy_o, cx_o, np.full(K, float(sigma))
+
+    A_max = 8.0 * smax / psf.peak_factor(sigma) * slack[1] ** 2
+    sb = (slack[0] * sigma, slack[1] * sigma)
+    lo, hi = _bounds(K, sub.shape[0], sub.shape[1], b_max, A_max, sb)
+    th0 = np.clip(psf.pack_var_sigma(b, A, cy, cx, np.clip(sig, *sb)),
+                  lo + 1e-9, hi - 1e-9)
+    r = lmga.fit(th0, yy, xx, sigma, sub, lo, hi, halo=halo,
+                 max_iter=max_iter, tol_obj=tol_obj,
+                 free_sigma="per_emitter",
+                 penalty=None if (wprior is None or K == 0
+                                  or wprior.is_flat)
+                 else _WidthPenalty(wprior, K))
+    return (r,) + psf.unpack_var_sigma(r.theta)
+
+
+def _model_any(b, A, cy, cx, sig, yy, xx, sigma, slack, halo=0.0):
+    """The window model for either layout."""
+    if slack is None:
+        return psf.model(psf.pack(b, A, cy, cx), yy, xx, sigma, halo=halo)
+    return psf.model_var_sigma(psf.pack_var_sigma(b, A, cy, cx, sig),
+                               yy, xx, halo=halo)
+
+
+def _stride(slack):
+    """Parameters per emitter in the fitted layout: 3 fixed, 4 free-width."""
+    return 3 if slack is None else 4
+
+
+def _halo_image(positions, amplitudes, frozen, sigma, yy, xx, y0, x0, base):
+    """`base` plus the frozen emitters' contribution, in window coordinates.
+
+    `sigma` is a scalar or one width per emitter over all of `positions`.
+    """
+    if not len(frozen):
+        return base
+    return base + patch_mod.build_halo_image(
+        positions, amplitudes, np.asarray(frozen, dtype=int), sigma,
+        yy, xx, y0, x0)
+
+
+def _try_add(d_e, positions, amplitudes, sigmas, bmap, cand, camp, sigma,
+             lam, A_s, k_max, slack, wprior=None):
+    """Score adding one emitter. Returns (accepted, positions, amplitudes,
+    sigmas).
+
+    Both models are fitted on the SAME pixels with the SAME frozen halo and
+    differ only by the one emitter, which is what makes their I-divergences
+    differencable into a Bayes factor.
+
+    On acceptance the whole window's refitted parameters are written back:
+    adding a source shifts its neighbours, and keeping their stale values
+    would leave the model worse than the fit that justified the acceptance.
+    With free widths that includes the neighbours' WIDTHS, for the same
+    reason -- a width is a fitted parameter like any other.
+
+    The candidate starts at the PSF width. It is a LoG peak at that width, so
+    that is what has actually been seen; letting it start wide would let a
+    proposal begin by claiming its neighbour's flux.
+
+    The only conditions that can block the move are `log BF <= 0` and
+    `COND_GUARD` -- an ill-conditioned Fisher matrix makes the Occam term
+    meaningless, so it is not weighed against anything. A pre-fit significance
+    screen on A/SE is deliberately absent: measured, it refused 68-79% of every
+    true emitter lost inside 2 sigma before the Bayes factor could vote, while
+    the Bayes factor itself refused none of them. Degenerate configurations are
+    removed by `_prune`, after a joint fit, on more information.
+    """
+    free, frozen, (y0, x0, y1, x1) = _window(positions, cand, sigma,
+                                             d_e.shape, k_max, sigmas)
+    sub = np.asarray(d_e[y0:y1, x0:x1])
+    h, w = sub.shape
+    yy, xx = np.mgrid[0:h, 0:w] * 1.0
+
+    level, halo = _window_bg(bmap, y0, x0, y1, x1)
+    halo = _halo_image(positions, amplitudes, frozen, sigmas, yy, xx,
+                       y0, x0, halo)
+
+    loc = (positions[free] - np.array([y0, x0])) if len(free) \
+        else np.empty((0, 2))
+    a0 = amplitudes[free] if len(free) else np.empty(0)
+    s0 = sigmas[free] if len(free) else np.empty(0)
+
+    r_b, _, A_b, _, _, s_b = _fit_any(sub, yy, xx, sigma, halo, level, a0,
+                                      loc[:, 0], loc[:, 1], s0, slack,
+                                      wprior=wprior)
+
+    cl = cand - np.array([y0, x0])
+    r_a, _, A, cy, cx, sg = _fit_any(
+        sub, yy, xx, sigma, halo, level, np.append(a0, camp),
+        np.append(loc[:, 0], cl[0]), np.append(loc[:, 1], cl[1]),
+        np.append(s0, sigma), slack, wprior=wprior)
+
+    log_bf, cond = evidence.log_bf_add(
+        r_b.I, r_a.I, r_b.F, r_a.F, A_b, A, len(free), lam, A_s,
+        widths=None if wprior is None else (wprior, s_b, sg))
+    if not np.isfinite(log_bf) or log_bf <= 0 or cond > evidence.COND_GUARD:
+        return False, positions, amplitudes, sigmas
+
+    new_pos = np.stack([cy + y0, cx + x0], axis=1)
+    if len(free):
+        positions = positions.copy()
+        amplitudes = amplitudes.copy()
+        sigmas = sigmas.copy()
+        positions[free] = new_pos[:len(free)]
+        amplitudes[free] = A[:len(free)]
+        sigmas[free] = sg[:len(free)]
+    positions = np.vstack([positions, new_pos[-1][None, :]]) if len(positions) \
+        else new_pos[-1][None, :]
+    amplitudes = np.append(amplitudes, A[-1])
+    sigmas = np.append(sigmas, sg[-1])
+    return True, positions, amplitudes, sigmas
+
+
+def _try_split(d_e, positions, amplitudes, sigmas, bmap, gi, sigma,
+               lam, A_s, k_max, slack, wprior=None):
+    """Score replacing emitter `gi` with two. Returns (accepted, pos, amp, sig).
+
+    The move FIND structurally cannot make. Two emitters closer than about
+    1.5 sigma are fitted well by one brighter PSF, so their residual has no
+    PEAK -- it has a quadrupole, negative in the middle and positive on two
+    lobes along the pair axis. `moves.residual_axis_var` recovers that axis
+    from the second moment of the residual and the split is proposed along it.
+
+    Takes K to K+1 like `_try_add`, so the outer loop stays monotone in N.
+
+    With free widths this move is no longer the pipeline's answer to defocus.
+    A quadrupole is what an unresolved PAIR leaves; a source merely broader
+    than the model leaves a ROTATIONALLY SYMMETRIC residual, and once the
+    incumbent can widen to absorb it there is no residual left to propose
+    into. That is the whole mechanism: the tiling this move used to do was
+    never a bad decision, it was the right decision inside a model space that
+    could not hold the answer.
+    """
+    free, frozen, (y0, x0, y1, x1) = _window(positions, positions[gi], sigma,
+                                             d_e.shape, k_max, sigmas)
+    lk = int(np.nonzero(free == gi)[0][0]) if gi in free else None
+    if lk is None:
+        return False, positions, amplitudes, sigmas
+
+    sub = np.asarray(d_e[y0:y1, x0:x1])
+    h, w = sub.shape
+    yy, xx = np.mgrid[0:h, 0:w] * 1.0
+    level, halo = _window_bg(bmap, y0, x0, y1, x1)
+    halo = _halo_image(positions, amplitudes, frozen, sigmas, yy, xx,
+                       y0, x0, halo)
+
+    loc = positions[free] - np.array([y0, x0])
+    r_b, b_b, A_b, cy_b, cx_b, s_b = _fit_any(
+        sub, yy, xx, sigma, halo, level, amplitudes[free],
+        loc[:, 0], loc[:, 1], sigmas[free], slack, wprior=wprior)
+
+    th_b = psf.pack_var_sigma(b_b, A_b, cy_b, cx_b, s_b)
+    resid = sub - _model_any(b_b, A_b, cy_b, cx_b, s_b, yy, xx, sigma, slack,
+                             halo=halo)
+    u, _ = moves.residual_axis_var(th_b, lk, yy, xx, resid)
+
+    # One incumbent, several proposals: its log-determinant is the same for
+    # all of them and is factorized once.
+    ld_b = evidence.logdet(r_b.F)
+    best = None
+    for disp in SPLIT_DISPS:
+        th_a = moves.split_var(th_b, lk, u, disp * sigma)
+        _, A0, cy0, cx0, s0 = psf.unpack_var_sigma(th_a)
+        r_a, b_a, A_a, cy_a, cx_a, s_a = _fit_any(
+            sub, yy, xx, sigma, halo, float(th_a[0]), A0, cy0, cx0, s0, slack,
+            wprior=wprior)
+        log_bf, cond = evidence.log_bf_add(
+            r_b.I, r_a.I, r_b.F, r_a.F, A_b, A_a, len(free), lam, A_s,
+            before=ld_b,
+            widths=None if wprior is None else (wprior, s_b, s_a))
+        if np.isfinite(log_bf) and log_bf > 0 and cond <= evidence.COND_GUARD:
+            if best is None or log_bf > best[0]:
+                best = (log_bf, A_a, cy_a, cx_a, s_a)
+    if best is None:
+        return False, positions, amplitudes, sigmas
+
+    # `moves.split_var` keeps the untouched emitters in order and appends the
+    # two children, so the fitted vector is [free without gi] + [child0, child1].
+    _, A, cy, cx, sg = best
+    new_pos = np.stack([cy + y0, cx + x0], axis=1)
+    keep_local = [j for j in range(len(free)) if j != lk]
+    positions = positions.copy()
+    amplitudes = amplitudes.copy()
+    sigmas = sigmas.copy()
+    if keep_local:
+        positions[free[keep_local]] = new_pos[:len(keep_local)]
+        amplitudes[free[keep_local]] = A[:len(keep_local)]
+        sigmas[free[keep_local]] = sg[:len(keep_local)]
+    positions[gi] = new_pos[-2]
+    amplitudes[gi] = A[-2]
+    sigmas[gi] = sg[-2]
+    positions = np.vstack([positions, new_pos[-1][None, :]])
+    amplitudes = np.append(amplitudes, A[-1])
+    sigmas = np.append(sigmas, sg[-1])
+    return True, positions, amplitudes, sigmas
+
+
+def _add_pass(d_e, bmap, positions, amplitudes, sigmas, cand, camp, sigma,
+              lam, A_s, k_max, slack=None, wprior=None, band=None,
+              veto_widths=True):
+    """One ADD pass over a candidate list. Returns (pos, amp, sig, n_added).
+
+    The proximity re-check is part of the pass rather than of `detect`: it reads
+    the positions an earlier acceptance in THIS pass has already written, so an
+    emitter accepted a moment ago can claim a later candidate's flux.
+    """
+    n_added = 0
+    for c, a in zip(cand, camp):
+        # `veto_radius` again -- here reading the widths THIS pass has already
+        # written, so an emitter that just widened claims the candidates it now
+        # covers.
+        if len(positions) and np.any(
+                np.linalg.norm(positions - c, axis=1)
+                <= veto_radius(sigma, sigmas if veto_widths else None, band)):
             continue
-        gy, gx = np.mgrid[y0:y1, x0:x1]
-        sub = d_e[y0:y1, x0:x1]
-        a0 = max(float(sub.max()) - b0, 1.0) / psf.peak_factor(sigma)
-        theta0 = np.concatenate([psf.pack(b0, [a0], [cy], [cx]), [sigma]])
-        lo = np.array([1e-3, 1e-3, cy - 1.5, cx - 1.5, 0.3])
-        hi = np.array([max(b0 * 20.0, 20.0), a0 * 50.0, cy + 1.5, cx + 1.5,
-                       AGG_SIGMA_MAX])
-        res = lmga.fit(np.clip(theta0, lo, hi), gy.astype(float),
-                       gx.astype(float), sigma, sub, lo, hi, halo=0.0,
-                       max_iter=80, free_sigma=True)
-        if not res.converged:
+        ok, positions, amplitudes, sigmas = _try_add(
+            d_e, positions, amplitudes, sigmas, bmap, c, a, sigma, lam, A_s,
+            k_max, slack, wprior)
+        n_added += int(ok)
+    return positions, amplitudes, sigmas, n_added
+
+
+def _split_pass(d_e, positions, amplitudes, sigmas, bmap, sigma, lam, A_s,
+                k_max, model, slack=None, wprior=None):
+    """Propose a split for every emitter, most pair-like first.
+
+    The ranking is not an optimization detail: a split accepted early changes
+    its neighbours, so the order decides which configuration the later
+    proposals are scored against.
+
+    The ranking statistic is the residual quadrupole, which background
+    curvature also produces. On a strongly structured background the ordering
+    degrades and the advantage this move carries shrinks accordingly.
+    """
+    n0 = len(positions)
+    if n0 == 0:
+        return positions, amplitudes, sigmas, 0
+    resid_full = d_e - model
+    strengths = np.zeros(n0)
+    for i in range(n0):
+        # Padded by the emitter's OWN width: the quadrupole of a wide source
+        # lives outside a box drawn at the in-focus width.
+        pad = int(np.ceil(BBOX_PAD * max(sigmas[i], sigma)))
+        y0 = max(0, int(positions[i, 0]) - pad)
+        x0 = max(0, int(positions[i, 1]) - pad)
+        y1 = min(d_e.shape[0], int(positions[i, 0]) + pad + 1)
+        x1 = min(d_e.shape[1], int(positions[i, 1]) + pad + 1)
+        yy, xx = np.mgrid[y0:y1, x0:x1] * 1.0
+        th = psf.pack_var_sigma(0.0, [amplitudes[i]], [positions[i, 0]],
+                                [positions[i, 1]], [sigmas[i]])
+        _, s = moves.residual_axis_var(th, 0, yy, xx,
+                                       resid_full[y0:y1, x0:x1])
+        strengths[i] = s
+
+    n_split = 0
+    for gi in np.argsort(-strengths):
+        if strengths[gi] <= 0:
+            break
+        ok, positions, amplitudes, sigmas = _try_split(
+            d_e, positions, amplitudes, sigmas, bmap, int(gi), sigma,
+            lam, A_s, k_max, slack, wprior)
+        n_split += int(ok)
+    return positions, amplitudes, sigmas, n_split
+
+
+def _amplitude_var(F, k, stride=3):
+    """var(A_k) from the Fisher matrix, or None if it cannot be trusted.
+
+    None means the Laplace evidence for this configuration cannot be computed
+    -- a singular Fisher matrix, or a non-positive amplitude variance -- so
+    removal must be forced rather than weighed. Weighing is not an option:
+    the quantity that would do the weighing is the thing that has broken.
+
+    `stride` is the parameters per emitter in the layout `F` was built in.
+    Note this is the MARGINAL variance, from the inverse: with free widths it
+    therefore already carries the amplitude-width correlation, which is real
+    and large for a faint broad source -- flux and width trade off against
+    each other -- and which is exactly what `PRUNE_TAU` should be reading.
+    """
+    try:
+        var = np.diag(np.linalg.inv(F))
+    except np.linalg.LinAlgError:
+        return None
+    v = var[1 + stride * k]
+    if not np.isfinite(v) or v <= 0:
+        return None
+    return float(v)
+
+
+def _prune(d_e, positions, amplitudes, sigmas, bmap, sigma, lam, A_s, k_max,
+           slack=None, wprior=None, tau=PRUNE_TAU):
+    """One pass of removal tests. Returns (positions, amplitudes, sigmas).
+
+    Runs outside the add loop and never feeds back into it: an emitter's A/SE
+    verdict depends on which neighbours are free in that pass, so letting
+    removal drive addition makes the same source get killed and recreated
+    indefinitely.
+    """
+    n = len(positions)
+    if n == 0:
+        return positions, amplitudes, sigmas
+    # Copied because the survivor write-back below mutates these in place and
+    # the caller still holds the pre-prune configuration.
+    positions = np.array(positions, dtype=float, copy=True)
+    amplitudes = np.array(amplitudes, dtype=float, copy=True)
+    sigmas = np.array(sigmas, dtype=float, copy=True)
+    stride = _stride(slack)
+    # An `alive` mask rather than deleting as we go: the visit order is
+    # computed once, and deleting from the arrays inside the loop would shift
+    # every later index in that order onto a different emitter.
+    alive = np.ones(n, dtype=bool)
+    # Faintest first: a spurious emitter is far likelier to be faint, and
+    # removing it may make its neighbour's own removal unnecessary.
+    for gi in np.argsort(amplitudes):
+        gi = int(gi)
+        if not alive[gi]:
             continue
-        # A fit that walked to its POSITION bound was not describing the
-        # object under the candidate -- it was sliding down an aggregate's
-        # skirt towards the real centre, and its sigma is a measure of how far
-        # it got, not of any object's width. Those fits are what produced
-        # spurious wide records on the flanks of genuine aggregates.
-        at_bound = (abs(res.theta[2] - cy) >= 1.5 - 1e-6
-                    or abs(res.theta[3] - cx) >= 1.5 - 1e-6
-                    or res.theta[-1] >= AGG_SIGMA_MAX - 1e-6)
-        if at_bound:
-            continue
-        rows.append((res.theta[2], res.theta[3], res.theta[-1], res.theta[1]))
-    if not rows:
-        return empty, np.zeros((H, W), bool)
+        cand = positions[gi]
+        others = np.nonzero(alive & (np.arange(n) != gi))[0]
+        free, frozen, (y0, x0, y1, x1) = _window(positions[others], cand,
+                                                 sigma, d_e.shape, k_max,
+                                                 sigmas[others])
+        free = others[free]
+        frozen = others[frozen]
+        sub = np.asarray(d_e[y0:y1, x0:x1])
+        h, w = sub.shape
+        yy, xx = np.mgrid[0:h, 0:w] * 1.0
+        level, halo = _window_bg(bmap, y0, x0, y1, x1)
+        halo = _halo_image(positions, amplitudes, frozen, sigmas, yy, xx,
+                           y0, x0, halo)
 
-    rows = np.array(rows)                     # (M, 4): y, x, sigma_fit, flux
-    med_flux = float(np.median(rows[:, 3]))
-    hit = ((rows[:, 3] > flux_ratio * med_flux)
-           & (rows[:, 2] > sigma_lo * sigma) & (rows[:, 2] < sigma_hi * sigma))
-    if not hit.any():
-        return empty, np.zeros((H, W), bool)
+        keep_idx = np.append(free, gi).astype(int)
+        loc = positions[keep_idx] - np.array([y0, x0])
+        r_full, _, A_full, _, _, s_full = _fit_any(
+            sub, yy, xx, sigma, halo, level, amplitudes[keep_idx],
+            loc[:, 0], loc[:, 1], sigmas[keep_idx], slack, wprior=wprior)
 
-    # One aggregate raises several LoG maxima, so several candidates fit the
-    # SAME object. Merge them brightest-first: a hit inside an already-accepted
-    # record's support is that record, not a second aggregate. Without this a
-    # 3-aggregate frame reported 8 records and masked 29% of itself.
-    keep = rows[hit]
-    keep = keep[np.argsort(-keep[:, 3])]
-    merged = []
-    for row in keep:
-        ry, rx, rs = row[0], row[1], row[2]
-        if any((ry - m[0]) ** 2 + (rx - m[1]) ** 2
-               <= (mask_radius * max(rs, m[2])) ** 2 for m in merged):
-            continue
-        merged.append(row)
-    keep = np.array(merged)
+        lr = positions[free] - np.array([y0, x0]) if len(free) \
+            else np.empty((0, 2))
+        r_red, _, A_red, cy_r, cx_r, s_r = _fit_any(
+            sub, yy, xx, sigma, halo, level,
+            amplitudes[free] if len(free) else np.empty(0),
+            lr[:, 0], lr[:, 1],
+            sigmas[free] if len(free) else np.empty(0), slack, wprior=wprior)
 
-    rec = np.empty(len(keep), dtype=AGGREGATE_DTYPE)
-    rec["y"], rec["x"] = keep[:, 0], keep[:, 1]
-    rec["sigma"], rec["flux"] = keep[:, 2], keep[:, 3]
-    rec["radius"] = mask_radius * keep[:, 2]
+        # `gi` is appended last in `keep_idx`, so it is the last emitter of
+        # the fitted vector.
+        k = len(keep_idx) - 1
+        v = _amplitude_var(r_full.F, k, stride)
+        if v is None or A_full[k] < tau * np.sqrt(v):
+            log_bf = np.inf                   # forced, not weighed
+        else:
+            # `(reduced, full)`: removal is the negation of the ADD whose
+            # "before" is the reduced configuration.
+            log_bf = evidence.log_bf_remove(
+                r_full.I, r_red.I, r_full.F, r_red.F, A_full, A_red,
+                len(keep_idx), lam, A_s,
+                widths=None if wprior is None else (wprior, s_r, s_full))
+        if log_bf > 0:
+            alive[gi] = False
+            # Write the reduced fit back over the survivors. This is what makes
+            # the faintest-first cascade correct: when a collapsed pair loses
+            # one member the other absorbs its flux, and the next removal test
+            # must be scored against that, not against a stale half-amplitude
+            # that would make the survivor look removable too.
+            if len(free):
+                positions[free, 0] = cy_r + y0
+                positions[free, 1] = cx_r + x0
+                amplitudes[free] = A_red
+                sigmas[free] = s_r
+    return positions[alive], amplitudes[alive], sigmas[alive]
 
-    mask = np.zeros((H, W), bool)
-    yy, xx = np.mgrid[0:H, 0:W]
-    for r in rec:
-        # Stamped over the disc's own bounding box, not the whole frame.
-        r0 = int(np.ceil(r["radius"]))
-        y0, y1 = max(0, int(r["y"]) - r0), min(H, int(r["y"]) + r0 + 1)
-        x0, x1 = max(0, int(r["x"]) - r0), min(W, int(r["x"]) + r0 + 1)
-        d2 = ((yy[y0:y1, x0:x1] - r["y"]) ** 2
-              + (xx[y0:y1, x0:x1] - r["x"]) ** 2)
-        mask[y0:y1, x0:x1] |= d2 <= r["radius"] ** 2
-    return rec, mask
 
+def _update_bg(d_e, positions, amplitudes, sigma, bmap, kernel, be=None,
+               exclude=None):
+    """Re-estimate the background from the current emitter model.
+
+    `kernel=None` gives one scalar for the frame, from the pixels no emitter
+    reaches; any integer estimates a surface on that window.
+
+    `sigma` may be one width per emitter, in which case each emitter's support
+    is masked at its own width and `be` must be None -- the Rust mask takes a
+    scalar.
+    """
+    # One mask, two consumers. `robust_background` and `background_map` mask on
+    # the same radius, so stamping it once here removes a full O(N*H*W) sweep
+    # per round -- 41% of a 512x512 frame before this, and the largest single
+    # cost left in the Python that stayed behind the port [P9].
+    if be is None:
+        free = calibrate.emitter_free_mask(bmap.shape, positions, sigma,
+                                           BG_MASK_RADIUS)
+    else:
+        free = be.emitter_free_mask(positions, sigma, bmap.shape,
+                                    BG_MASK_RADIUS)
+    if exclude is not None:
+        # An aggregate's pixels are not background and not a fitted emitter.
+        # Leaving them in pulls the local surface up towards the aggregate,
+        # which is exactly the flux we are trying to keep out of the model.
+        free = free & ~exclude
+    scalar = max(calibrate.robust_background(d_e, positions, sigma,
+                                             BG_MASK_RADIUS, free=free),
+                 BG_FLOOR)
+    if kernel is None:
+        return np.full(bmap.shape, scalar)
+    return background_map(d_e, positions, sigma, kernel=kernel,
+                          fallback=scalar, free=free)
+
+
+def detect(data_img, sigma=1.2, offset=0.0, gain=None, lam0=0.02, A_s0=None,
+           k_max=12, max_rounds=6, threshold=None, prune=True,
+           split=True, bg_kernel=BG_KERNEL, max_settle=4, verbose=1,
+           impl="py", prior=None,
+           slack=SIGMA_SLACK, band=FOCUS_BAND,
+           width_gamma=prior_mod.FOCUS_WIDTH_GAMMA, prune_tau=PRUNE_TAU,
+           veto_widths=True):
+    """Full detection. Returns a `DetectResult`.
+
+    `max_rounds` is a safety stop, not the termination condition: the loop ends
+    when a round accepts nothing, which it must eventually do because every
+    accepted emitter lowers the residual that produces the candidates.
+
+    `threshold=None` derives FIND's seed cut from the frame size and the PSF
+    width (`calibrate.seed_threshold`) rather than carrying a constant, which
+    cannot be right on two frame sizes at once. Pass a float to pin it; pass
+    `CAND_THRESHOLD` for the pre-2026-09-03 value.
+
+    `bg_kernel=None` fixes the background at one scalar for the whole frame;
+    any integer estimates a surface on that window. The surface is re-estimated
+    once per round from the current emitter model, so background and emitters
+    are fitted by backfitting rather than simultaneously. It changes the
+    reported amplitudes by less than the seed-to-seed noise, because every fit
+    already has a free background scalar over a 9-13 px window and a background
+    smooth on the scale of the frame is nearly constant over one. What it does
+    buy is a cleaner residual on real frames.
+
+    `impl` selects which implementation runs the four passes: "py" for the
+    reference in this file, "rs" for the Rust extension. Everything else -- this
+    round loop, `find_candidates`, and `background_map`'s convolutions -- is the
+    same code either way, which is what makes the two comparable. See
+    `backend.py`.
+
+    `slack` gives every emitter its own width, bounded to that (lo, hi)
+    multiple of `sigma`; `None` fixes them all at `sigma`. See `SIGMA_SLACK`
+    for why the model needs it -- in short, a fixed-width model answers a
+    source it cannot represent by tiling it, and no threshold repairs a model
+    space that does not contain the answer.
+
+    `impl` is IGNORED while `slack` is on, and the Python passes run: the Rust
+    core implements the fixed-width layout only. Pass `slack=None` for the
+    fast path. This is a prototype-then-port split, not a permanent one.
+    """
+    if slack is not None and impl != "py":
+        # Silently ignoring a performance argument is worse than being slow.
+        print(f"note: impl={impl!r} ignored -- the Rust core implements the "
+              f"fixed-width passes only.\n      Pass slack=None for it, or "
+              f"accept the Python passes.")
+    be = backend_mod.get("py" if slack is not None else impl)
+    raw = np.asarray(data_img, dtype=float)
+    H, W = raw.shape
+    g_eff = calibrate.estimate_gain(raw, offset) if gain is None else float(gain)
+    d_e = (raw - offset) / g_eff
+
+    # FIND's cut is DERIVED from the frame and the PSF unless the caller
+    # pins it; a constant cannot be right on two frame sizes at once.
+    if threshold is None:
+        threshold = calibrate.seed_threshold(d_e.shape, sigma)
+
+    b0 = float(np.percentile(d_e, 10.0))
+
+    # BEFORE the search: an aggregate is still one object here. After it, the
+    # fixed-sigma model will have tiled it into pieces no per-detection
+    # statistic can identify. See `find_aggregates`.
+    # lam is emitters per px^2.
+    usable_px = max(float(H * W), 1.0)
+
+    bmap = np.full((H, W), max(b0, BG_FLOOR))
+    if A_s0 is None:
+        A_s0 = max(float(d_e.max()) - b0, 10.0) / psf.peak_factor(sigma)
+    lam, A_s = lam0, A_s0
+
+    def _in_focus(sig):
+        """The reporting band, as a mask over the working arrays."""
+        if slack is None or band is None or not len(sig):
+            return np.ones(len(sig), dtype=bool)
+        return (sig >= band[0] * sigma) & (sig <= band[1] * sigma)
+
+    def _rates(sig):
+        """(lam_focus, lam_wide) from the current configuration.
+
+        Empirical Bayes, exactly as `lam` and `A_s` already are: how rare a
+        defocused object is comes off the frame, not off a constant. Both are
+        floored at a count of one -- a frame may a priori hold one object of
+        either class -- which at a typical 4096 usable px opens the wide class
+        at about 3 nats against and stops mattering once one is found. Before
+        anything is detected there is nothing to estimate from, and both fall
+        back to `lam`, as the single-class pipeline does.
+        """
+        if slack is None or band is None or not len(sig):
+            return lam, lam
+        n_f = int(np.count_nonzero(sig <= band[1] * sigma))
+        return (max(n_f, 1) / usable_px, max(len(sig) - n_f, 1) / usable_px)
+
+    positions = np.empty((0, 2))
+    amplitudes = np.empty(0)
+    sigmas = np.empty(0)
+    history = []
+
+    # The four passes carry per-emitter widths; the backend contract does not,
+    # so with `slack` on they are called directly rather than through `be`.
+    # `find_candidates`, `background_map` and this loop are the same code
+    # either way, which is what has always made the backends comparable.
+    def _render(pos, amp, sig):
+        return bmap + (be.render_model(pos, amp, sigma, bmap.shape, 0.0)
+                       if slack is None
+                       else calibrate.render_model(pos, amp, sig, bmap.shape,
+                                                   0.0))
+
+    def _refine(pos, amp, sig, sweeps):
+        if slack is None:
+            pos, amp, se_ = be.refine(d_e, pos, amp, sigma, bmap, k_max,
+                                      sweeps)
+            return pos, amp, se_, np.full(len(amp), float(sigma))
+        # The SAME prior the round's moves were scored with. Refining under a
+        # different one would let the estimation half undo what the model
+        # selection half decided.
+        return refine(d_e, pos, amp, sigma, bmap, k_max=k_max,
+                      max_sweeps=sweeps, sigmas=sig, slack=slack,
+                      wprior=_width_prior(slack, band, sigma, *_rates(sig),
+                                          gamma=width_gamma))
+
+    def _prune_once(pos, amp, sig):
+        if slack is None:
+            pri = A_s if prior is None else prior
+            pos, amp, n = be.prune(d_e, bmap, pos, amp, sigma, lam, pri, k_max)
+            return pos, amp, np.full(len(amp), float(sigma))
+        return _prune(d_e, pos, amp, sig, bmap, sigma, lam,
+                      A_s if prior is None else prior,
+                      k_max, slack,
+                      _width_prior(slack, band, sigma, *_rates(sig),
+                                   gamma=width_gamma),
+                      tau=prune_tau)
+
+    for rnd in range(max_rounds):
+        model = _render(positions, amplitudes, sigmas)
+        veto_sig = sigmas if veto_widths else None
+        cand, camp, _ = find_candidates(d_e, model, sigma, positions,
+                                        threshold, veto_sig, band)
+        pri = A_s if prior is None else prior
+        wprior = _width_prior(slack, band, sigma, *_rates(sigmas),
+                              gamma=width_gamma)
+        if slack is None:
+            positions, amplitudes, n_added = be.add_pass(
+                d_e, bmap, positions, amplitudes, cand, camp, sigma, lam, pri,
+                k_max)
+            sigmas = np.full(len(amplitudes), float(sigma))
+        else:
+            positions, amplitudes, sigmas, n_added = _add_pass(
+                d_e, bmap, positions, amplitudes, sigmas, cand, camp, sigma,
+                lam, pri, k_max, slack, wprior, band, veto_widths)
+
+        # SPLIT runs on the model the adds just produced: an emitter only looks
+        # like an unresolved pair once its neighbourhood is otherwise
+        # explained, and splitting against a model still missing a nearby
+        # source mostly splits emitters into that source's flux.
+        n_split = 0
+        if split:
+            if n_added:
+                model = _render(positions, amplitudes, sigmas)
+            if slack is None:
+                positions, amplitudes, n_split = be.split_pass(
+                    d_e, bmap, positions, amplitudes, model, sigma, lam, pri,
+                    k_max)
+                sigmas = np.full(len(amplitudes), float(sigma))
+            else:
+                positions, amplitudes, sigmas, n_split = _split_pass(
+                    d_e, positions, amplitudes, sigmas, bmap, sigma, lam, pri,
+                    k_max, model, slack, wprior)
+
+        if n_added or n_split:
+            # One sweep here; the round loop is the outer iteration.
+            positions, amplitudes, _, sigmas = _refine(
+                positions, amplitudes, sigmas, 1)
+            # Both estimated from the IN-FOCUS class alone. Counting the
+            # nuisance objects in `lam` would be a positive feedback loop --
+            # more objects raises the count prior, which makes the next add
+            # easier -- and averaging their fluxes into `A_s` drags the
+            # amplitude prior towards the dim, broad ones, which are dim
+            # because of the confocal axial response and not because the
+            # emitter population is faint.
+            foc = _in_focus(sigmas)
+            lam = max(int(np.count_nonzero(foc)) / usable_px, 1e-6)
+            if foc.any():
+                A_s = max(float(np.mean(amplitudes[foc])), 1.0)
+            # Re-estimated only AFTER the emitters have been re-fitted, and
+            # only from the emitter model with no background in it. The mask
+            # uses each emitter's OWN width, so a defocused source's larger
+            # footprint is excluded from its own background window.
+            bmap = _update_bg(d_e, positions, amplitudes,
+                              sigma if slack is None else sigmas, bmap,
+                              bg_kernel, be=be if slack is None else None,
+                              )
+
+        history.append(dict(round=rnd, N=len(positions), added=n_added,
+                            split=n_split, candidates=len(cand),
+                            background=float(np.median(bmap))))
+        if verbose >= 1:
+            print(f"  [round {rnd}] {len(cand):3d} candidates, "
+                  f"{n_added:3d} added, {n_split:3d} split "
+                  f"-> N={len(positions):3d}  "
+                  f"bg={np.median(bmap):.3f} "
+                  f"[{bmap.min():.2f}, {bmap.max():.2f}]")
+        if n_added == 0 and n_split == 0:
+            break
+
+    # Refine BEFORE pruning. `refine` re-fits at fixed N with no separation
+    # constraint and routinely pulls an accepted pair together; those collapsed
+    # pairs are exactly what the removal test is for, and pruning first cannot
+    # see them. So the order is settle, prune, settle again at the reduced N.
+    positions, amplitudes, se, sigmas = _refine(positions, amplitudes, sigmas,
+                                               REFINE_SWEEPS)
+
+    # Settle and prune alternate until the prune removes nothing. One pass is
+    # not enough: the re-fit at the reduced N is as free to collapse a pair as
+    # the first one was. This cannot cycle -- prune only removes, so N strictly
+    # decreases. `max_settle` is a backstop.
+    for _ in range(max_settle if prune else 0):
+        if not len(positions):
+            break
+        n_before = len(positions)
+        positions, amplitudes, sigmas = _prune_once(positions, amplitudes,
+                                                    sigmas)
+        if len(positions) == n_before:
+            break
+        if verbose >= 1:
+            print(f"  [prune] {n_before} -> {len(positions)}")
+        positions, amplitudes, se, sigmas = _refine(positions, amplitudes,
+                                                    sigmas, REFINE_SWEEPS)
+    model = _render(positions, amplitudes, sigmas)
+
+    # The reporting split, and the ONLY place it happens. Everything above this
+    # line worked on the whole configuration -- which is the point: a defocused
+    # object has to be fitted, refined and pruned like any other or its flux
+    # goes back into the residual and refills FIND's candidate list, which is
+    # the tiling this exists to stop. `model_image` and `residual` therefore
+    # contain the nuisance objects too; they are what produced them.
+    focus = _in_focus(sigmas)
+    narrow = (~focus & (sigmas < band[0] * sigma)
+              if slack is not None and band is not None
+              else np.zeros(len(sigmas), dtype=bool))
+    wide = ~focus & ~narrow
+    idx = np.arange(len(sigmas))
+    width_rejects = np.concatenate([
+        width_reject_records(idx[narrow], positions[narrow],
+                             amplitudes[narrow], sigmas[narrow], sigma,
+                             "too_narrow"),
+        width_reject_records(idx[wide], positions[wide], amplitudes[wide],
+                             sigmas[wide], sigma, "too_wide"),
+    ])
+    wide_rec = _wide_records(positions[wide], amplitudes[wide], sigmas[wide])
+
+
+    if verbose >= 1:
+        nr = (d_e - model) / np.sqrt(np.maximum(model, 1e-6))
+        print(f"[final] N={int(focus.sum())}"
+              + (f" (+{int(wide.sum())} wide, {int(narrow.sum())} narrow)"
+                 if len(width_rejects) else "")
+              + f"  bg={np.median(bmap):.2f} "
+              f"[{bmap.min():.2f}, {bmap.max():.2f}]  "
+              f"resid median={np.median(nr):+.3f}  "
+              f"robust_std={calibrate.robust_spread(nr):.3f}")
+
+    positions, amplitudes = positions[focus], amplitudes[focus]
+    se = se[focus] if se is not None and len(se) else se
+    sigmas = sigmas[focus]
+
+    return DetectResult(
+        positions=positions, amplitudes=amplitudes, sigma=sigma, lam=lam,
+        A_s=A_s, gain=g_eff, n_outer_passes=len(history), model_image=model,
+        # `background` is the SURFACE, an (H, W) array, not a scalar. Callers
+        # that only want a number should take its median; callers that render
+        # or subtract a model want the array.
+        residual=d_e - model, background=bmap, se=se, history=history,
+        aggregates=(wide_rec if len(wide_rec) else None),
+        width_rejects=(width_rejects if len(width_rejects) else None),
+        width_filter=dict(band=None if band is None else tuple(band),
+                          slack=None if slack is None else tuple(slack)),
+        # The fitted widths are a RESULT, not a diagnostic afterthought: they
+        # are what the model used for these positions, amplitudes and CRLBs,
+        # and `sigma_ratio` is a per-emitter defocus readout the fixed-width
+        # pipeline could not produce. Asking the same question AFTER the
+        # search, on a fit whose neighbours have been frozen into its halo,
+        # does not work -- README section 10b measured that the answer is no
+        # longer there by then, and section 13 records the removal.
+        fit_sigma=sigmas,
+        sigma_ratio=(sigmas / sigma if len(sigmas) else sigmas),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Post-hoc reporting -- NOT part of the port
+# ---------------------------------------------------------------------------
+#
+# Everything above this line runs inside the search and is the port target.
+# What follows reads a finished `DetectResult` and says something about it. It
+# is here rather than in `loctable` only because `loctable` needs `polars` and
+# this does not; nothing below is on any hot path and none of it should cross
+# into Rust.
 
 AGG_AMP_RATIO = 20.0    # over-bright cut: flux / the frame's median detection
 AGG_LINK = 3.0          # sigma; flagged detections within this are one object
@@ -823,1272 +1743,3 @@ def aggregate_report(result, ratio=AGG_AMP_RATIO, min_flux=None,
                      else ratio * float(np.median(amp)) if amp.size
                      else float("nan")),
                 objects=objs)
-
-
-def render_aggregates(rec, shape):
-    """The fitted aggregates as an image, to be FROZEN into the model.
-
-    Masking an aggregate's candidates is not enough on its own: its flux is
-    still in the image and still unexplained, so SPLIT subdivides it inward
-    from the mask boundary and ADD re-seeds wherever the residual pokes out.
-    Measured before this existed -- 68 of 120 detections were still inside the
-    mask, carrying 112742 e- against the aggregates' true 110000. The search
-    was faithfully modelling the aggregate, one PSF at a time, exactly as it
-    is designed to.
-
-    Adding this to `bmap` instead makes the aggregate a KNOWN additive term.
-    Every window fit already splits `bmap` into a free level and a frozen
-    shape (`_window_bg`), so the aggregate is accounted for by every fit with
-    no change to any pass -- and the residual over it is flat, so nothing is
-    proposed there in the first place.
-    """
-    H, W = int(shape[0]), int(shape[1])
-    out = np.zeros((H, W))
-    if rec is None or len(rec) == 0:
-        return out
-    for a in rec:
-        # Each aggregate has its OWN sigma, so they cannot be rendered in one
-        # call -- `calibrate.render_model` takes a single sigma for all.
-        out += calibrate.render_model(np.array([[a["y"], a["x"]]]),
-                                      np.array([a["flux"]]), float(a["sigma"]),
-                                      (H, W), 0.0)
-    return out
-
-
-def _window(positions, cand, sigma, shape, k_max):
-    """(free_indices, frozen_indices, bbox) for the local fit around `cand`.
-
-    Free: existing emitters close enough that adding `cand` changes their
-    estimates, capped at `k_max - 1` nearest so the joint Fisher matrix stays
-    small. Frozen: everything else near enough to contribute flux, folded in
-    as a constant. Both radii are `patches.py`'s.
-
-    `BBOX_PAD = 3 sigma` captures 100% of an isolated emitter's position
-    information and ~90% of its amplitude information; widening it changes no
-    measured outcome and costs runtime linearly in window area.
-    """
-    n = len(positions)
-    if n == 0:
-        free = np.empty(0, dtype=int)
-    else:
-        d = np.linalg.norm(np.atleast_2d(positions) - cand, axis=1)
-        near = np.argsort(d)
-        free = near[d[near] <= LINK_FACTOR * sigma][:k_max - 1]
-
-    pts = np.vstack([np.atleast_2d(positions)[free], cand[None, :]]) \
-        if len(free) else cand[None, :]
-    pad = BBOX_PAD * sigma
-    y0 = max(0, int(np.floor(pts[:, 0].min() - pad)))
-    x0 = max(0, int(np.floor(pts[:, 1].min() - pad)))
-    y1 = min(shape[0], int(np.ceil(pts[:, 0].max() + pad)) + 1)
-    x1 = min(shape[1], int(np.ceil(pts[:, 1].max() + pad)) + 1)
-
-    if n:
-        others = np.setdiff1d(np.arange(n), free)
-        py = np.clip(positions[others, 0], y0, y1 - 1)
-        px = np.clip(positions[others, 1], x0, x1 - 1)
-        d = np.hypot(positions[others, 0] - py, positions[others, 1] - px)
-        frozen = others[d <= HALO_FACTOR * sigma]
-    else:
-        frozen = np.empty(0, dtype=int)
-    return free, frozen, (y0, x0, y1, x1)
-
-
-A_MIN_REL = 1e-6
-# The amplitude floor a fit may not go below, as a fraction of the window's own
-# `A_max`; `moves.A_MIN` is the absolute backstop. The floor has to be relative
-# because
-# what it protects is a RATIO. An emitter's position block of the Fisher
-# matrix scales as A^2, so at bead fluxes of ~2000 e- an amplitude of 1e-4
-# puts those entries at ~5.7e-12 against a largest diagonal of ~768 -- a ratio
-# of 3e-14, about 130x float64 epsilon. At that point log|F| is numerical
-# noise, the Occam term of every Bayes factor built on it is noise with it,
-# and the LM step along that direction is unbounded: traced on such a patch,
-# the fit predicted a 5.2e4 nat decrease, delivered 1.05e-3, and crawled for
-# 3000+ iterations still 364 nats above the optimum.
-#
-# Measured ratio of smallest to largest diag(F) with a second emitter parked
-# at the floor:
-#
-#     floor / A_max     min/max diag(F)
-#       0 (1e-4 abs)        3.0e-14      <- float64 noise
-#           1e-6            6.4e-10
-#           1e-4            4.8e-07      (saturates; a different parameter
-#           3e-3            4.8e-07       becomes the smallest)
-#
-# 1e-6 buys six orders of margin over epsilon while remaining physically
-# negligible -- on a bead patch it is a floor of ~0.02 e- of total flux. A
-# larger floor would start to express an opinion about how faint an emitter
-# may be, and that decision belongs to `_prune` and the Bayes factor, not to a
-# numerical guard. The absolute floor is only a backstop for a window whose
-# `A_max` is itself tiny.
-#
-# Note this cannot be enforced downstream in `evidence.logdet_cond` instead:
-# no test on F alone distinguishes an uninformed parameter from a well-posed
-# matrix in badly scaled units. Here the flux scale is known, so it can.
-
-
-def _bounds(K, h, w, b_max, A_max):
-    """Box constraints for one window's fit, in LOCAL coordinates.
-
-    Positions are confined to the sub-image. Letting a centre leave the frame
-    was tried -- it lets the fit put rim flux where it actually came from --
-    and measurably lost real detections elsewhere, so the bounds stay closed.
-    """
-    a_min = max(moves.A_MIN, A_MIN_REL * A_max)
-    lo = [0.0]
-    hi = [b_max]
-    for _ in range(K):
-        lo += [a_min, -0.5, -0.5]
-        hi += [A_max, h - 0.5, w - 0.5]
-    return np.asarray(lo), np.asarray(hi)
-
-
-def _fit_window(sub, yy, xx, sigma, halo, theta0, max_iter=100,
-                tol_obj=EVIDENCE_TOL_OBJ):
-    K = (len(theta0) - 1) // 3
-    smax = max(float(sub.max()), 1.0)
-    b_max = max(smax * 4.0, 10.0)
-    A_max = 8.0 * smax / psf.peak_factor(sigma)
-    lo, hi = _bounds(K, sub.shape[0], sub.shape[1], b_max, A_max)
-    th0 = np.clip(np.asarray(theta0, float), lo + 1e-9, hi - 1e-9)
-    return lmga.fit(th0, yy, xx, sigma, sub, lo, hi, halo=halo,
-                    max_iter=max_iter, tol_obj=tol_obj)
-
-
-def _halo_image(positions, amplitudes, frozen, sigma, yy, xx, y0, x0, base):
-    """`base` plus the frozen emitters' contribution, in window coordinates."""
-    if not len(frozen):
-        return base
-    return base + psf.model(psf.pack(0.0, amplitudes[frozen],
-                                     positions[frozen, 0] - y0,
-                                     positions[frozen, 1] - x0),
-                            yy, xx, sigma)
-
-
-def _try_add(d_e, positions, amplitudes, bmap, cand, camp, sigma,
-             lam, A_s, k_max):
-    """Score adding one emitter. Returns (accepted, positions, amplitudes).
-
-    Both models are fitted on the SAME pixels with the SAME frozen halo and
-    differ only by the one emitter, which is what makes their I-divergences
-    differencable into a Bayes factor.
-
-    On acceptance the whole window's refitted parameters are written back:
-    adding a source shifts its neighbours, and keeping their stale values
-    would leave the model worse than the fit that justified the acceptance.
-
-    The only conditions that can block the move are `log BF <= 0` and
-    `COND_GUARD` -- an ill-conditioned Fisher matrix makes the Occam term
-    meaningless, so it is not weighed against anything. A pre-fit significance
-    screen on A/SE is deliberately absent: measured, it refused 68-79% of every
-    true emitter lost inside 2 sigma before the Bayes factor could vote, while
-    the Bayes factor itself refused none of them. Degenerate configurations are
-    removed by `_prune`, after a joint fit, on more information.
-    """
-    free, frozen, (y0, x0, y1, x1) = _window(positions, cand, sigma,
-                                             d_e.shape, k_max)
-    sub = np.asarray(d_e[y0:y1, x0:x1])
-    h, w = sub.shape
-    yy, xx = np.mgrid[0:h, 0:w] * 1.0
-
-    level, halo = _window_bg(bmap, y0, x0, y1, x1)
-    halo = _halo_image(positions, amplitudes, frozen, sigma, yy, xx,
-                       y0, x0, halo)
-
-    loc = (positions[free] - np.array([y0, x0])) if len(free) \
-        else np.empty((0, 2))
-    a0 = amplitudes[free] if len(free) else np.empty(0)
-
-    th_b = psf.pack(level, a0, loc[:, 0], loc[:, 1])
-    r_b = _fit_window(sub, yy, xx, sigma, halo, th_b)
-
-    cl = cand - np.array([y0, x0])
-    th_a = psf.pack(level, np.append(a0, camp),
-                    np.append(loc[:, 0], cl[0]), np.append(loc[:, 1], cl[1]))
-    r_a = _fit_window(sub, yy, xx, sigma, halo, th_a)
-
-    log_bf, cond = evidence.log_bf_add(
-        r_b.I, r_a.I, r_b.F, r_a.F,
-        psf.unpack(r_b.theta)[1], psf.unpack(r_a.theta)[1],
-        len(free), lam, A_s)
-    if not np.isfinite(log_bf) or log_bf <= 0 or cond > evidence.COND_GUARD:
-        return False, positions, amplitudes
-
-    _, A, cy, cx = psf.unpack(r_a.theta)
-    new_pos = np.stack([cy + y0, cx + x0], axis=1)
-    if len(free):
-        positions = positions.copy()
-        amplitudes = amplitudes.copy()
-        positions[free] = new_pos[:len(free)]
-        amplitudes[free] = A[:len(free)]
-    positions = np.vstack([positions, new_pos[-1][None, :]]) if len(positions) \
-        else new_pos[-1][None, :]
-    amplitudes = np.append(amplitudes, A[-1])
-    return True, positions, amplitudes
-
-
-def _try_split(d_e, positions, amplitudes, bmap, gi, sigma,
-               lam, A_s, k_max):
-    """Score replacing emitter `gi` with two. Returns (accepted, pos, amp).
-
-    The move FIND structurally cannot make. Two emitters closer than about
-    1.5 sigma are fitted well by one brighter PSF, so their residual has no
-    PEAK -- it has a quadrupole, negative in the middle and positive on two
-    lobes along the pair axis. `moves.residual_axis` recovers that axis from
-    the second moment of the residual and the split is proposed along it.
-
-    Takes K to K+1 like `_try_add`, so the outer loop stays monotone in N.
-    """
-    free, frozen, (y0, x0, y1, x1) = _window(positions, positions[gi], sigma,
-                                             d_e.shape, k_max)
-    lk = int(np.nonzero(free == gi)[0][0]) if gi in free else None
-    if lk is None:
-        return False, positions, amplitudes
-
-    sub = np.asarray(d_e[y0:y1, x0:x1])
-    h, w = sub.shape
-    yy, xx = np.mgrid[0:h, 0:w] * 1.0
-    level, halo = _window_bg(bmap, y0, x0, y1, x1)
-    halo = _halo_image(positions, amplitudes, frozen, sigma, yy, xx,
-                       y0, x0, halo)
-
-    loc = positions[free] - np.array([y0, x0])
-    th_b = psf.pack(level, amplitudes[free], loc[:, 0], loc[:, 1])
-    r_b = _fit_window(sub, yy, xx, sigma, halo, th_b)
-
-    resid = sub - psf.model(r_b.theta, yy, xx, sigma, halo=halo)
-    u, _ = moves.residual_axis(r_b.theta, lk, yy, xx, sigma, resid)
-
-    # One incumbent, several proposals: its log-determinant is the same for
-    # all of them and is factorized once.
-    ld_b = evidence.logdet(r_b.F)
-    A_b = psf.unpack(r_b.theta)[1]
-    best = None
-    for disp in SPLIT_DISPS:
-        th_a = moves.split(r_b.theta, lk, u, disp * sigma)
-        r_a = _fit_window(sub, yy, xx, sigma, halo, th_a)
-        log_bf, cond = evidence.log_bf_add(
-            r_b.I, r_a.I, r_b.F, r_a.F, A_b,
-            psf.unpack(r_a.theta)[1],
-            len(free), lam, A_s, before=ld_b)
-        if np.isfinite(log_bf) and log_bf > 0 and cond <= evidence.COND_GUARD:
-            if best is None or log_bf > best[0]:
-                best = (log_bf, r_a)
-    if best is None:
-        return False, positions, amplitudes
-
-    # `moves.split` keeps the untouched emitters in order and appends the two
-    # children, so the fitted vector is [free without gi] + [child0, child1].
-    _, A, cy, cx = psf.unpack(best[1].theta)
-    new_pos = np.stack([cy + y0, cx + x0], axis=1)
-    keep_local = [j for j in range(len(free)) if j != lk]
-    positions = positions.copy()
-    amplitudes = amplitudes.copy()
-    if keep_local:
-        positions[free[keep_local]] = new_pos[:len(keep_local)]
-        amplitudes[free[keep_local]] = A[:len(keep_local)]
-    positions[gi] = new_pos[-2]
-    amplitudes[gi] = A[-2]
-    positions = np.vstack([positions, new_pos[-1][None, :]])
-    amplitudes = np.append(amplitudes, A[-1])
-    return True, positions, amplitudes
-
-
-def _add_pass(d_e, bmap, positions, amplitudes, cand, camp, sigma, lam, A_s,
-              k_max):
-    """One ADD pass over a candidate list. Returns (pos, amp, n_added).
-
-    The proximity re-check is part of the pass rather than of `detect`: it reads
-    the positions an earlier acceptance in THIS pass has already written, so an
-    emitter accepted a moment ago can claim a later candidate's flux.
-    """
-    n_added = 0
-    for c, a in zip(cand, camp):
-        if len(positions) and np.min(np.linalg.norm(
-                positions - c, axis=1)) <= sigma:
-            continue
-        ok, positions, amplitudes = _try_add(
-            d_e, positions, amplitudes, bmap, c, a, sigma, lam, A_s, k_max)
-        n_added += int(ok)
-    return positions, amplitudes, n_added
-
-
-def _split_pass(d_e, positions, amplitudes, bmap, sigma, lam, A_s,
-                k_max, model):
-    """Propose a split for every emitter, most pair-like first.
-
-    The ranking is not an optimization detail: a split accepted early changes
-    its neighbours, so the order decides which configuration the later
-    proposals are scored against.
-
-    The ranking statistic is the residual quadrupole, which background
-    curvature also produces. On a strongly structured background the ordering
-    degrades and the advantage this move carries shrinks accordingly.
-    """
-    n0 = len(positions)
-    if n0 == 0:
-        return positions, amplitudes, 0
-    resid_full = d_e - model
-    strengths = np.zeros(n0)
-    pad = int(np.ceil(BBOX_PAD * sigma))
-    for i in range(n0):
-        y0 = max(0, int(positions[i, 0]) - pad)
-        x0 = max(0, int(positions[i, 1]) - pad)
-        y1 = min(d_e.shape[0], int(positions[i, 0]) + pad + 1)
-        x1 = min(d_e.shape[1], int(positions[i, 1]) + pad + 1)
-        yy, xx = np.mgrid[y0:y1, x0:x1] * 1.0
-        th = psf.pack(0.0, [amplitudes[i]], [positions[i, 0]], [positions[i, 1]])
-        _, s = moves.residual_axis(th, 0, yy, xx, sigma,
-                                   resid_full[y0:y1, x0:x1])
-        strengths[i] = s
-
-    n_split = 0
-    for gi in np.argsort(-strengths):
-        if strengths[gi] <= 0:
-            break
-        ok, positions, amplitudes = _try_split(
-            d_e, positions, amplitudes, bmap, int(gi), sigma,
-            lam, A_s, k_max)
-        n_split += int(ok)
-    return positions, amplitudes, n_split
-
-
-def _amplitude_var(F, k):
-    """var(A_k) from the Fisher matrix, or None if it cannot be trusted.
-
-    None means the Laplace evidence for this configuration cannot be computed
-    -- a singular Fisher matrix, or a non-positive amplitude variance -- so
-    removal must be forced rather than weighed. Weighing is not an option:
-    the quantity that would do the weighing is the thing that has broken.
-    """
-    try:
-        var = np.diag(np.linalg.inv(F))
-    except np.linalg.LinAlgError:
-        return None
-    v = var[1 + 3 * k]
-    if not np.isfinite(v) or v <= 0:
-        return None
-    return float(v)
-
-
-def _prune(d_e, positions, amplitudes, bmap, sigma, lam, A_s, k_max):
-    """One pass of removal tests. Returns (positions, amplitudes).
-
-    Runs outside the add loop and never feeds back into it: an emitter's A/SE
-    verdict depends on which neighbours are free in that pass, so letting
-    removal drive addition makes the same source get killed and recreated
-    indefinitely.
-    """
-    n = len(positions)
-    if n == 0:
-        return positions, amplitudes
-    # Copied because the survivor write-back below mutates these in place and
-    # the caller still holds the pre-prune configuration.
-    positions = np.array(positions, dtype=float, copy=True)
-    amplitudes = np.array(amplitudes, dtype=float, copy=True)
-    # An `alive` mask rather than deleting as we go: the visit order is
-    # computed once, and deleting from the arrays inside the loop would shift
-    # every later index in that order onto a different emitter.
-    alive = np.ones(n, dtype=bool)
-    # Faintest first: a spurious emitter is far likelier to be faint, and
-    # removing it may make its neighbour's own removal unnecessary.
-    for gi in np.argsort(amplitudes):
-        gi = int(gi)
-        if not alive[gi]:
-            continue
-        cand = positions[gi]
-        others = np.nonzero(alive & (np.arange(n) != gi))[0]
-        free, frozen, (y0, x0, y1, x1) = _window(positions[others], cand,
-                                                 sigma, d_e.shape, k_max)
-        free = others[free]
-        frozen = others[frozen]
-        sub = np.asarray(d_e[y0:y1, x0:x1])
-        h, w = sub.shape
-        yy, xx = np.mgrid[0:h, 0:w] * 1.0
-        level, halo = _window_bg(bmap, y0, x0, y1, x1)
-        halo = _halo_image(positions, amplitudes, frozen, sigma, yy, xx,
-                           y0, x0, halo)
-
-        keep_idx = np.append(free, gi).astype(int)
-        loc = positions[keep_idx] - np.array([y0, x0])
-        th_full = psf.pack(level, amplitudes[keep_idx], loc[:, 0], loc[:, 1])
-        r_full = _fit_window(sub, yy, xx, sigma, halo, th_full)
-
-        lr = positions[free] - np.array([y0, x0]) if len(free) \
-            else np.empty((0, 2))
-        th_red = psf.pack(level, amplitudes[free] if len(free)
-                          else np.empty(0), lr[:, 0], lr[:, 1])
-        r_red = _fit_window(sub, yy, xx, sigma, halo, th_red)
-
-        # `gi` is appended last in `keep_idx`, so it is the last emitter of
-        # the fitted vector.
-        k = len(keep_idx) - 1
-        v = _amplitude_var(r_full.F, k)
-        if v is None or psf.unpack(r_full.theta)[1][k] < PRUNE_TAU * np.sqrt(v):
-            log_bf = np.inf                   # forced, not weighed
-        else:
-            log_bf = evidence.log_bf_remove(
-                r_full.I, r_red.I, r_full.F, r_red.F,
-                psf.unpack(r_full.theta)[1], psf.unpack(r_red.theta)[1],
-                len(keep_idx), lam, A_s)
-        if log_bf > 0:
-            alive[gi] = False
-            # Write the reduced fit back over the survivors. This is what makes
-            # the faintest-first cascade correct: when a collapsed pair loses
-            # one member the other absorbs its flux, and the next removal test
-            # must be scored against that, not against a stale half-amplitude
-            # that would make the survivor look removable too.
-            if len(free):
-                _, A, cy, cx = psf.unpack(r_red.theta)
-                positions[free, 0] = cy + y0
-                positions[free, 1] = cx + x0
-                amplitudes[free] = A
-    return positions[alive], amplitudes[alive]
-
-
-def _update_bg(d_e, positions, amplitudes, sigma, bmap, kernel, be=None,
-               exclude=None):
-    """Re-estimate the background from the current emitter model.
-
-    `kernel=None` gives one scalar for the frame, from the pixels no emitter
-    reaches; any integer estimates a surface on that window.
-    """
-    # One mask, two consumers. `robust_background` and `background_map` mask on
-    # the same radius, so stamping it once here removes a full O(N*H*W) sweep
-    # per round -- 41% of a 512x512 frame before this, and the largest single
-    # cost left in the Python that stayed behind the port [P9].
-    if be is None:
-        free = calibrate.emitter_free_mask(bmap.shape, positions, sigma,
-                                           BG_MASK_RADIUS)
-    else:
-        free = be.emitter_free_mask(positions, sigma, bmap.shape,
-                                    BG_MASK_RADIUS)
-    if exclude is not None:
-        # An aggregate's pixels are not background and not a fitted emitter.
-        # Leaving them in pulls the local surface up towards the aggregate,
-        # which is exactly the flux we are trying to keep out of the model.
-        free = free & ~exclude
-    scalar = max(calibrate.robust_background(d_e, positions, sigma,
-                                             BG_MASK_RADIUS, free=free),
-                 BG_FLOOR)
-    if kernel is None:
-        return np.full(bmap.shape, scalar)
-    return background_map(d_e, positions, sigma, kernel=kernel,
-                          fallback=scalar, free=free)
-
-
-def detect(data_img, sigma=1.2, offset=0.0, gain=None, lam0=0.02, A_s0=None,
-           k_max=12, max_rounds=6, threshold=CAND_THRESHOLD, prune=True,
-           split=True, bg_kernel=BG_KERNEL, max_settle=4, verbose=1,
-           impl="py", reject_aggregates=False, prior=None,
-           agg_flux_ratio=AGG_FLUX_RATIO, agg_sigma_lo=AGG_SIGMA_LO,
-           agg_sigma_hi=AGG_SIGMA_HI, agg_mask_radius=AGG_MASK_RADIUS):
-    """Full detection. Returns a `DetectResult`.
-
-    `max_rounds` is a safety stop, not the termination condition: the loop ends
-    when a round accepts nothing, which it must eventually do because every
-    accepted emitter lowers the residual that produces the candidates.
-
-    `bg_kernel=None` fixes the background at one scalar for the whole frame;
-    any integer estimates a surface on that window. The surface is re-estimated
-    once per round from the current emitter model, so background and emitters
-    are fitted by backfitting rather than simultaneously. It changes the
-    reported amplitudes by less than the seed-to-seed noise, because every fit
-    already has a free background scalar over a 9-13 px window and a background
-    smooth on the scale of the frame is nearly constant over one. What it does
-    buy is a cleaner residual on real frames.
-
-    `impl` selects which implementation runs the four passes: "py" for the
-    reference in this file, "rs" for the Rust extension. Everything else -- this
-    round loop, `find_candidates`, and `background_map`'s convolutions -- is the
-    same code either way, which is what makes the two comparable. See
-    `backend.py`.
-
-    `reject_aggregates` runs `find_aggregates` once before the search and
-    excludes what it finds from candidates, from the background estimate and
-    from `lam`'s area. What it excluded is REPORTED in `result.aggregates`,
-    never silently dropped. It is **off by default**: the test flags about 6%
-    of ordinary candidate peaks as well (close pairs, which one wide Gaussian
-    also fits), so turning it on trades a little recall for immunity to an
-    error that is otherwise unbounded -- and that trade should be a decision,
-    not a default. Turn it on only for frames that actually contain an
-    OVER-WIDE object (sigma_fit >> sigma at the bright sites) -- never for
-    over-bright, PSF-width ones, where it does measurable harm; see
-    `flag_aggregates`. Read `result.aggregate_fraction` to see how much of the
-    frame went.
-    """
-    be = backend_mod.get(impl)
-    raw = np.asarray(data_img, dtype=float)
-    H, W = raw.shape
-    g_eff = calibrate.estimate_gain(raw, offset) if gain is None else float(gain)
-    d_e = (raw - offset) / g_eff
-
-    b0 = float(np.percentile(d_e, 10.0))
-
-    # BEFORE the search: an aggregate is still one object here. After it, the
-    # fixed-sigma model will have tiled it into pieces no per-detection
-    # statistic can identify. See `find_aggregates`.
-    agg_rec, agg_mask = None, None
-    if reject_aggregates:
-        agg_rec, agg_mask = find_aggregates(
-            d_e, sigma, max(b0, BG_FLOOR), threshold=threshold,
-            flux_ratio=agg_flux_ratio, sigma_lo=agg_sigma_lo,
-            sigma_hi=agg_sigma_hi, mask_radius=agg_mask_radius)
-        if not agg_mask.any():
-            agg_mask = None
-        if verbose >= 1 and agg_rec is not None and len(agg_rec):
-            frac = 0.0 if agg_mask is None else float(agg_mask.mean())
-            print(f"  [aggregates] {len(agg_rec)} found, {100*frac:.1f}% of "
-                  f"the frame masked; sigma "
-                  f"{agg_rec['sigma'].min():.2f}-{agg_rec['sigma'].max():.2f}, "
-                  f"flux {agg_rec['flux'].max():.0f} max")
-
-    # lam is emitters per usable px^2, so the masked area must come out of the
-    # denominator -- otherwise excluding a region lowers the density prior and
-    # quietly makes the Bayes factor stricter everywhere else.
-    usable_px = float(H * W if agg_mask is None else (~agg_mask).sum())
-    usable_px = max(usable_px, 1.0)
-
-    # Frozen, and kept SEPARATE from the estimated background so that
-    # `_update_bg` re-estimating the surface each round cannot wipe it.
-    agg_model = render_aggregates(agg_rec, (H, W))
-
-    bmap = np.full((H, W), max(b0, BG_FLOOR)) + agg_model
-    if A_s0 is None:
-        A_s0 = max(float(d_e.max()) - b0, 10.0) / psf.peak_factor(sigma)
-    lam, A_s = lam0, A_s0
-
-    positions = np.empty((0, 2))
-    amplitudes = np.empty(0)
-    history = []
-
-    for rnd in range(max_rounds):
-        model = bmap + be.render_model(positions, amplitudes, sigma,
-                                       bmap.shape, 0.0)
-        cand, camp, _ = find_candidates(d_e, model, sigma, positions, threshold)
-        if agg_mask is not None and len(cand):
-            inside = agg_mask[cand[:, 0].astype(int), cand[:, 1].astype(int)]
-            cand, camp = cand[~inside], camp[~inside]
-        pri = A_s if prior is None else prior
-        positions, amplitudes, n_added = be.add_pass(
-            d_e, bmap, positions, amplitudes, cand, camp, sigma, lam, pri,
-            k_max)
-
-        # SPLIT runs on the model the adds just produced: an emitter only looks
-        # like an unresolved pair once its neighbourhood is otherwise
-        # explained, and splitting against a model still missing a nearby
-        # source mostly splits emitters into that source's flux.
-        n_split = 0
-        if split:
-            if n_added:
-                model = bmap + be.render_model(positions, amplitudes, sigma,
-                                               bmap.shape, 0.0)
-            positions, amplitudes, n_split = be.split_pass(
-                d_e, bmap, positions, amplitudes, model, sigma, lam, pri,
-                k_max)
-
-        if n_added or n_split:
-            # One sweep here; the round loop is the outer iteration.
-            positions, amplitudes, _ = be.refine(
-                d_e, positions, amplitudes, sigma, bmap, k_max, 1)
-            lam = max(len(positions) / usable_px, 1e-6)
-            if len(amplitudes):
-                A_s = max(float(np.mean(amplitudes)), 1.0)
-            # Re-estimated only AFTER the emitters have been re-fitted, and
-            # only from the emitter model with no background in it.
-            bmap = _update_bg(d_e, positions, amplitudes, sigma, bmap,
-                              bg_kernel, be=be, exclude=agg_mask) + agg_model
-
-        history.append(dict(round=rnd, N=len(positions), added=n_added,
-                            split=n_split, candidates=len(cand),
-                            background=float(np.median(bmap))))
-        if verbose >= 1:
-            print(f"  [round {rnd}] {len(cand):3d} candidates, "
-                  f"{n_added:3d} added, {n_split:3d} split "
-                  f"-> N={len(positions):3d}  "
-                  f"bg={np.median(bmap):.3f} "
-                  f"[{bmap.min():.2f}, {bmap.max():.2f}]")
-        if n_added == 0 and n_split == 0:
-            break
-
-    # Refine BEFORE pruning. `refine` re-fits at fixed N with no separation
-    # constraint and routinely pulls an accepted pair together; those collapsed
-    # pairs are exactly what the removal test is for, and pruning first cannot
-    # see them. So the order is settle, prune, settle again at the reduced N.
-    positions, amplitudes, se = be.refine(d_e, positions, amplitudes, sigma,
-                                          bmap, k_max, REFINE_SWEEPS)
-
-    # Settle and prune alternate until the prune removes nothing. One pass is
-    # not enough: the re-fit at the reduced N is as free to collapse a pair as
-    # the first one was. This cannot cycle -- prune only removes, so N strictly
-    # decreases. `max_settle` is a backstop.
-    for _ in range(max_settle if prune else 0):
-        if not len(positions):
-            break
-        n_before = len(positions)
-        positions, amplitudes, _ = be.prune(d_e, bmap, positions, amplitudes,
-                                            sigma, lam,
-                                            A_s if prior is None else prior,
-                                            k_max)
-        if len(positions) == n_before:
-            break
-        if verbose >= 1:
-            print(f"  [prune] {n_before} -> {len(positions)}")
-        positions, amplitudes, se = be.refine(d_e, positions, amplitudes,
-                                              sigma, bmap, k_max,
-                                              REFINE_SWEEPS)
-    model = bmap + be.render_model(positions, amplitudes, sigma, bmap.shape,
-                                   0.0)
-    if verbose >= 1:
-        nr = (d_e - model) / np.sqrt(np.maximum(model, 1e-6))
-        print(f"[final] N={len(positions)}  "
-              f"bg={np.median(bmap):.2f} [{bmap.min():.2f}, {bmap.max():.2f}]  "
-              f"resid median={np.median(nr):+.3f}  "
-              f"robust_std={calibrate.robust_spread(nr):.3f}")
-
-    return DetectResult(
-        positions=positions, amplitudes=amplitudes, sigma=sigma, lam=lam,
-        A_s=A_s, gain=g_eff, n_outer_passes=len(history), model_image=model,
-        # `background` is the SURFACE, an (H, W) array, not a scalar. Callers
-        # that only want a number should take its median; callers that render
-        # or subtract a model want the array.
-        residual=d_e - model, background=bmap, se=se, history=history,
-        aggregates=agg_rec,
-        aggregate_fraction=(0.0 if agg_mask is None else float(agg_mask.mean())),
-    )
-
-
-# ---------------------------------------------------------------------------
-# The ROI solver: detector-seeded local model selection
-# ---------------------------------------------------------------------------
-#
-# The alternative to the round loop above. A sensitive matched-filter detector
-# (`aguet.detect_spots`) produces one seed per RESOLVABLE object; each group of
-# seeds defines an ROI; and the whole model-selection question is asked inside
-# that ROI, once, against a window that never changes.
-#
-# Why the window not changing is the point. `_try_add`'s complexity is entirely
-# the K -> K+1 Bayes factor's validity condition: both fits must see the same
-# pixels and the same frozen halo, so `_window` reconstructs that agreement for
-# every proposal against every committed emitter -- which is also the one
-# super-linear term in the profile. Here the ROI IS the window, built once, so
-# the invariant holds structurally and every proposal in the ROI is scored
-# against every other on identical pixels for free.
-#
-# What this gives up, and it is worth stating plainly: the count becomes
-# DETECTOR-CONDITIONAL. In the round loop a peak missed at round 0 can still be
-# found at round 2 as the residual changes. Here it is never considered, so the
-# detector's `alpha` is the recall dial and nothing downstream can recover what
-# it does not seed. Sub-2-sigma companions are the exception -- they leave no
-# peak for ANY linear detector by construction, and they are `_split`'s job as
-# they always were.
-
-AGUET_ALPHA = 0.2
-# The detector's per-pixel significance level, and the pipeline's recall dial.
-# Unlike `LOG_SEED_Z` this is a PROBABILITY, so it means the same thing at
-# every sigma, gain and background -- see `aguet.py`. Measured coverage
-# (fraction of true emitters with a seed within 1.5 px; 40 emitters on 64^2,
-# 8 seeds) against the LoG seeder it replaces:
-#
-#     flux  peakSNR   aguet .05  aguet 0.2  aguet 0.5   LoG 6.50z   LoG 0.65z
-#     1900     13.9       0.828      0.872      0.878       0.878       0.878
-#      120      3.1       0.756      0.844      0.863       0.800       0.863
-#       60      2.0       0.591      0.750      0.809       0.191       0.822
-#
-# with 0.1 / 1.0 / 2.0 spurious seeds per frame at 0.2 and 2.0 / 5.5 / 10.8 at
-# 0.5. The ceiling in every column is close pairs, which give ONE maximum by
-# construction; `_split` recovers those, so coverage is not recall.
-#
-# 0.2 is the operating point: it takes essentially all of the coverage 0.5 buys
-# at a fifth of the spurious seeds, and every spurious seed is a wasted ROI
-# solve. Raise it toward 0.5 on faint data where the extra recall is worth the
-# runtime; the Bayes factor absorbs the extra proposals either way.
-
-GROW_MAX_ROUNDS = 8
-# Backstop on the grow loop, per ROI. Not a convergence criterion: the loop
-# ends when a round accepts nothing, which it must, because every accepted
-# emitter lowers the residual that proposes the next one and `k_max` caps K.
-
-
-BIRTH_Z = 3.0
-# Significance floor on a birth proposal, in standard deviations of the Poisson
-# matched filter's own null. See `_gauss_kernel_l2`.
-#
-# It exists because the first version of `_residual_peaks` had none -- it
-# proposed every positive bump and left the decision entirely to the Bayes
-# factor, on the reasoning (README section 5) that the evidence absorbs extra
-# proposals. It does not absorb an UNBOUNDED number of them. Measured at
-# density 0.055 on the bright arm, with no floor:
-#
-#     arm       N/frame   extra preds on one truth   preds >1.5px from truth
-#     rounds       73.8            0.5                        0.5%
-#     roi          70.0            3.2                        4.3%
-#
-# and those far predictions had a median flux of 72 e- against 1441 for the
-# matched ones -- faint, isolated, and each one a real positive noise
-# fluctuation that a Bayes factor is right to prefer explaining. The evidence
-# was not failing; it was being asked a question about pure noise thousands of
-# times per frame, and at that rate its tail is a false-positive budget.
-#
-# The floor is on the PROPOSAL, not on the emitter, so it is not a detection
-# rule: `LOG_SEED_Z`'s ~6.5 sigma cut decided existence, this only decides what
-# is worth fitting twice. That is why 3.0 is defensible where 6.5 was not.
-
-
-def _gauss_kernel_l2(sigma):
-    """L2 norm of the normalized Gaussian kernel: the null sd of the matched
-    filter applied to a unit-variance field.
-
-    The analytic value is `1/sqrt(4 pi sigma^2)`, but the discretized and
-    renormalized kernel scipy actually convolves with differs from it by a few
-    percent at small sigma, and the whole point of dividing by this is that the
-    threshold means "standard deviations". So it is measured on scipy's own
-    kernel, the same way `log_kernel_l2` is.
-    """
-    key = float(sigma)
-    if key not in _GAUSS_L2_CACHE:
-        n = 201
-        imp = np.zeros(n)
-        imp[n // 2] = 1.0
-        g = ndi.gaussian_filter1d(imp, key, order=0, mode="constant")
-        _GAUSS_L2_CACHE[key] = float(np.sqrt((g @ g) ** 2))
-    return _GAUSS_L2_CACHE[key]
-
-
-_GAUSS_L2_CACHE = {}
-
-
-def _residual_peaks(sub, yy, xx, sigma, halo, theta, owned=None, max_peaks=4,
-                    z_thresh=None):
-    """Birth proposals inside an ROI: PSF-matched peaks of its own residual.
-
-    Returns (points, amplitudes) in LOCAL coordinates, strongest first.
-
-    A plain matched filter, not the LoG the round loop used. There is no
-    background to reject here -- the ROI's fit already carries a free `b` and
-    the surface's shape as a known term -- so subtracting the template's local
-    mean would only cost signal. Peaks within one sigma of an emitter already
-    in `theta` are dropped: that basin is taken, and the move that resolves it
-    is a split, not a birth.
-
-    `owned` is the ROI's OWNERSHIP MASK over its own pixels. ROI boxes are
-    padded by `BBOX_PAD = 3 sigma` and therefore OVERLAP; a neighbour's emitter
-    is frozen into this ROI's halo only if it was a seed, so an emitter BORN in
-    the overlap is invisible to the ROI next door, which is free to give birth
-    to the same source again. Restricting births to the pixels whose nearest
-    seed belongs to THIS ROI partitions the frame exactly once -- a bounds
-    question, not a loss question: no source is excluded, only assigned.
-
-    Worth knowing what this did NOT fix. It was added on the hypothesis that
-    overlap duplication explained the arm's false positives at density 0.055,
-    and it did not move them (5.67 per frame before and after). The duplicates
-    were real but the cost was elsewhere -- see `BIRTH_Z`.
-    """
-    z_thresh = BIRTH_Z if z_thresh is None else float(z_thresh)
-    m = psf.model(theta, yy, xx, sigma, halo=halo)
-    resid = sub - m
-    # The Poisson matched filter: under Poisson noise the residual's own scale
-    # is sqrt(mean), so dividing by it makes the field unit-variance and the
-    # filter response's null sd is then just the kernel's L2 norm. The result is
-    # a z-score, which is what makes one threshold valid at every sigma, gain
-    # and background -- the same normalization `find_candidates` used, with a
-    # matched template instead of a LoG one.
-    nr = resid / np.sqrt(np.maximum(m, BG_FLOOR))
-    f = ndi.gaussian_filter(nr, sigma, mode="nearest") / _gauss_kernel_l2(sigma)
-    win = 2 * int(np.ceil(sigma)) + 1
-    pk = (f == ndi.maximum_filter(f, size=win, mode="nearest")) & (f > z_thresh)
-    ys, xs = np.nonzero(pk)
-    if len(ys) == 0:
-        return np.empty((0, 2)), np.empty(0)
-
-    pts = np.stack([ys, xs], axis=1).astype(float)
-    _, _, cy, cx = psf.unpack(theta)
-    if len(cy):
-        centres = np.stack([cy, cx], axis=1)
-        d = np.linalg.norm(pts[:, None, :] - centres[None, :, :], axis=-1)
-        keep = d.min(axis=1) > sigma
-        pts, ys, xs = pts[keep], ys[keep], xs[keep]
-    if len(pts) == 0:
-        return np.empty((0, 2)), np.empty(0)
-
-    if owned is not None and len(pts):
-        keep = owned[ys, xs]
-        pts, ys, xs = pts[keep], ys[keep], xs[keep]
-        if len(pts) == 0:
-            return np.empty((0, 2)), np.empty(0)
-
-    order = np.argsort(-f[ys, xs])[:max_peaks]
-    pts = pts[order]
-    amp = np.maximum(resid[ys[order], xs[order]], 1e-2) / psf.peak_factor(sigma)
-    return pts, amp
-
-
-def _score_add(sub, yy, xx, sigma, halo, r_b, th_a, lam, A_s, ld_b=None):
-    """Fit `th_a` and score it against incumbent `r_b` as one K -> K+1 move.
-
-    The single scoring path for both birth and split. In the round loop this
-    logic was written twice, in `_try_add` and `_try_split`, because each also
-    had to build its own window; here the window is the ROI's and the only
-    thing that differs between the two moves is which `theta` is proposed.
-    """
-    r_a = _fit_window(sub, yy, xx, sigma, halo, th_a)
-    K_b = (len(r_b.theta) - 1) // 3
-    log_bf, cond = evidence.log_bf_add(
-        r_b.I, r_a.I, r_b.F, r_a.F,
-        psf.unpack(r_b.theta)[1], psf.unpack(r_a.theta)[1],
-        K_b, lam, A_s, before=ld_b)
-    ok = bool(np.isfinite(log_bf) and log_bf > 0
-              and cond <= evidence.COND_GUARD)
-    return ok, log_bf, r_a
-
-
-def _grow(sub, yy, xx, sigma, halo, r, lam, A_s, k_max, owned=None,
-          birth_z=None):
-    """Birth and split until the ROI stops accepting. Returns the fit.
-
-    Both moves take K -> K+1, so N is monotone here exactly as it was in the
-    round loop, and `k_max` bounds it. Splits are visited most pair-like first
-    for the same reason as before: an accepted split changes its neighbours, so
-    the order decides what later proposals are scored against.
-    """
-    for _ in range(GROW_MAX_ROUNDS):
-        accepted = False
-
-        K = (len(r.theta) - 1) // 3
-        if K < k_max:
-            pts, amps = _residual_peaks(sub, yy, xx, sigma, halo, r.theta,
-                                        owned=owned, z_thresh=birth_z)
-            for c, a in zip(pts, amps):
-                b, A, cy, cx = psf.unpack(r.theta)
-                if len(A) >= k_max:
-                    break
-                if len(cy) and np.min(np.hypot(cy - c[0], cx - c[1])) <= sigma:
-                    continue
-                th_a = psf.pack(b, np.append(A, a), np.append(cy, c[0]),
-                                np.append(cx, c[1]))
-                ok, _, r_a = _score_add(sub, yy, xx, sigma, halo, r, th_a,
-                                        lam, A_s)
-                if ok:
-                    r, accepted = r_a, True
-
-        b, A, cy, cx = psf.unpack(r.theta)
-        if len(A) and len(A) < k_max:
-            resid = sub - psf.model(r.theta, yy, xx, sigma, halo=halo)
-            strengths = np.array([
-                moves.residual_axis(r.theta, k, yy, xx, sigma, resid)[1]
-                for k in range(len(A))])
-            for k in np.argsort(-strengths):
-                k = int(k)
-                if strengths[k] <= 0:
-                    break
-                b, A, cy, cx = psf.unpack(r.theta)
-                if k >= len(A) or len(A) >= k_max:
-                    break
-                # Recomputed against the CURRENT fit: an earlier acceptance in
-                # this same round moved this emitter's neighbours.
-                resid = sub - psf.model(r.theta, yy, xx, sigma, halo=halo)
-                u, _ = moves.residual_axis(r.theta, k, yy, xx, sigma, resid)
-                ld_b = evidence.logdet(r.F)
-                best = None
-                for disp in SPLIT_DISPS:
-                    th_a = moves.split(r.theta, k, u, disp * sigma)
-                    ok, log_bf, r_a = _score_add(sub, yy, xx, sigma, halo, r,
-                                                 th_a, lam, A_s, ld_b=ld_b)
-                    if ok and (best is None or log_bf > best[0]):
-                        best = (log_bf, r_a)
-                if best is not None:
-                    r, accepted = best[1], True
-
-        if not accepted:
-            break
-    return r
-
-
-def _shrink(sub, yy, xx, sigma, halo, r, lam, A_s):
-    """Removal tests until nothing goes. Returns the fit at the reduced K.
-
-    Faintest first, and the reduced fit is what is kept -- so the survivors
-    absorbing a removed neighbour's flux is not a separate write-back step as
-    it was in `_prune`, it is just the fit that won.
-
-    Removal is FORCED, not weighed, when `_amplitude_var` cannot be trusted or
-    when `A < PRUNE_TAU * SE(A)`; see `PRUNE_TAU`. Weighing is not available
-    there, because the quantity that would do the weighing is what has broken.
-    """
-    while True:
-        b, A, cy, cx = psf.unpack(r.theta)
-        if len(A) == 0:
-            return r
-        ld_full = evidence.logdet(r.F)
-        victim = None
-        for k in np.argsort(A):
-            k = int(k)
-            keep = np.ones(len(A), dtype=bool)
-            keep[k] = False
-            th_red = psf.pack(b, A[keep], cy[keep], cx[keep])
-            r_red = _fit_window(sub, yy, xx, sigma, halo, th_red)
-            v = _amplitude_var(r.F, k)
-            if v is None or A[k] < PRUNE_TAU * np.sqrt(v):
-                log_bf = np.inf                   # forced, not weighed
-            else:
-                log_bf = evidence.log_bf_remove(
-                    r.I, r_red.I, r.F, r_red.F, A,
-                    psf.unpack(r_red.theta)[1],
-                    len(A), lam, A_s, full=ld_full)
-            if log_bf > 0:
-                victim = r_red
-                break
-        if victim is None:
-            return r
-        r = victim
-
-
-WIDE_SIGMA_LO = 0.95
-WIDE_SIGMA_HI = 8.0
-# Bounds on `H_wide`'s free width, as multiples of the PSF sigma, and together
-# the width of its uniform prior.
-#
-# The LOWER bound is not 0. Nothing images narrower than the PSF, so a fit that
-# goes there is a fit that has broken, not a narrow object -- and letting it is
-# not free: on the two finished movie runs the post-hoc per-emitter free-sigma
-# refit put 8-16% of its rejects BELOW the PSF width and 4-9% flat on its lower
-# bound. 0.95 is just interior enough that `H_wide` at the PSF width reduces to
-# `H_1` without lmga's Coleman-Li scaling collapsing on a bound.
-#
-# The UPPER bound is what "one object" can still mean; beyond it the thing is
-# not a defocused point source and belongs to the background.
-
-
-def _fit_wide(sub, yy, xx, sigma, halo, level, sumA, cy0, cx0, s0):
-    """Fit one emitter of FREE width to the whole ROI. theta = [b, A, y, x, s]."""
-    h, w = sub.shape
-    smax = max(float(sub.max()), 1.0)
-    b_max = max(smax * 4.0, 10.0)
-    A_max = 8.0 * smax / psf.peak_factor(sigma) * max(1.0, (s0 / sigma) ** 2)
-    lo = np.array([0.0, max(moves.A_MIN, A_MIN_REL * A_max), -0.5, -0.5,
-                   WIDE_SIGMA_LO * sigma])
-    hi = np.array([b_max, A_max, h - 0.5, w - 0.5, WIDE_SIGMA_HI * sigma])
-    th0 = np.clip(np.array([level, sumA, cy0, cx0, s0], dtype=float),
-                  lo + 1e-9, hi - 1e-9)
-    return lmga.fit(th0, yy, xx, sigma, sub, lo, hi, halo=halo,
-                    max_iter=100, tol_obj=EVIDENCE_TOL_OBJ, free_sigma=True)
-
-
-def _wide_start(sub, yy, xx, halo, level, sigma):
-    """(cy, cx, sigma) moment start for `H_wide`, from the ROI's own flux.
-
-    Starting the width at the PSF sigma does not work: an ROI tiled by four
-    PSF-width emitters has a broad flux distribution, and a fit begun at the
-    narrow end sits in the wrong basin and reports it as evidence against
-    width. The second moment does not care how the flux was tiled, which is
-    exactly the property needed here.
-    """
-    w = np.maximum(sub - level - halo, 0.0)
-    tot = float(w.sum())
-    if tot <= 0:
-        return sub.shape[0] / 2.0 - 0.5, sub.shape[1] / 2.0 - 0.5, sigma
-    cy = float((w * yy).sum() / tot)
-    cx = float((w * xx).sum() / tot)
-    m2 = float((w * ((yy - cy) ** 2 + (xx - cx) ** 2)).sum() / tot)
-    # For a 2-D Gaussian the mean squared radius is 2 sigma^2.
-    s = np.sqrt(max(m2, 0.0) / 2.0)
-    return cy, cx, float(np.clip(s, sigma, WIDE_SIGMA_HI * sigma * 0.9))
-
-
-def _try_wide(d_e, bmap, seeds, seed_amps, patch, sigma, r, lam, A_s):
-    """Score `H_wide` against the ROI's chosen `H_K`. Returns (log_bf, fit, bbox).
-
-    This is the discriminator README section 10b named as missing -- "a
-    genuinely extended object leaves a SMOOTH residual, a cluster of point
-    sources leaves PSF-scale peaks" -- computed rather than thresholded.
-    Merging a real cluster into one wide Gaussian loses the data term badly;
-    merging the tiles of one defocused object does not.
-
-    It is well posed HERE and nowhere later. A post-hoc free-sigma refit of a
-    finished detection asks the same question of a tile whose neighbours have
-    been frozen into its halo, and a tile with its neighbours frozen IS a
-    PSF-sized bump: measured, sigma 1.22 against 1.20 for an ordinary emitter.
-    The width evidence exists only while the ROI's flux is still undivided.
-
-    Both hypotheses are refitted on a WINDOW SIZED FOR THE WIDE ONE, which is
-    why this cannot reuse the solve's own window. An ROI is padded by
-    `BBOX_PAD = 3 sigma`, about 3.6 px at sigma=1.2, while a source at 4x the
-    PSF width reaches 14 px -- measured, testing on the ROI's own window found
-    the wide object 100% of the time at 1.5-2x defocus and only 17-50% at
-    3-4x, because the window could not hold it. Refitting `H_K` on the enlarged
-    window too is what keeps the two I-divergences differencable at all.
-    """
-    b, A, cy, cx = psf.unpack(r.theta)
-    if len(A) == 0:
-        return -np.inf, None, None
-
-    y0, x0 = patch.y0, patch.x0
-    sub0 = np.asarray(d_e[y0:patch.y1, x0:patch.x1])
-    yy0, xx0 = np.mgrid[0:sub0.shape[0], 0:sub0.shape[1]] * 1.0
-    level0, _ = _window_bg(bmap, y0, x0, patch.y1, patch.x1)
-    _, _, s0 = _wide_start(sub0, yy0, xx0, 0.0, level0, sigma)
-
-    # Enlarged window: wide enough to hold a source of the moment-estimated
-    # width, and never smaller than the ROI's own box.
-    pad = max(BBOX_PAD * sigma, 3.0 * s0)
-    gy, gx = cy + y0, cx + x0
-    ny0 = max(0, int(np.floor(gy.min() - pad)))
-    nx0 = max(0, int(np.floor(gx.min() - pad)))
-    ny1 = min(d_e.shape[0], int(np.ceil(gy.max() + pad)) + 1)
-    nx1 = min(d_e.shape[1], int(np.ceil(gx.max() + pad)) + 1)
-
-    sub = np.asarray(d_e[ny0:ny1, nx0:nx1])
-    h, w = sub.shape
-    yy, xx = np.mgrid[0:h, 0:w] * 1.0
-    level, halo = _window_bg(bmap, ny0, nx0, ny1, nx1)
-
-    # The halo must be rebuilt for the new box: `patch.frozen_indices` was
-    # computed for the small one, and what is frozen has to be the same set for
-    # both fits or their objectives are not comparable.
-    own = set(np.asarray(patch.indices, dtype=int).tolist())
-    others = np.array([i for i in range(len(seeds)) if i not in own], dtype=int)
-    if len(others):
-        py = np.clip(seeds[others, 0], ny0, ny1 - 1)
-        px = np.clip(seeds[others, 1], nx0, nx1 - 1)
-        d = np.hypot(seeds[others, 0] - py, seeds[others, 1] - px)
-        others = others[d <= HALO_FACTOR * sigma]
-    halo = _halo_image(seeds, seed_amps, others, sigma, yy, xx, ny0, nx0, halo)
-
-    th_k = psf.pack(level, A, gy - ny0, gx - nx0)
-    r_k = _fit_window(sub, yy, xx, sigma, halo, th_k)
-
-    cy0, cx0, s0 = _wide_start(sub, yy, xx, halo, level, sigma)
-    _, Ak, _, _ = psf.unpack(r_k.theta)
-    r_w = _fit_wide(sub, yy, xx, sigma, halo, level, float(np.sum(Ak)),
-                    cy0, cx0, s0)
-
-    sigma_width = (WIDE_SIGMA_HI - WIDE_SIGMA_LO) * sigma
-    log_bf = evidence.log_bf_wide(
-        r_k.I, r_w.I, r_k.F, r_w.F, Ak, float(r_w.theta[1]),
-        len(Ak), lam, A_s, sigma_width)
-    return log_bf, r_w, (ny0, nx0)
-
-
-def solve_roi(d_e, bmap, seeds, seed_amps, patch, sigma, lam, A_s, k_max=12,
-              wide=True, birth_z=None):
-    """Model selection inside one ROI. Returns (positions, amplitudes), global.
-
-    The window -- pixels, frozen halo, background level and shape -- is built
-    ONCE here and every fit inside `_grow` and `_shrink` shares it, which is
-    what makes their I-divergences differencable without any of `_window`'s
-    bookkeeping.
-
-    Returns `(positions, amplitudes, wide_record)`. When `H_wide` wins, the ROI
-    yields no point sources at all and one record instead: the object is not
-    representable at the PSF width, so every emitter the fixed-sigma model put
-    on it was a tile.
-
-    The halo is rendered from the DETECTOR's seed amplitudes, not from fitted
-    neighbours, because neighbouring ROIs have not been solved yet. That is a
-    seeding error in the frozen term, and it is why `refine` still runs
-    globally afterwards: solving decides N, refining decides the parameters
-    and the CRLBs, and only refine sees every neighbour at its fitted value.
-    """
-    y0, x0, y1, x1 = patch.y0, patch.x0, patch.y1, patch.x1
-    sub = np.asarray(d_e[y0:y1, x0:x1])
-    h, w = sub.shape
-    yy, xx = np.mgrid[0:h, 0:w] * 1.0
-
-    level, halo = _window_bg(bmap, y0, x0, y1, x1)
-    halo = _halo_image(seeds, seed_amps, np.asarray(patch.frozen_indices,
-                                                    dtype=int),
-                       sigma, yy, xx, y0, x0, halo)
-
-    idx = np.asarray(patch.indices, dtype=int)
-
-    # Nearest-seed ownership over this ROI's pixels. Ties go to the lower seed
-    # index, which is the same rule in every ROI, so the partition is a true
-    # partition: every pixel is owned by exactly one ROI.
-    if len(seeds) > len(idx):
-        gy = yy + y0
-        gx = xx + x0
-        d2 = ((gy[..., None] - seeds[None, None, :, 0]) ** 2
-              + (gx[..., None] - seeds[None, None, :, 1]) ** 2)
-        owned = np.isin(np.argmin(d2, axis=-1), idx)
-    else:
-        owned = np.ones(sub.shape, dtype=bool)
-
-    loc = seeds[idx] - np.array([y0, x0])
-    theta0 = psf.pack(level, seed_amps[idx], loc[:, 0], loc[:, 1])
-    r = _fit_window(sub, yy, xx, sigma, halo, theta0)
-
-    r = _grow(sub, yy, xx, sigma, halo, r, lam, A_s, k_max, owned=owned,
-              birth_z=birth_z)
-    r = _shrink(sub, yy, xx, sigma, halo, r, lam, A_s)
-
-    if wide:
-        log_bf, r_w, org = _try_wide(d_e, bmap, seeds, seed_amps, patch, sigma,
-                                     r, lam, A_s)
-        if np.isfinite(log_bf) and log_bf > 0 and r_w is not None:
-            wy0, wx0 = org
-            Aw, cyw, cxw, sw = (r_w.theta[1], r_w.theta[2], r_w.theta[3],
-                                r_w.theta[4])
-            rec = np.zeros(1, dtype=AGGREGATE_DTYPE)
-            rec["y"], rec["x"] = cyw + wy0, cxw + wx0
-            rec["sigma"], rec["flux"] = sw, Aw
-            rec["radius"] = AGG_MASK_RADIUS * sw
-            return np.empty((0, 2)), np.empty(0), rec
-
-    _, A, cy, cx = psf.unpack(r.theta)
-    if len(A) == 0:
-        return np.empty((0, 2)), np.empty(0), None
-    return np.stack([cy + y0, cx + x0], axis=1), A, None
-
-
-def _dedupe_wide(rec):
-    """Collapse wide records that are the same physical object.
-
-    One over-wide source raises SEVERAL detector seeds -- a broad blob is not a
-    single local maximum of the LoG -- so it becomes several ROIs, each of which
-    independently concludes it is looking at one wide object. Measured on a
-    single synthetic source at 3-4x the PSF width: two records where there is
-    one thing.
-
-    Brightest first, absorbing any later record whose centre falls inside
-    `AGG_MASK_RADIUS` of the wider of the two. This is the rule
-    `find_aggregates` already uses on its own overlapping hits; it is repeated
-    rather than shared because that one dedupes CANDIDATES before a search and
-    this one dedupes CONCLUSIONS after one.
-    """
-    if rec is None or len(rec) <= 1:
-        return rec
-    keep = []
-    for row in rec[np.argsort(-rec["flux"])]:
-        if any((row["y"] - k["y"]) ** 2 + (row["x"] - k["x"]) ** 2
-               <= (AGG_MASK_RADIUS * max(row["sigma"], k["sigma"])) ** 2
-               for k in keep):
-            continue
-        keep.append(row)
-    return np.array(keep, dtype=AGGREGATE_DTYPE)
-
-
-def detect_local(data_img, sigma=1.2, offset=0.0, gain=None,
-                 alpha=AGUET_ALPHA, lam0=0.02, A_s0=None, k_max=12,
-                 bg_kernel=BG_KERNEL, max_settle=4, verbose=1, impl="py",
-                 wide=True, birth_z=None):
-    """Detector-seeded local model selection. Returns a `DetectResult`.
-
-        DETECT   aguet.detect_spots        one seed per resolvable object
-        GROUP    patches.build_patches     seeds -> ROIs, halo, bbox
-        SOLVE    solve_roi, per ROI        birth/split/prune, independently
-        REFINE   refine                    parameters and CRLBs, to a fixed point
-
-    No round loop, no residual map over the frame, no background backfitting
-    between rounds. ROIs do not interact during SOLVE, so the order they are
-    visited in cannot change the answer -- which the round loop could not say.
-    """
-    be = backend_mod.get(impl)
-    raw = np.asarray(data_img, dtype=float)
-    H, W = raw.shape
-    g_eff = calibrate.estimate_gain(raw, offset) if gain is None else float(gain)
-    d_e = (raw - offset) / g_eff
-
-    seeds, seed_amps, _ = aguet.detect_spots(d_e, sigma, alpha,
-                                             clear_border=False)
-
-    b0 = float(np.percentile(d_e, 10.0))
-    if A_s0 is None:
-        A_s0 = max(float(d_e.max()) - b0, 10.0) / psf.peak_factor(sigma)
-    lam = max(len(seeds) / float(H * W), 1e-6) if len(seeds) else lam0
-    A_s = max(float(np.mean(seed_amps)), 1.0) if len(seed_amps) else A_s0
-
-    # Estimated ONCE, from the detector's own seeds. The round loop re-estimated
-    # it every round because its emitter set kept changing; here the seed set is
-    # final before any fit runs. README section 10 measured what the surface is
-    # worth -- a cleaner residual, and ~5% on SE(A) at most -- so paying for it
-    # more than once buys nothing.
-    bmap = _update_bg(d_e, seeds, seed_amps, sigma, np.full((H, W), max(b0, BG_FLOOR)),
-                      bg_kernel, be=be)
-
-    rois = patch_mod.build_patches(seeds, sigma, (H, W), k_max=k_max) \
-        if len(seeds) else []
-
-    pos_parts, amp_parts, wide_parts = [], [], []
-    for p in rois:
-        pp, aa, ww = solve_roi(d_e, bmap, seeds, seed_amps, p, sigma, lam, A_s,
-                               k_max, wide=wide, birth_z=birth_z)
-        if ww is not None:
-            wide_parts.append(ww)
-        elif len(aa):
-            pos_parts.append(pp)
-            amp_parts.append(aa)
-    positions = np.vstack(pos_parts) if pos_parts else np.empty((0, 2))
-    amplitudes = np.concatenate(amp_parts) if amp_parts else np.empty(0)
-    agg_rec = _dedupe_wide(np.concatenate(wide_parts)) if wide_parts else None
-
-    # Frozen into `bmap` as a KNOWN additive term, exactly as `find_aggregates`
-    # does, and for the same reason: an over-wide object left in the residual is
-    # re-tiled from the boundary inward by the very next thing that looks at it
-    # -- here, `refine` and the settle prune. Every window fit already splits
-    # `bmap` into a free level and a frozen shape, so this costs no new code in
-    # any pass.
-    agg_model = render_aggregates(agg_rec, (H, W))
-    bmap = bmap + agg_model
-
-    if verbose >= 1:
-        nw = 0 if agg_rec is None else len(agg_rec)
-        print(f"  [detect] {len(seeds):4d} seeds (alpha={alpha}) -> "
-              f"{len(rois):4d} ROIs -> N={len(positions):4d}"
-              + (f", {nw} wide" if nw else ""))
-
-    if len(positions):
-        lam = max(len(positions) / float(H * W), 1e-6)
-        A_s = max(float(np.mean(amplitudes)), 1.0)
-
-        # Re-estimated ONCE, now from the emitters that were actually found.
-        # The first estimate masked only the DETECTOR's seeds, and the detector
-        # returns one seed per resolvable object, not one per emitter -- at
-        # density 0.055 that is ~25 seeds against 84 true sources, so two
-        # thirds of the frame's emitters were sitting in their own background
-        # window and inflating it. The signature is an amplitude bias with the
-        # wrong sign: measured on the bright arm, dA/A ran -2.1% here against
-        # +2.0% for the round loop, and the median position error was 0.27 px
-        # against 0.14.
-        bmap = _update_bg(d_e, positions, amplitudes, sigma, bmap, bg_kernel,
-                          be=be) + agg_model
-
-    positions, amplitudes, se = be.refine(d_e, positions, amplitudes, sigma,
-                                          bmap, k_max, REFINE_SWEEPS)
-
-    # `refine` re-fits at fixed N with no separation constraint and can pull an
-    # accepted pair together, which no ROI saw when it accepted them. That is
-    # what this loop is for and it is INSTRUMENTED: if it never removes
-    # anything on real data, it is dead weight and should go.
-    n_settled = 0
-    for _ in range(max_settle):
-        if not len(positions):
-            break
-        n_before = len(positions)
-        positions, amplitudes, _ = be.prune(d_e, bmap, positions, amplitudes,
-                                            sigma, lam, A_s, k_max)
-        if len(positions) == n_before:
-            break
-        n_settled += n_before - len(positions)
-        positions, amplitudes, se = be.refine(d_e, positions, amplitudes,
-                                              sigma, bmap, k_max,
-                                              REFINE_SWEEPS)
-
-    model = bmap + be.render_model(positions, amplitudes, sigma, bmap.shape,
-                                   0.0)
-    if verbose >= 1:
-        nr = (d_e - model) / np.sqrt(np.maximum(model, 1e-6))
-        print(f"[final] N={len(positions)}  settle removed {n_settled}  "
-              f"bg={np.median(bmap):.2f} [{bmap.min():.2f}, {bmap.max():.2f}]  "
-              f"resid median={np.median(nr):+.3f}  "
-              f"robust_std={calibrate.robust_spread(nr):.3f}")
-
-    return DetectResult(
-        positions=positions, amplitudes=amplitudes, sigma=sigma, lam=lam,
-        A_s=A_s, gain=g_eff, n_outer_passes=1, model_image=model,
-        residual=d_e - model, background=bmap, se=se,
-        history=[dict(seeds=len(seeds), rois=len(rois),
-                      N=len(positions), settled=n_settled,
-                      wide=0 if agg_rec is None else len(agg_rec))],
-        aggregates=agg_rec,
-    )

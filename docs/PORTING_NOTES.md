@@ -364,8 +364,54 @@ to nothing.
 |---|---|---|
 | `01_psf` | model and Jacobian | relative 1e-13. **Not** bit-exact — every libm's `erf` differs, and that sets the floor for everything above |
 | `02_lmga` | the bounded optimizer | `I` to 1e-8 **absolute** (nats). Do not assert on `n_iter`: the gain-ratio accept/reject branch is sensitive to the last ulp |
-| `03_evidence` | Bayes factor and guards | 1e-10. `antisymmetry_residual` must be **exactly** 0.0 — if it is not, the add and remove paths have diverged |
+| `03_evidence` | Bayes factor, guards, and the width prior | 1e-10. `antisymmetry_residual` must be **exactly** 0.0 — if it is not, the add and remove paths have diverged |
 | `04_end_to_end` | whole pipeline, **built from `spotsolve`** | deliberately **not** bit-exact; accept on `N` ±1, precision/recall ±0.03, RMSE ±0.02 px, audit counts ±1 |
+
+### The free-width layers, added 2026-09-03
+
+Every fixture above carries a **second block** for the 4K+1 layout. Port them
+in the same bottom-up order; each isolates one thing the free width added, and
+each was chosen so that a specific wrong port fails *it* rather than failing
+`04_end_to_end` with "N is different".
+
+| block | what it pins | the mistake it catches |
+|---|---|---|
+| `01_psf.var_sigma_cases` | `model_var_sigma` / `jac_var_sigma` on `[b, A, y, x, s, …]` | **Column order.** Sigma is the LAST of each emitter's four. A port that puts it first passes `model` and fails `jac_flat` |
+| `02_lmga.var_sigma_cases` | the same fit twice, `ml` and `map`, same data and start | **The penalty's sign, scale, and what it touches.** `ml` passing while `map` fails localizes it to the penalty alone |
+| `03_evidence.width_prior_cases` | `logpdf`, `curvature`, `log_config` for both priors | The prior's own arithmetic, before any Bayes factor reads it |
+| `03_evidence.var_sigma_cases` | `log_bf_add` / `log_bf_remove` on 4K+1 | **The Laplace volume.** A port that keeps `1.5·log 2π` fails by exactly `0.5·log 2π` = 0.919 nats |
+| `04_end_to_end.sim_cases` | `detect` at the shipped default, on the confocal simulation | Everything above, composed — plus `n_wide`, which is the only column that sees the class boundary |
+
+**Two contracts in `02_lmga.var_sigma_cases` that are easy to get backwards**,
+and they point opposite ways on purpose:
+
+- `I` is the data term with the penalty **excluded**. `evidence` adds the prior
+  itself, so a penalized `I` charges it twice.
+- `F` is the Gauss–Newton matrix with the penalty's curvature **included**. The
+  Laplace volume wants the Hessian of the log *posterior*, `F + Λ`.
+
+A port that adds the penalty to `I` passes `ml` and fails `map`.
+
+**`04_end_to_end` now has two arms and needs both.** `cases` is Gaussian-
+rendered fields at `slack=None` — the layout the Rust core implements today,
+kept so it cannot regress while the free width is added. `sim_cases` is the
+confocal simulation at the shipped default, and it is the one that matters
+here: **Gaussian fields cannot test any of this.** Every emitter in them is
+rendered at the model's own sigma, so nothing exercises the width prior, the
+class boundary, or the MAP penalty — a port could ignore all three and still
+pass. `sim_out` puts emitters at depths uniform in ±0.5 µm through a vectorial
+spinning-disk PSF, so its widths are set by physics rather than by a knob, and
+its pathologies are the ones the real movies have.
+
+The pixels are **baked into the JSON**. `data/sim_out` is a build product and
+is not in the repository, so a fixture that referenced it by path would be
+unreproducible for exactly the reader who needs it. Regenerating those cases
+needs the directory present; asserting against them does not.
+
+Check `n_wide` as well as `N`. A port whose width prior is subtly wrong lands
+the class boundary somewhere else, and `N` alone can hide that, because a
+mis-classified object stays in the model either way — it just gets reported
+through a different field.
 
 Two earlier fixtures, `04_score` and `05_boxes`, covered the projected score and
 the box tiling. Neither was on the `spotsolve` path and both were dropped with

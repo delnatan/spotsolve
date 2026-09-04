@@ -49,7 +49,8 @@ import scipy.ndimage as ndi
 
 from . import psf
 
-__all__ = ["LOG_SEED_Z", "LOG_SEED_THRESHOLD", "robust_background",
+__all__ = ["SEED_ALPHA", "seed_threshold", "LOG_SEED_Z",
+           "LOG_SEED_THRESHOLD", "robust_background",
            "emitter_free_mask",
            "estimate_gain",
            "robust_spread", "lower_half_spread", "gain_ratio_from_residual",
@@ -96,8 +97,94 @@ LOG_SEED_THRESHOLD = LOG_SEED_Z
 # Deprecated alias. The unit changed under this name, so prefer `LOG_SEED_Z`;
 # anything still reading this and expecting raw filter units is wrong by
 # 1/||w||_2.
+#
+# BOTH are superseded by `seed_threshold`, which DERIVES the cut instead of
+# carrying one. `LOG_SEED_Z` remains only so the historical behaviour can be
+# reproduced on demand.
 
 
+SEED_ALPHA = 0.05
+# The seeder's family-wise false-seed rate per frame, and the only free number
+# in `seed_threshold`.
+#
+# It can be this loose because FIND IS A SEEDER, NOT A DECISION RULE. Every
+# candidate it raises still has to win a Bayes factor in ADD, so a spurious
+# seed costs runtime, not a false detection. What an over-tight seed costs is
+# unrecoverable: the forward-only loop never revisits a peak it did not
+# propose, so a real emitter that fails this cut is lost outright.
+#
+# Measured, moderate density, sweeping the cut alone (the shipped 6.496 against
+# the derived 3.7-4.5):
+#
+#     z      recall sparse/moderate   split/add   rounds   last round
+#    3.70          97.5% / 93.4%         0.60      5.8      0 added 0 split
+#    4.50          97.5% / 93.1%         0.71      5.8      0 added 0 split
+#    5.50          97.5% / 92.8%         0.81      6.0      0 added 1 split
+#    6.496         96.2% / 92.6%         0.88      6.0      0 added 1 split
+#
+# Three things move together, and they are one effect. Recall rises. SPLIT
+# stops doing ADD's work -- the split/add ratio falls monotonically, which is
+# README section 11's "adds are zero and splits are everything" in reverse.
+# And at 3.7-4.5 the round loop TERMINATES on its own instead of exhausting
+# `max_rounds`, which section 11 said it could not be made to do.
+#
+# The tell that 6.496 was wrong is in the acceptance rate, and it needs no
+# ground truth to see: at that cut ADD accepted 62.5 of 63.5 candidates,
+# **98%**. A proposal mechanism the decision rule almost never refuses is not
+# proposing anything marginal -- it is a screen masquerading as a seeder. At
+# 3.7 the acceptance rate is 83% and the Bayes factor is doing visible work.
+#
+# WHAT IT COSTS, and it is not zero. Ghost detections -- extra ones near no
+# true emitter at all -- go from 0.00 per frame to 0.33 at 1 emitter/um^2 and
+# 0.17 at 5. The old cut bought that immunity by refusing to look.
+#
+# Note the ghost rate is ~6x the nominal `alpha`, and the reason is worth
+# knowing: the Bonferroni cut assumes the LoG response is standard normal under
+# the null, which holds only where the MODEL IS RIGHT. On a frame containing
+# sources the model cannot represent, the residual is not white, and the
+# effective test count is larger than the pixel geometry says. So this is a
+# LOWER bound on the cut's conservatism -- tighten `alpha` if a downstream
+# cannot tolerate the odd invented emitter, and do not expect the nominal rate
+# to be delivered on data with model mismatch.
+
+
+def seed_threshold(shape, sigma, alpha=SEED_ALPHA):
+    """FIND's seed cut in sd of the LoG null, derived rather than carried.
+
+    `find_candidates` normalizes its response by `core.log_kernel_l2(sigma)`,
+    so under the null it is standard normal per pixel; and it keeps only local
+    maxima in a `2*ceil(sigma)+1` window, so that window sets the number of
+    INDEPENDENT tests. A family-wise rate `alpha` over `n` of them is the
+    Bonferroni cut `Phi^-1(1 - alpha/n)`.
+
+    It therefore scales with the frame and with the PSF, which a constant
+    cannot: on 64^2 at sigma 0.818 it is 3.70, on 512^2 at sigma 1.45 it is
+    4.43. The historical `LOG_SEED_Z = 6.496` corresponds to `alpha ~ 2e-8`.
+    """
+    h, w = shape[:2]
+    win = 2 * int(np.ceil(float(sigma))) + 1
+    n = max(float(h) * float(w) / float(win) ** 2, 1.0)
+    return float(_norm_isf(min(max(float(alpha), 1e-12), 0.999) / n))
+
+
+def _norm_isf(p):
+    """Standard-normal upper-tail inverse. `scipy.special.ndtri` is already a
+    dependency through `scipy`, and this keeps the Rust port's contract to one
+    special function it must match."""
+    from scipy.special import ndtri
+    return -ndtri(p)
+
+
+
+
+def _widths(sigma, n):
+    """`sigma` as one width per emitter, whether a scalar or an array was
+    given. The pipeline's fits may leave every emitter at its own width, and
+    the two places that stamp an emitter's SUPPORT -- the background mask and
+    the model render -- have to use that width or they mask and render the
+    wrong footprint for a defocused source."""
+    a = np.asarray(sigma, dtype=float)
+    return np.full(n, float(a)) if a.ndim == 0 else a.ravel()
 
 
 def emitter_free_mask(shape, positions, sigma, radius_factor=3.0):
@@ -114,9 +201,10 @@ def emitter_free_mask(shape, positions, sigma, radius_factor=3.0):
     free = np.ones((H, W), dtype=bool)
     if positions is None or len(positions) == 0:
         return free
-    r = radius_factor * sigma
-    r2 = r * r
-    for cy, cx in np.atleast_2d(np.asarray(positions, dtype=float)):
+    pos = np.atleast_2d(np.asarray(positions, dtype=float))
+    radii = radius_factor * _widths(sigma, len(pos))
+    for (cy, cx), r in zip(pos, radii):
+        r2 = r * r
         y0 = max(int(np.ceil(cy - r)), 0)
         y1 = min(int(np.floor(cy + r)) + 1, H)
         x0 = max(int(np.ceil(cx - r)), 0)
@@ -301,6 +389,8 @@ def gain_ratio_from_residual(d_e, model, seed=0):
 def render_model(positions, amplitudes, sigma, shape, background, truncate=4.0):
     """Global model image: background plus every emitter's PSF, summed.
 
+    `sigma` is a scalar or one width per emitter.
+
     Contributions from overlapping emitters ADD, which is what the physics
     says and what every patch fit assumes locally. (An earlier version
     stitched per-patch models by AVERAGING them where bounding boxes
@@ -317,8 +407,9 @@ def render_model(positions, amplitudes, sigma, shape, background, truncate=4.0):
         return m
     positions = np.atleast_2d(np.asarray(positions, dtype=float))
     amplitudes = np.asarray(amplitudes, dtype=float).ravel()
-    rad = int(np.ceil(truncate * sigma))
-    for (cy, cx), A in zip(positions, amplitudes):
+    widths = _widths(sigma, len(positions))
+    for (cy, cx), A, s_k in zip(positions, amplitudes, widths):
+        rad = int(np.ceil(truncate * s_k))
         y0 = max(0, int(np.floor(cy)) - rad)
         y1 = min(H, int(np.ceil(cy)) + rad + 1)
         x0 = max(0, int(np.floor(cx)) - rad)
@@ -327,5 +418,5 @@ def render_model(positions, amplitudes, sigma, shape, background, truncate=4.0):
             continue
         yy, xx = np.mgrid[y0:y1, x0:x1]
         th = psf.pack(0.0, [A], [cy], [cx])
-        m[y0:y1, x0:x1] += psf.model(th, yy * 1.0, xx * 1.0, sigma)
+        m[y0:y1, x0:x1] += psf.model(th, yy * 1.0, xx * 1.0, s_k)
     return m

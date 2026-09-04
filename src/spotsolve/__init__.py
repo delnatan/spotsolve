@@ -12,21 +12,29 @@ in evidence.
     result = spotsolve.detect(image, sigma=1.45, gain=2.401, offset=100.0)
     result.positions    # (N, 2) float (y, x), pixels
     result.amplitudes   # (N,) total flux, photoelectrons
-    result.se           # (N, 2) reported standard errors, pixels
+    result.se           # (N, 3) CRLB: SE of (flux, y, x)
+    result.fit_sigma    # (N,) each emitter's own fitted width
+    result.aggregates   # objects too wide to be a point source -- see §8b
 
 The pipeline itself lives in `spotsolve.core`; the names re-exported here are
 its public surface. The other modules are the layers it is built from, and are
 imported directly when you need them:
 
-    psf lmga evidence patches moves calibrate   the model and the fit
-    backend                                     Python / Rust pass dispatch
-    audit metrics simulate                      is the answer any good?
-    loctable                                    results as `polars` tables
-    aguet                                       the reference detector
+    psf lmga prior evidence patches moves calibrate   the model and the fit
+    backend                                          Python / Rust dispatch
+    audit metrics simulate                           is the answer any good?
+    loctable                                         results as `polars` tables
+
+Every emitter carries its own width, bounded to `SIGMA_SLACK` and fitted by
+MAP under a prior centred on the PSF; one that lands outside `FOCUS_BAND` is
+modelled to the end but returned in `aggregates` rather than as a detection.
+That is what keeps a defocused source from being tiled into several spurious
+in-focus ones -- README section 8b.
 
 Pass `impl="rs"` to `detect` to run the four inner passes in the `spotsolve_rs`
 Rust extension instead of the Python reference; `backend.available()` says
-whether it is installed here. Results are identical either way.
+whether it is installed here. The Rust core implements the FIXED-width layout,
+so `impl` is ignored unless `slack=None`.
 """
 
 from .core import (  # noqa: F401
@@ -35,20 +43,24 @@ from .core import (  # noqa: F401
     render,
     background_map,
     find_candidates,
-    find_aggregates,
     flag_aggregates,
     aggregate_report,
-    render_aggregates,
     log_kernel_l2,
 )
-from .infocus import (  # noqa: F401
-    filter_in_focus,
-    INF_FOCUS_SIGMA_RATIO_MIN,
-    INF_FOCUS_SIGMA_RATIO_MAX,
-    VAR_SIGMA_RATIO_LO,
-    VAR_SIGMA_RATIO_HI,
+from .prior import (  # noqa: F401
+    FluxPrior,
+    ExponentialFlux,
+    WidthPrior,
+    UniformWidth,
+    FocusMixtureWidth,
+    FOCUS_WIDTH_GAMMA,
 )
-from .structs import DetectResult, FitResult, Patch  # noqa: F401
+from .structs import (  # noqa: F401
+    WIDTH_REJECT_DTYPE,
+    DetectResult,
+    FitResult,
+    Patch,
+)
 
 # Tuning constants. These are the pipeline's dials and are part of the public
 # surface: `PRUNE_TAU` is its only precision/recall knob, and the Rust backend
@@ -58,8 +70,11 @@ from .core import (  # noqa: F401
     HALO_FACTOR,
     BBOX_PAD,
     CAND_THRESHOLD,
+    SEED_ALPHA,
     PRUNE_TAU,
     SPLIT_DISPS,
+    SIGMA_SLACK,
+    FOCUS_BAND,
     BG_KERNEL,
     BG_FLOOR,
     BG_MASK_RADIUS,
@@ -69,9 +84,6 @@ from .core import (  # noqa: F401
     REFINE_TOL,
     REFINE_TOL_OBJ,
     EVIDENCE_TOL_OBJ,
-    AGG_FLUX_RATIO,
-    AGG_SIGMA_LO,
-    AGG_SIGMA_HI,
     AGG_MASK_RADIUS,
     AGG_AMP_RATIO,
     AGG_LINK,
@@ -86,12 +98,9 @@ __all__ = [
     "render",
     "background_map",
     "find_candidates",
-    "find_aggregates",
     "flag_aggregates",
     "aggregate_report",
-    "render_aggregates",
     "log_kernel_l2",
-    "filter_in_focus",
     "DetectResult",
     "FitResult",
     "Patch",
@@ -99,8 +108,18 @@ __all__ = [
     "HALO_FACTOR",
     "BBOX_PAD",
     "CAND_THRESHOLD",
+    "SEED_ALPHA",
     "PRUNE_TAU",
     "SPLIT_DISPS",
+    "SIGMA_SLACK",
+    "FOCUS_BAND",
+    "WIDTH_REJECT_DTYPE",
+    "FluxPrior",
+    "ExponentialFlux",
+    "WidthPrior",
+    "UniformWidth",
+    "FocusMixtureWidth",
+    "FOCUS_WIDTH_GAMMA",
     "BG_KERNEL",
     "BG_FLOOR",
     "BG_MASK_RADIUS",
@@ -110,15 +129,8 @@ __all__ = [
     "REFINE_TOL",
     "REFINE_TOL_OBJ",
     "EVIDENCE_TOL_OBJ",
-    "AGG_FLUX_RATIO",
-    "AGG_SIGMA_LO",
-    "AGG_SIGMA_HI",
     "AGG_MASK_RADIUS",
     "AGG_AMP_RATIO",
     "AGG_LINK",
-    "INF_FOCUS_SIGMA_RATIO_MIN",
-    "INF_FOCUS_SIGMA_RATIO_MAX",
-    "VAR_SIGMA_RATIO_LO",
-    "VAR_SIGMA_RATIO_HI",
     "__version__",
 ]

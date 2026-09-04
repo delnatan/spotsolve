@@ -24,14 +24,20 @@ import scipy.ndimage as ndi
 
 import spotsolve
 from spotsolve import calibrate
+from spotsolve import core
 from spotsolve import evidence
 from spotsolve import lmga
+from spotsolve import prior
 from spotsolve import psf
 from spotsolve import simulate
 
 REPO = pathlib.Path(__file__).resolve().parent.parent
 OUT = str(REPO / "tests" / "fixtures")
 SIGMA = 1.2
+# The confocal simulation's own in-focus width, fitted to the pixel-binned
+# stamp it deposits (`scripts/psf_sigma_scan.py`). Not the same instrument as
+# `SIGMA` above, which is the Gaussian arm's.
+SIM_SIGMA = 0.818
 GAIN, OFFSET = 4.23, 100.0
 
 
@@ -184,13 +190,36 @@ def fx_psf():
         cases.append(dict(K=K, h=h, w=w, sigma=SIGMA, theta=theta,
                           peak_factor=psf.peak_factor(SIGMA),
                           model=m, jac_flat=J.reshape(-1, J.shape[-1])))
+
+    # The 4K+1 layout, which the free width fits and the Rust core already
+    # carries as `pack_var` / `model_and_jac_var_sigma_ax`.
+    var_cases = []
+    for K, seed in ((1, 5), (3, 6)):
+        r = np.random.default_rng(seed)
+        h, w = 13, 11
+        yy, xx = np.mgrid[0:h, 0:w] * 1.0
+        sig = r.uniform(0.8, 2.0, K) * SIGMA
+        theta = psf.pack_var_sigma(r.uniform(2, 8), r.uniform(300, 1800, K),
+                                   r.uniform(2, h - 2, K),
+                                   r.uniform(2, w - 2, K), sig)
+        m = psf.model_var_sigma(theta, yy, xx)
+        J = psf.jac_var_sigma(theta, yy, xx)
+        var_cases.append(dict(K=K, h=h, w=w, theta=theta, sigmas=sig,
+                              model=m, jac_flat=J.reshape(-1, J.shape[-1])))
+
     return dict(
-        what="psf.model / psf.jac on a (h,w) pixel-centre grid",
+        what="psf.model / psf.jac on a (h,w) pixel-centre grid, fixed and "
+             "per-emitter width",
         layout="theta = [b, A_0, y_0, x_0, A_1, ...]; jac_flat is "
-               "(h*w, 3K+1) in C order, i.e. row-major over (y, x)",
+               "(h*w, 3K+1) in C order, i.e. row-major over (y, x). "
+               "var_sigma_cases use [b, A_0, y_0, x_0, s_0, A_1, ...] and "
+               "(h*w, 4K+1); the sigma column is the LAST of each emitter's "
+               "four, and a port that orders it first will pass this layer's "
+               "`model` and fail its `jac_flat`.",
         compare="relative 1e-13 elementwise. NOT bit-exact across libm "
                 "implementations -- erf is the reason.",
-        cases=cases)
+        cases=cases,
+        var_sigma_cases=var_cases)
 
 
 # ---------------------------------------------------------------- layer 2
@@ -221,13 +250,59 @@ def fx_lmga():
                           stalled=res.stalled,
                           grad_inf_norm=float(np.max(np.abs(
                               _grad(res.theta, yy, xx, SIGMA, d))))))
+    # Free widths, ML and MAP. The pair is the point: the same data and the
+    # same start, differing only by the penalty, so a port can tell "my
+    # optimizer is wrong" from "my penalty is wrong".
+    var_cases = []
+    s0 = SIGMA
+    wp = prior.FocusMixtureWidth(0.006, 0.0004, 0.70 * s0, 2.0 * s0,
+                                 2.2 * s0, s0, prior.FOCUS_WIDTH_GAMMA)
+    for K, seed in ((1, 31), (2, 32)):
+        r = np.random.default_rng(seed)
+        h = w = 15
+        yy, xx = np.mgrid[0:h, 0:w] * 1.0
+        sig = r.uniform(0.95, 1.7, K) * s0
+        th = psf.pack_var_sigma(r.uniform(2, 8), r.uniform(300, 1800, K),
+                                r.uniform(4, 11, K), r.uniform(4, 11, K), sig)
+        d = r.poisson(np.maximum(psf.model_var_sigma(th, yy, xx),
+                                 1e-9)).astype(float)
+        lo = np.array([0.0] + [1e-4, -0.5, -0.5, 0.70 * s0] * K)
+        hi = np.array([max(d.max() * 4, 10.0)]
+                      + [8 * max(d.max(), 1) / psf.peak_factor(s0) * 2.2 ** 2,
+                         h - 0.5, w - 0.5, 2.2 * s0] * K)
+        t0 = np.clip(th * np.append([1.0], np.tile([1.1, 1.0, 1.0, 1.0], K)),
+                     lo + 1e-9, hi - 1e-9)
+        out = {}
+        for name, pen in (("ml", None), ("map", core._WidthPenalty(wp, K))):
+            res = lmga.fit(t0, yy, xx, s0, d, lo, hi, max_iter=100,
+                           free_sigma="per_emitter", penalty=pen)
+            out[name] = dict(theta=res.theta, I=res.I, F=res.F,
+                             converged=res.converged, stalled=res.stalled)
+        var_cases.append(dict(K=K, h=h, w=w, sigma=s0, data=d, theta0=t0,
+                              lower=lo, upper=hi,
+                              penalty=dict(kind="focus_mixture",
+                                           lo=wp.lo, mid=wp.mid, hi=wp.hi,
+                                           sigma0=wp.sigma0, scale=wp.scale,
+                                           lam_focus=wp.lam_focus,
+                                           lam_wide=wp.lam_wide),
+                              **out))
+
     return dict(
-        what="lmga.fit: bounded Fisher-scoring LM on the Poisson I-divergence",
+        what="lmga.fit: bounded Fisher-scoring LM on the Poisson "
+             "I-divergence, at fixed and per-emitter width, ML and MAP",
         compare="I to 1e-8 ABSOLUTE (nats -- the unit decisions are made in); "
                 "theta to 1e-6 px / 1e-4 relative on amplitude; F to 1e-9 "
                 "relative. Do NOT assert on n_iter: the gain-ratio branch "
                 "makes it sensitive to the last ulp of the model.",
-        cases=cases)
+        contract="In `var_sigma_cases`, `I` is the DATA term with the penalty "
+                 "EXCLUDED and `F` is the Gauss-Newton matrix with the "
+                 "penalty's curvature INCLUDED. That asymmetry is deliberate: "
+                 "`evidence` adds the prior itself, so a penalized `I` would "
+                 "charge it twice, while the Laplace volume wants the Hessian "
+                 "of the log posterior. A port that adds the penalty to `I` "
+                 "will pass `ml` and fail `map`.",
+        cases=cases,
+        var_sigma_cases=var_cases)
 
 
 def _grad(theta, yy, xx, sigma, d):
@@ -250,9 +325,13 @@ def fx_evidence():
         Aa = r.normal(size=(p + 3, p + 3)); Fa = Aa @ Aa.T + (p + 3) * np.eye(p + 3)
         ld_b, cond_b, ok_b = evidence.logdet_cond(Fb)
         ld_a, cond_a, ok_a = evidence.logdet_cond(Fa)
-        bf, c = evidence.log_bf_add(120.0, 100.0, Fb, Fa, 900.0, 1500.0,
+        # Per-emitter amplitude ARRAYS, not their sums: under a general
+        # flux prior `sum_k log g(A_k)` is not `log g(sum_k A_k)`.
+        A_b = r.uniform(400.0, 1600.0, K)
+        A_a = np.append(A_b, r.uniform(400.0, 1600.0))
+        bf, c = evidence.log_bf_add(120.0, 100.0, Fb, Fa, A_b, A_a,
                                     K, 0.02, 950.0)
-        rem = evidence.log_bf_remove(100.0, 120.0, Fa, Fb, 1500.0, 900.0,
+        rem = evidence.log_bf_remove(100.0, 120.0, Fa, Fb, A_a, A_b,
                                      K + 1, 0.02, 950.0)
         theta = psf.pack(4.0, r.uniform(200, 1500, K), r.uniform(2, 9, K),
                          r.uniform(2, 9, K))
@@ -260,19 +339,76 @@ def fx_evidence():
             K=K, F_before=Fb, F_after=Fa,
             logdet_before=ld_b, cond_before=cond_b, ok_before=ok_b,
             logdet_after=ld_a, cond_after=cond_a, ok_after=ok_a,
-            I_before=120.0, I_after=100.0, sumA_before=900.0,
-            sumA_after=1500.0, lam=0.02, A_s=950.0,
+            I_before=120.0, I_after=100.0, A_before=A_b, A_after=A_a,
+            lam=0.02, A_s=950.0,
             log_bf_add=bf, cond_reported=c, log_bf_remove=rem,
             antisymmetry_residual=float(bf + rem),
             theta=theta))
+
+    # The width layer: the prior itself, then the Bayes factor that reads it.
+    # Separated because a port that gets `log_config` wrong will fail the
+    # second in a way that says nothing about which term is at fault.
+    s0 = SIGMA
+    wp_u = prior.UniformWidth(0.02, 0.70 * s0, 2.2 * s0)
+    wp_m = prior.FocusMixtureWidth(0.006, 0.0004, 0.70 * s0, 2.0 * s0,
+                                   2.2 * s0, s0, prior.FOCUS_WIDTH_GAMMA)
+    probe = np.array([0.75, 1.0, 1.2, 1.6, 1.99, 2.1]) * s0
+    width_cases = []
+    for name, wp in (("uniform", wp_u), ("focus_mixture", wp_m)):
+        cfgs = [np.array([1.0]) * s0,
+                np.array([0.98, 1.05, 1.4]) * s0,
+                np.array([0.98, 1.05, 1.4, 2.1]) * s0]
+        width_cases.append(dict(
+            kind=name,
+            lo=wp.lo, hi=wp.hi, lam_focus=getattr(wp, "lam_focus", wp_u.lam),
+            mid=getattr(wp, "mid", None),
+            lam_wide=getattr(wp, "lam_wide", None),
+            sigma0=getattr(wp, "sigma0", None),
+            scale=getattr(wp, "scale", None),
+            probe_sigma=probe,
+            logpdf=np.asarray(wp.logpdf(probe)),
+            curvature=np.asarray(wp.curvature(probe)),
+            configs=[dict(sigmas=c, log_config=wp.log_config(c)) for c in cfgs],
+        ))
+
+    # `log_bf_add` on the 4K+1 layout: K free widths before, K+1 after.
+    var_cases = []
+    for K in (1, 3):
+        p = 4 * K + 1
+        Ab = r.normal(size=(p, p)); Fb = Ab @ Ab.T + p * np.eye(p)
+        Aa = r.normal(size=(p + 4, p + 4)); Fa = Aa @ Aa.T + (p + 4) * np.eye(p + 4)
+        A_b = r.uniform(400.0, 1600.0, K)
+        A_a = np.append(A_b, r.uniform(400.0, 1600.0))
+        sig_b = r.uniform(0.9, 1.6, K) * s0
+        sig_a = np.append(sig_b, 1.05 * s0)
+        bf, c = evidence.log_bf_add(120.0, 100.0, Fb, Fa, A_b, A_a, K,
+                                    0.02, 950.0,
+                                    widths=(wp_m, sig_b, sig_a))
+        rem = evidence.log_bf_remove(100.0, 120.0, Fa, Fb, A_a, A_b, K + 1,
+                                     0.02, 950.0,
+                                     widths=(wp_m, sig_b, sig_a))
+        var_cases.append(dict(
+            K=K, F_before=Fb, F_after=Fa, I_before=120.0, I_after=100.0,
+            A_before=A_b, A_after=A_a, sigmas_before=sig_b, sigmas_after=sig_a,
+            lam=0.02, A_s=950.0, log_bf_add=bf, cond_reported=c,
+            log_bf_remove=rem, antisymmetry_residual=float(bf + rem)))
+
     return dict(
-        what="evidence.logdet_cond / log_bf_add / log_bf_remove",
+        what="evidence.logdet_cond / log_bf_add / log_bf_remove, fixed and "
+             "free width, and the prior.WidthPrior they read",
         invariant="log_bf_remove is the EXACT negation of log_bf_add on the "
                   "same pair; antisymmetry_residual must be 0.0 exactly, not "
                   "small. If it is not, the two paths have diverged.",
-        constants=dict(COND_GUARD=evidence.COND_GUARD),
-        compare="log BF to 1e-10 absolute; logdet to 1e-12 relative.",
-        cases=cases)
+        constants=dict(COND_GUARD=evidence.COND_GUARD,
+                       FOCUS_WIDTH_GAMMA=prior.FOCUS_WIDTH_GAMMA),
+        compare="log BF to 1e-10 absolute; logdet to 1e-12 relative; "
+                "logpdf / curvature / log_config to 1e-12 relative. The "
+                "free-width Laplace volume is 2*log(2pi), not 1.5*log(2pi) -- "
+                "a port that keeps the fixed-width constant fails "
+                "`var_sigma_cases` by exactly 0.5*log(2pi) = 0.919 nats.",
+        cases=cases,
+        width_prior_cases=width_cases,
+        var_sigma_cases=var_cases)
 
 
 # ---------------------------------------------------------------- layer 4
@@ -287,23 +423,29 @@ def fx_end_to_end():
     (README section 12)."""
     from spotsolve import audit
     from spotsolve import metrics
-    cases = []
-    for size, dens, seed in ((39, 0.034, 1001), (39, 0.055, 1002),
-                             (62, 0.047, 1003)):
-        sim, adu = field(size, dens, seed)
-        res = spotsolve.detect(adu, sigma=SIGMA, offset=OFFSET, gain=GAIN,
-                            k_max=12, verbose=0)
-        d_e = (adu - OFFSET) / GAIN
-        a = audit.audit_result(d_e, res.model_image, SIGMA)
-        m = metrics.match(sim.positions, res.positions, radius=1.5)
+
+    def one(adu, truth_pos, truth_amp, sigma, gain, offset, tag, extra, **kw):
+        res = spotsolve.detect(adu, sigma=sigma, offset=offset, gain=gain,
+                               k_max=12, verbose=0, **kw)
+        d_e = (adu - offset) / gain
+        a = audit.audit_result(d_e, res.model_image, sigma)
+        m = metrics.match(truth_pos, res.positions, radius=1.5)
         order = np.lexsort((res.positions[:, 1], res.positions[:, 0]))
-        cases.append(dict(
-            size=size, density=dens, seed=seed,
+        agg = res.aggregates
+        return dict(
+            tag=tag, sigma=sigma, gain=gain, offset=offset,
             raw_adu=np.round(adu).astype(int),
-            truth_positions=sim.positions, truth_amplitudes=sim.amplitudes,
+            truth_positions=truth_pos, truth_amplitudes=truth_amp,
             N=len(res.positions),
             positions=res.positions[order], amplitudes=res.amplitudes[order],
+            fit_sigma=(res.fit_sigma[order] if res.fit_sigma is not None
+                       else []),
             se=np.nan_to_num(res.se[order], nan=-1.0),
+            n_wide=(0 if agg is None else len(agg)),
+            wide_sigma=(np.sort(agg["sigma"]) if agg is not None
+                        else np.empty(0)),
+            n_width_rejects=(0 if res.width_rejects is None
+                             else len(res.width_rejects)),
             # `background` is an (H, W) SURFACE in spotsolve, not a scalar.
             background=np.asarray(res.background), lam=res.lam, A_s=res.A_s,
             n_passes=len(res.history),
@@ -312,19 +454,76 @@ def fx_end_to_end():
                        z_min=a["z_min"], z_max=a["z_max"],
                        z_median=a["z_median"]),
             match=dict(n_true=m.n_true, n_est=m.n_est, precision=m.precision,
-                       recall=m.recall, rmse=m.rmse)))
+                       recall=m.recall, rmse=m.rmse),
+            **extra)
+
+    # --- the FIXED-width arm, on Gaussian-rendered fields. Kept because the
+    #     Rust core implements that layout today and must not regress while
+    #     the free width is being added.
+    cases = []
+    for size, dens, seed in ((39, 0.034, 1001), (39, 0.055, 1002)):
+        sim, adu = field(size, dens, seed)
+        cases.append(one(adu, sim.positions, sim.amplitudes, SIGMA, GAIN,
+                         OFFSET, f"gauss_{size}_{dens}",
+                         dict(size=size, density=dens, seed=seed),
+                         slack=None))
+
+    # --- the SHIPPED default, on the confocal simulation. This is the arm
+    #     that matters for the free-width port, and Gaussian fields cannot
+    #     replace it: every emitter there is rendered at the model's own sigma,
+    #     so nothing exercises the width prior, the class boundary or the MAP
+    #     penalty -- a port could ignore all three and still pass. `sim_out`
+    #     puts emitters at depths uniform in +/-0.5 um through a vectorial
+    #     spinning-disk PSF, so its widths are set by physics and its
+    #     pathologies are the ones the real movies have.
+    #
+    #     The PIXELS ARE BAKED IN. `data/sim_out` is a build product and is not
+    #     in the repository, so a fixture that referenced it by path would be
+    #     unreproducible for exactly the reader who needs it most.
+    sim_cases = []
+    sim_dir = pathlib.Path(__file__).resolve().parent.parent / "data" / "sim_out"
+    if sim_dir.is_dir():
+        meta = json.loads((sim_dir / "metadata.json").read_text())
+        s_gain = float(meta["camera"]["gain"])
+        s_off = float(meta["camera"]["baseline"])
+        for label, frames in (("sparse", (0, 1)), ("moderate", (0,))):
+            stack = np.load(sim_dir / f"{label}.npy").astype(float)
+            truth = np.genfromtxt(sim_dir / f"{label}_truth.csv",
+                                  delimiter=",", names=True)
+            for fr in frames:
+                m_ = np.atleast_1d(truth["frame"]) == fr
+                tp = np.column_stack([np.atleast_1d(truth["y_px"])[m_],
+                                      np.atleast_1d(truth["x_px"])[m_]])
+                sim_cases.append(one(
+                    stack[fr], tp,
+                    np.atleast_1d(truth["photons_in_frame"])[m_],
+                    SIM_SIGMA, s_gain, s_off, f"{label}_f{fr}",
+                    dict(density=label, frame=fr,
+                         truth_z_um=np.atleast_1d(truth["z_um"])[m_])))
+    else:
+        print("  NOTE: data/sim_out absent; sim_cases left empty")
+
     return dict(
-        what="spotsolve.detect end to end on synthetic fields with truth",
+        what="spotsolve.detect end to end, with ground truth",
         compare="NOT bit-exact, deliberately. Accept a port if, per case: "
                 "|N - N_expected| <= 1; precision and recall each within 0.03; "
                 "rmse within 0.02 px; audit n_missed and n_piled each within "
                 "1. Positions are sorted by (y, x) so they can be matched "
                 "pairwise for a spot check, but a 1-emitter difference "
                 "renumbers everything after it -- match by nearest neighbour, "
-                "not by index.",
-        settings=dict(sigma=SIGMA, gain=GAIN, offset=OFFSET,
-                      k_max=12, camera_offset=OFFSET),
-        cases=cases)
+                "not by index. On `sim_cases` also require |n_wide - "
+                "expected| <= 1: a port whose width prior is wrong will land "
+                "the class boundary somewhere else, and N alone can hide that "
+                "because a mis-classified object leaves the model either way.",
+        settings=dict(gauss=dict(sigma=SIGMA, gain=GAIN, offset=OFFSET,
+                                 slack=None),
+                      sim=dict(sigma=SIM_SIGMA, k_max=12,
+                               slack=list(spotsolve.SIGMA_SLACK),
+                               band=list(spotsolve.FOCUS_BAND),
+                               width_gamma=prior.FOCUS_WIDTH_GAMMA,
+                               prune_tau=spotsolve.PRUNE_TAU)),
+        cases=cases,
+        sim_cases=sim_cases)
 
 
 
@@ -340,7 +539,6 @@ def fx_geometry():
     algorithm -- which is exactly when a golden fixture earns its keep."""
     from spotsolve import moves
     from spotsolve import patches as patch_mod
-    r = np.random.default_rng(31)
     cases = []
     for H, W, n, seed in ((48, 52, 12, 31), (39, 39, 40, 32), (24, 30, 3, 33)):
         rr = np.random.default_rng(seed)
@@ -442,23 +640,25 @@ def _mid_search_state(size, dens, seed, rounds):
     A_s = max(float(d_e.max()) - b0, 10.0) / psf.peak_factor(SIGMA)
     lam = 0.02
     positions, amplitudes = np.empty((0, 2)), np.empty(0)
+    sigmas = np.empty(0)
     for _ in range(rounds):
         model = spotsolve.render(positions, amplitudes, SIGMA, bmap)
         cand, camp, _ = spotsolve.find_candidates(d_e, model, SIGMA, positions,
-                                               spotsolve.CAND_THRESHOLD)
-        for c, a in zip(cand, camp):
-            if len(positions) and np.min(
-                    np.linalg.norm(positions - c, axis=1)) <= SIGMA:
-                continue
-            _, positions, amplitudes = spotsolve.core._try_add(
-                d_e, positions, amplitudes, bmap, c, a, SIGMA, lam, A_s, 12)
-        positions, amplitudes, _ = spotsolve.refine(
-            d_e, positions, amplitudes, SIGMA, bmap, k_max=12, max_sweeps=1)
+                                                  spotsolve.CAND_THRESHOLD)
+        # `slack=None`: this state is the FIXED-width passes' input, which is
+        # the layout the Rust core implements. The free-width passes are
+        # captured separately, from `detect` itself.
+        positions, amplitudes, sigmas, _ = spotsolve.core._add_pass(
+            d_e, bmap, positions, amplitudes, sigmas, cand, camp, SIGMA,
+            lam, A_s, 12, slack=None)
+        positions, amplitudes, _, sigmas = spotsolve.core.refine(
+            d_e, positions, amplitudes, SIGMA, bmap, k_max=12, max_sweeps=1,
+            sigmas=sigmas, slack=None)
         lam = max(len(positions) / float(H * W), 1e-6)
         if len(amplitudes):
             A_s = max(float(np.mean(amplitudes)), 1.0)
-        bmap = spotsolve.core._update_bg(d_e, positions, amplitudes, SIGMA, bmap,
-                                 spotsolve.BG_KERNEL)
+        bmap = spotsolve.core._update_bg(d_e, positions, amplitudes, SIGMA,
+                                         bmap, spotsolve.BG_KERNEL)
     return sim, d_e, positions, amplitudes, bmap, lam, A_s
 
 
@@ -482,29 +682,27 @@ def fx_passes():
         model = spotsolve.render(pos, amp, SIGMA, bmap)
         cand, camp, _ = spotsolve.find_candidates(d_e, model, SIGMA, pos,
                                                spotsolve.CAND_THRESHOLD)
-        p_add, a_add, n_added = pos.copy(), amp.copy(), 0
-        for c, a in zip(cand, camp):
-            if len(p_add) and np.min(
-                    np.linalg.norm(p_add - c, axis=1)) <= SIGMA:
-                continue
-            ok, p_add, a_add = spotsolve.core._try_add(d_e, p_add, a_add, bmap, c, a,
-                                               SIGMA, lam, A_s, k_max)
-            n_added += int(ok)
+        zs = np.empty(0)
+        p_add, a_add, s_add, n_added = spotsolve.core._add_pass(
+            d_e, bmap, pos.copy(), amp.copy(), np.full(len(amp), SIGMA),
+            cand, camp, SIGMA, lam, A_s, k_max, slack=None)
 
         # SPLIT: run against the model the adds produced, as `detect` does.
         model_s = spotsolve.render(p_add, a_add, SIGMA, bmap)
-        p_spl, a_spl, n_split = spotsolve.core._split_pass(
-            d_e, p_add.copy(), a_add.copy(), bmap, SIGMA, lam, A_s, k_max,
-            model_s)
+        p_spl, a_spl, s_spl, n_split = spotsolve.core._split_pass(
+            d_e, p_add.copy(), a_add.copy(), s_add.copy(), bmap, SIGMA, lam,
+            A_s, k_max, model_s, slack=None)
 
         # REFINE: one sweep, which is what the round loop uses.
-        p_ref, a_ref, se_ref = spotsolve.refine(
+        p_ref, a_ref, se_ref, s_ref = spotsolve.core.refine(
             d_e, p_spl.copy(), a_spl.copy(), SIGMA, bmap, k_max=k_max,
-            max_sweeps=1)
+            max_sweeps=1, sigmas=s_spl.copy(), slack=None)
 
         # PRUNE: one pass, faintest first, with write-back onto survivors.
-        p_prn, a_prn = spotsolve.core._prune(d_e, p_ref.copy(), a_ref.copy(), bmap,
-                                     SIGMA, lam, A_s, k_max)
+        p_prn, a_prn, _ = spotsolve.core._prune(
+            d_e, p_ref.copy(), a_ref.copy(), s_ref.copy(), bmap, SIGMA, lam,
+            A_s, k_max, slack=None)
+        del zs
 
         cases.append(dict(
             size=size, density=dens, seed=seed, sigma=SIGMA, k_max=k_max,
