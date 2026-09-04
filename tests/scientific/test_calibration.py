@@ -8,10 +8,14 @@ from spotsolve.prototype import (
     FitOptions,
     Hypothesis,
     NullModel,
+    ProposalBootstrapCalibration,
+    ProposalOptions,
     StartGrid,
     calibrate_local,
+    calibrate_proposal_search,
     fit_hypotheses,
     select_local,
+    select_proposed_frame,
 )
 from tests.scientific.scenarios import (
     blank,
@@ -166,6 +170,34 @@ def test_sequential_selection_distinguishes_wide_single_and_pair():
     assert pair.n_focus == 2
     assert wide.hypothesis is Hypothesis.HWIDE
     assert wide.n_focus == 0
+
+
+def test_proposal_search_calibration_roundtrips_and_selects_frame(tmp_path):
+    proposal_options = ProposalOptions(
+        score_threshold=1.5, max_proposals=4)
+    calibration = calibrate_proposal_search(
+        _null_models(), 1, roi_size=9, max_components=4, seed=52,
+        fit_options=OPTIONS, start_grid=GRID,
+        proposal_options=proposal_options)
+    assert calibration.focus_null[Hypothesis.H0].shape == (1, 1)
+    assert calibration.pair_null[Hypothesis.H1].shape == (1, 1)
+    assert calibration.proposal_counts[Hypothesis.HWIDE].shape == (1, 1)
+
+    path = tmp_path / "proposal-calibration.json"
+    calibration.save(path)
+    restored = ProposalBootstrapCalibration.load(path)
+    assert restored.fingerprint == calibration.fingerprint
+    with pytest.raises(ValueError, match="pipeline does not match"):
+        restored.check_pipeline(
+            (13, 13), 1.2,
+            ProposalOptions(score_threshold=2.0, max_proposals=4),
+            9, 4)
+
+    scenario = focused_single(shape=(13, 13), photons=900.0, seed=73)
+    selected = select_proposed_frame(
+        scenario.image, scenario.sigma, restored,
+        alpha_focus=0.51, alpha_pair=0.51)
+    assert len(selected.focused_positions) >= 1
 
 
 def test_boundary_railed_pair_is_not_reported_as_resolved():

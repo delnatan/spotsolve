@@ -64,6 +64,66 @@ held-out samples for tight error bars, and measured PSF/noise mismatch. Stage
 3 must include proposal generation and its multiple-search bias before any
 frame-level false-positive claim is valid.
 
+Stage 3 checkpoint, 2026-09-04:
+
+- `prototype.proposals` implements the standardized Poisson score for adding a
+  fixed in-focus PSF, using separable correlations for both score and Fisher
+  normalization. It returns ranked subpixel maxima, one-step flux estimates,
+  the trace-free Hessian pair axis, explicit proposal-budget status, and
+  connected components.
+- The proposal-only background is an iteratively upper-clipped Gaussian field.
+  It is intentionally cheap and is not reused as the final scientific
+  background fit. The default score cut is permissive at 2.0 standard-score
+  units; it controls computation, not false-positive error.
+- `prototype.frame` extracts fixed 13x13 local ROIs and fits one ranked
+  representative per connected component. This is the minimal Stage 3 bridge;
+  fitting multiple candidates jointly and reversibly remains Stage 4 work.
+- `prototype.proposal_calibration` bootstraps the maximum focus and pair gains
+  after background estimation, local-maximum search, deduplication, component
+  grouping, fit budgeting, and local multistart fitting. Its fingerprint covers
+  the complete proposal and fit pipeline. Applying these tails to every tested
+  component controls the familywise search effect at the calibrated frame size.
+
+The 33x33 proposal-only sweep used 100 draws in every combination of background
+1/4/20/100 e-/pixel, bright-source photons 150/300/900, flux ratio 1/4, and
+separation 0.5/0.75/1/1.25/1.5 sigma. All 126 source cells outside the
+150-photon, background-100 corner had 100/100 component recall. A separate
+200-null oracle diagnostic found only 13.5% H1 power and less than 50% focused
+or pair power throughout that excluded corner, so it does not trigger the
+Stage 3 proposal-recall gate. On 200 held-out nuisance frames per class, the
+proposal counts were bounded: blank mean/p95/max 1.43/4/5 and smooth haze
+2.25/4/7. Proposal-map median/p95 time was 0.165/0.204 ms.
+
+The end-to-end 1% sentinel command was:
+
+```text
+python scripts/bench_proposal_calibration.py --calibration-draws 99 \
+  --null-evaluation-draws 100 --pair-evaluation-draws 48 \
+  --alpha-focus 0.01 --alpha-pair 0.01 \
+  --calibration-output /tmp/spotsolve-stage3-edge-e2e-alpha01-calibration.json \
+  --output /tmp/spotsolve-stage3-edge-e2e-alpha01.json
+```
+
+It produced zero focused calls in each of 100 blank, 100 smooth-haze, and three
+100-frame wide-source classes. Two of 100 focused singles were falsely split;
+the 95% Wilson interval is 0.55%-7.00% and includes the declared 1% point, but
+more draws are required to distinguish calibration error from sampling noise.
+At 900 bright-source photons and background 4, exact end-to-end pair recovery
+was 87.5% for equal pairs at 1.0 sigma and 68.8% for 4:1 pairs at 1.25 sigma.
+No tested pair frame was lost at proposal generation. Median/p95 end-to-end
+frame time was 181/385 ms; offline proposal calibration took 280 seconds. The
+edge-inclusive held-out mean fit counts were 1.57 for blank, 2.15 for haze, and
+1.95-2.04 across the three wide-source classes.
+
+This remains a checkpoint rather than a production detector. Fixed-size edge
+ROIs are shifted inward rather than discarded, and the full-frame bootstrap
+therefore includes the same boundary search. Dedicated spatial calibration
+cells may still be needed if measured edge behavior differs. The current
+single-representative component fit can return at most two emitters per
+component. Stage 4 must replace it
+with reversible joint component moves, and the calibration grid still needs
+the remaining background/flux and measured-mismatch axes.
+
 The first 24-trial diagnostic at sigma 1.2, 900 e- for the bright source, and
 background 4 e-/pixel used this command:
 
@@ -144,6 +204,8 @@ src/spotsolve/prototype/
     proposals.py       # score map, maxima and pair-axis proposals
     select.py          # statistics and calibrated decisions
     calibration.py     # bootstrap generation and threshold tables
+    proposal_calibration.py # bootstrap maxima after the full proposal search
+    frame.py           # proposal components to fixed local fits
     solver.py          # component-level and frame-level orchestration
     result.py          # prototype result and ambiguity records
 
