@@ -10,7 +10,8 @@ def test_public_names_exist():
 
 def test_submodules_import():
     for name in ("psf", "lmga", "evidence", "patches", "moves", "calibrate",
-                 "backend", "audit", "metrics", "simulate", "prior", "core"):
+                 "backend", "audit", "metrics", "simulate", "prior", "core",
+                 "sparse"):
         __import__(f"spotsolve.{name}")
 
 

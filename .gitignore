@@ -23,7 +23,10 @@ rust/dist/
 # notebooks, and the rendered figures from past runs. Kept on disk because
 # they are worth re-reading; kept out of git because none of it is source and
 # the MATLAB tree alone is ~10 MB of committed binaries (.mex*).
-reference/
+# Anchored: an unanchored `reference/` also matches at depth, which silently
+# untracked `src/spotsolve/inference/reference/` -- the frozen Python
+# validation oracle for the Rust solver, which IS source.
+/reference/
 
 # --- Data and run artifacts ----------------------------------------------
 # The two bead crops in `data/` ARE tracked (39x39 and 62x62 uint16, a few kB
@@ -67,3 +70,5 @@ data/sim_out/
 # The golden fixtures under tests/fixtures/ ARE tracked (~1.6 MB of JSON):
 # they are the contract the Rust port is tested against, and CI needs them
 # without a Python run. Regenerate with `python scripts/make_fixtures.py`.
+# The retained inference contract also includes one compact array fixture.
+!tests/fixtures/08_inference.npz

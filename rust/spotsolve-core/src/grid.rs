@@ -68,7 +68,12 @@ impl EmitterGrid {
         let cell = cell.max(1e-6);
         let ny = ((h as f64 / cell).ceil() as usize).max(1);
         let nx = ((w as f64 / cell).ceil() as usize).max(1);
-        let mut g = Self { cell, ny, nx, cells: vec![Vec::new(); ny * nx] };
+        let mut g = Self {
+            cell,
+            ny,
+            nx,
+            cells: vec![Vec::new(); ny * nx],
+        };
         for i in 0..n {
             g.insert(i as u32, pos[2 * i], pos[2 * i + 1]);
         }
@@ -114,15 +119,7 @@ impl EmitterGrid {
     /// This is a superset of the emitters actually within `margin` of the
     /// rectangle -- the caller must still apply the exact distance test. The
     /// index only replaces the scan over all `N`.
-    pub fn query_rect(
-        &self,
-        y0: f64,
-        x0: f64,
-        y1: f64,
-        x1: f64,
-        margin: f64,
-        out: &mut Vec<u32>,
-    ) {
+    pub fn query_rect(&self, y0: f64, x0: f64, y1: f64, x1: f64, margin: f64, out: &mut Vec<u32>) {
         out.clear();
         let lo_y = (((y0 - margin) / self.cell).floor().max(0.0) as usize).min(self.ny - 1);
         let hi_y = (((y1 + margin) / self.cell).floor().max(0.0) as usize).min(self.ny - 1);

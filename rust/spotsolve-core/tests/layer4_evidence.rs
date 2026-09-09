@@ -8,7 +8,7 @@
 mod common;
 
 use common::*;
-use spotsolve_core::evidence::{Evidence, Prior, COND_GUARD};
+use spotsolve_core::evidence::{COND_GUARD, Evidence, Prior};
 
 #[test]
 fn bayes_factors_match_the_fixture() {
@@ -19,18 +19,36 @@ fn bayes_factors_match_the_fixture() {
         let k = usize_at(case, "K");
         let (nb, _, fb) = mat_at(case, "F_before");
         let (na, _, fa) = mat_at(case, "F_after");
-        let prior = Prior { lam: f64_at(case, "lam"), a_s: f64_at(case, "A_s") };
+        let prior = Prior {
+            lam: f64_at(case, "lam"),
+            a_s: f64_at(case, "A_s"),
+        };
         let (i_b, i_a) = (f64_at(case, "I_before"), f64_at(case, "I_after"));
-        let (sa_b, sa_a) = (f64_at(case, "sumA_before"), f64_at(case, "sumA_after"));
+        // Fixtures store individual emitter amplitudes; the Rust API takes their sum.
+        let (sa_b, sa_a) = (
+            vec_at(case, "A_before").iter().sum(),
+            vec_at(case, "A_after").iter().sum(),
+        );
 
-        let (bf, cond) =
-            ev.log_bf_add(i_b, i_a, &fb, &fa, nb, na, sa_b, sa_a, k, prior, None);
-        assert_abs(bf, f64_at(case, "log_bf_add"), 1e-10, &format!("K={k} log_bf_add"));
-        assert!(cond.is_finite(), "K={k}: cond must be finite for a well-posed F");
+        let (bf, cond) = ev.log_bf_add(i_b, i_a, &fb, &fa, nb, na, sa_b, sa_a, k, prior, None);
+        assert_abs(
+            bf,
+            f64_at(case, "log_bf_add"),
+            1e-10,
+            &format!("K={k} log_bf_add"),
+        );
+        assert!(
+            cond.is_finite(),
+            "K={k}: cond must be finite for a well-posed F"
+        );
 
-        let rem =
-            ev.log_bf_remove(i_a, i_b, &fa, &fb, na, nb, sa_a, sa_b, k + 1, prior, None);
-        assert_abs(rem, f64_at(case, "log_bf_remove"), 1e-10, &format!("K={k} log_bf_remove"));
+        let rem = ev.log_bf_remove(i_a, i_b, &fa, &fb, na, nb, sa_a, sa_b, k + 1, prior, None);
+        assert_abs(
+            rem,
+            f64_at(case, "log_bf_remove"),
+            1e-10,
+            &format!("K={k} log_bf_remove"),
+        );
     }
 }
 
@@ -47,14 +65,26 @@ fn add_and_remove_are_exactly_antisymmetric() {
         let k = usize_at(case, "K");
         let (nb, _, fb) = mat_at(case, "F_before");
         let (na, _, fa) = mat_at(case, "F_after");
-        let prior = Prior { lam: f64_at(case, "lam"), a_s: f64_at(case, "A_s") };
+        let prior = Prior {
+            lam: f64_at(case, "lam"),
+            a_s: f64_at(case, "A_s"),
+        };
         let (i_b, i_a) = (f64_at(case, "I_before"), f64_at(case, "I_after"));
-        let (sa_b, sa_a) = (f64_at(case, "sumA_before"), f64_at(case, "sumA_after"));
+        // Fixtures store individual emitter amplitudes; the Rust API takes their sum.
+        let (sa_b, sa_a) = (
+            vec_at(case, "A_before").iter().sum(),
+            vec_at(case, "A_after").iter().sum(),
+        );
 
         let (bf, _) = ev.log_bf_add(i_b, i_a, &fb, &fa, nb, na, sa_b, sa_a, k, prior, None);
         let rem = ev.log_bf_remove(i_a, i_b, &fa, &fb, na, nb, sa_a, sa_b, k + 1, prior, None);
 
-        assert_eq!(bf + rem, 0.0, "K={k}: antisymmetry residual is {}, not 0.0", bf + rem);
+        assert_eq!(
+            bf + rem,
+            0.0,
+            "K={k}: antisymmetry residual is {}, not 0.0",
+            bf + rem
+        );
         assert_eq!(
             f64_at(case, "antisymmetry_residual"),
             0.0,
@@ -76,9 +106,16 @@ fn precomputed_incumbent_logdet_is_bit_identical() {
         let k = usize_at(case, "K");
         let (nb, _, fb) = mat_at(case, "F_before");
         let (na, _, fa) = mat_at(case, "F_after");
-        let prior = Prior { lam: f64_at(case, "lam"), a_s: f64_at(case, "A_s") };
+        let prior = Prior {
+            lam: f64_at(case, "lam"),
+            a_s: f64_at(case, "A_s"),
+        };
         let (i_b, i_a) = (f64_at(case, "I_before"), f64_at(case, "I_after"));
-        let (sa_b, sa_a) = (f64_at(case, "sumA_before"), f64_at(case, "sumA_after"));
+        // Fixtures store individual emitter amplitudes; the Rust API takes their sum.
+        let (sa_b, sa_a) = (
+            vec_at(case, "A_before").iter().sum(),
+            vec_at(case, "A_after").iter().sum(),
+        );
 
         let (fresh, _) = ev.log_bf_add(i_b, i_a, &fb, &fa, nb, na, sa_b, sa_a, k, prior, None);
         let pre = ev.logdet(&fb, nb);
@@ -92,26 +129,51 @@ fn precomputed_incumbent_logdet_is_bit_identical() {
 #[test]
 fn ill_posed_fisher_matrices_fail_closed() {
     let mut ev = Evidence::new();
-    let prior = Prior { lam: 0.02, a_s: 950.0 };
+    let prior = Prior {
+        lam: 0.02,
+        a_s: 950.0,
+    };
     let good = [4.0, 1.0, 1.0, 4.0];
     let singular = [1.0, 1.0, 1.0, 1.0];
 
     // An ill-posed LARGER model must never be accepted...
-    let (bf, _) =
-        ev.log_bf_add(120.0, 100.0, &good, &singular, 2, 2, 900.0, 1500.0, 1, prior, None);
-    assert_eq!(bf, f64::NEG_INFINITY, "an ill-posed proposal was not refused");
+    let (bf, _) = ev.log_bf_add(
+        120.0, 100.0, &good, &singular, 2, 2, 900.0, 1500.0, 1, prior, None,
+    );
+    assert_eq!(
+        bf,
+        f64::NEG_INFINITY,
+        "an ill-posed proposal was not refused"
+    );
 
     // ... and an ill-posed SMALLER model is not evidence in favour of it.
-    let (bf, _) =
-        ev.log_bf_add(120.0, 100.0, &singular, &good, 2, 2, 900.0, 1500.0, 1, prior, None);
-    assert_eq!(bf, f64::NEG_INFINITY, "a broken incumbent was read as support for the proposal");
+    let (bf, _) = ev.log_bf_add(
+        120.0, 100.0, &singular, &good, 2, 2, 900.0, 1500.0, 1, prior, None,
+    );
+    assert_eq!(
+        bf,
+        f64::NEG_INFINITY,
+        "a broken incumbent was read as support for the proposal"
+    );
 
     // On removal the directions differ: a reduced model we cannot trust means
     // keep what we have; a degenerate FULL model means removal is right.
-    let r = ev.log_bf_remove(100.0, 120.0, &good, &singular, 2, 2, 1500.0, 900.0, 2, prior, None);
-    assert_eq!(r, f64::NEG_INFINITY, "an untrustworthy reduced model did not block removal");
-    let r = ev.log_bf_remove(100.0, 120.0, &singular, &good, 2, 2, 1500.0, 900.0, 2, prior, None);
-    assert_eq!(r, f64::INFINITY, "a degenerate full model did not force removal");
+    let r = ev.log_bf_remove(
+        100.0, 120.0, &good, &singular, 2, 2, 1500.0, 900.0, 2, prior, None,
+    );
+    assert_eq!(
+        r,
+        f64::NEG_INFINITY,
+        "an untrustworthy reduced model did not block removal"
+    );
+    let r = ev.log_bf_remove(
+        100.0, 120.0, &singular, &good, 2, 2, 1500.0, 900.0, 2, prior, None,
+    );
+    assert_eq!(
+        r,
+        f64::INFINITY,
+        "a degenerate full model did not force removal"
+    );
 }
 
 /// The boundary divergence the guard on the removal path exists for: as an
@@ -140,7 +202,10 @@ fn occam_term_rewards_a_vanishing_emitter() {
         let (ld, _) = ev.logdet(&base(a), 7);
         let (ld_s, _) = ev.logdet(&f_small, 7);
         let occam = -0.5 * (ld - ld_s);
-        assert!(occam >= prev, "the Occam term must grow as A shrinks, not fall");
+        assert!(
+            occam >= prev,
+            "the Occam term must grow as A shrinks, not fall"
+        );
         prev = occam;
     }
     // ... and it is not a bounded nuisance: four decades of A buy ~18 nats.

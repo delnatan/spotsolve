@@ -1329,7 +1329,8 @@ def detect(data_img, sigma=1.2, offset=0.0, gain=None, lam0=0.02, A_s0=None,
 
     `impl` is IGNORED while `slack` is on, and the Python passes run: the Rust
     core implements the fixed-width layout only. Pass `slack=None` for the
-    fast path. This is a prototype-then-port split, not a permanent one.
+    fast path. This older full-frame path remains separate from the calibrated
+    native local inference and the single-pass sparse localizer.
     """
     if slack is not None and impl != "py":
         # Silently ignoring a performance argument is worse than being slow.

@@ -23,14 +23,21 @@ pub fn load(name: &str) -> Fixture {
         .collect::<PathBuf>()
         .join(format!("{name}.json"));
     let txt = std::fs::read_to_string(&p).unwrap_or_else(|e| {
-        panic!("cannot read {}: {e}. Run `python scripts/make_fixtures.py` first.", p.display())
+        panic!(
+            "cannot read {}: {e}. Run `python scripts/make_fixtures.py` first.",
+            p.display()
+        )
     });
-    Fixture { root: serde_json::from_str(&txt).expect("fixture is not valid JSON") }
+    Fixture {
+        root: serde_json::from_str(&txt).expect("fixture is not valid JSON"),
+    }
 }
 
 impl Fixture {
     pub fn cases(&self) -> &Vec<Value> {
-        self.root["cases"].as_array().expect("fixture has no `cases` array")
+        self.root["cases"]
+            .as_array()
+            .expect("fixture has no `cases` array")
     }
     /// The fixture's own statement of how exactly this layer reproduces.
     /// Printed on failure so the tolerance and its reasoning stay together.
@@ -44,11 +51,15 @@ pub fn f64_at(v: &Value, key: &str) -> f64 {
 }
 
 pub fn usize_at(v: &Value, key: &str) -> usize {
-    v[key].as_u64().unwrap_or_else(|| panic!("`{key}` is not an integer")) as usize
+    v[key]
+        .as_u64()
+        .unwrap_or_else(|| panic!("`{key}` is not an integer")) as usize
 }
 
 pub fn bool_at(v: &Value, key: &str) -> bool {
-    v[key].as_bool().unwrap_or_else(|| panic!("`{key}` is not a bool"))
+    v[key]
+        .as_bool()
+        .unwrap_or_else(|| panic!("`{key}` is not a bool"))
 }
 
 pub fn vec_at(v: &Value, key: &str) -> Vec<f64> {
@@ -62,9 +73,15 @@ pub fn vec_at(v: &Value, key: &str) -> Vec<f64> {
 
 /// A 2-D fixture array, returned row-major as `(rows, cols, data)`.
 pub fn mat_at(v: &Value, key: &str) -> (usize, usize, Vec<f64>) {
-    let rows = v[key].as_array().unwrap_or_else(|| panic!("`{key}` is not an array"));
+    let rows = v[key]
+        .as_array()
+        .unwrap_or_else(|| panic!("`{key}` is not an array"));
     let nr = rows.len();
-    let nc = if nr == 0 { 0 } else { rows[0].as_array().expect("not 2-D").len() };
+    let nc = if nr == 0 {
+        0
+    } else {
+        rows[0].as_array().expect("not 2-D").len()
+    };
     let mut data = Vec::with_capacity(nr * nc);
     for r in rows {
         let row = r.as_array().expect("ragged fixture array");
@@ -113,7 +130,13 @@ pub fn assert_abs(got: f64, want: f64, tol: f64, what: &str) {
 /// first -- when a whole Jacobian is wrong, the worst one localizes the bug.
 #[track_caller]
 pub fn assert_all_rel(got: &[f64], want: &[f64], tol: f64, what: &str) {
-    assert_eq!(got.len(), want.len(), "{what}: length {} vs {}", got.len(), want.len());
+    assert_eq!(
+        got.len(),
+        want.len(),
+        "{what}: length {} vs {}",
+        got.len(),
+        want.len()
+    );
     let mut worst = (0usize, 0.0f64);
     for (i, (&g, &w)) in got.iter().zip(want).enumerate() {
         let e = (g - w).abs() / w.abs().max(1.0);
@@ -124,6 +147,10 @@ pub fn assert_all_rel(got: &[f64], want: &[f64], tol: f64, what: &str) {
     assert!(
         worst.1 <= tol,
         "{what}: worst at [{}] got {:.17e}, want {:.17e}, rel err {:.3e} > {:.3e}",
-        worst.0, got[worst.0], want[worst.0], worst.1, tol
+        worst.0,
+        got[worst.0],
+        want[worst.0],
+        worst.1,
+        tol
     );
 }

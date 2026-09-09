@@ -29,6 +29,7 @@
 pub mod evidence;
 pub mod filters;
 pub mod grid;
+pub mod inference;
 pub mod linalg;
 pub mod lmcl;
 pub mod moves;
@@ -36,3 +37,12 @@ pub mod passes;
 pub mod patches;
 pub mod psf;
 pub mod render;
+pub mod search;
+pub mod sparse;
+pub mod statistics;
+
+pub mod affine;
+
+pub mod geometry;
+
+pub mod uncertainty;

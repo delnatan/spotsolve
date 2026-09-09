@@ -25,6 +25,10 @@ imported directly when you need them:
     audit metrics simulate                           is the answer any good?
     loctable                                         results as `polars` tables
 
+`localize_sparse` is the independent-source counterpart: one Rust candidate
+pass and one bounded fit per peak, with fixed or fitted width. It intentionally
+does not run the dense add/split/prune loop.
+
 Every emitter carries its own width, bounded to `SIGMA_SLACK` and fitted by
 MAP under a prior centred on the PSF; one that lands outside `FOCUS_BAND` is
 modelled to the end but returned in `aggregates` rather than as a detection.
@@ -61,6 +65,7 @@ from .structs import (  # noqa: F401
     FitResult,
     Patch,
 )
+from .sparse import SparseResult, localize_sparse  # noqa: F401
 
 # Tuning constants. These are the pipeline's dials and are part of the public
 # surface: `PRUNE_TAU` is its only precision/recall knob, and the Rust backend
@@ -94,6 +99,8 @@ __version__ = "0.1.0"
 
 __all__ = [
     "detect",
+    "localize_sparse",
+    "SparseResult",
     "refine",
     "render",
     "background_map",

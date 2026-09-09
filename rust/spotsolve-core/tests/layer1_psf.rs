@@ -140,3 +140,32 @@ fn variable_sigma_jacobian_matches_finite_difference() {
         }
     }
 }
+
+#[test]
+fn variable_sigma_render_matches_model_and_jacobian_path() {
+    let (h, w) = (13, 11);
+    let ay = (0..h).map(|v| v as f64).collect::<Vec<_>>();
+    let ax = (0..w).map(|v| v as f64).collect::<Vec<_>>();
+    let theta = psf::pack_var(3.5, &[700.0, 400.0], &[5.2, 8.1], &[4.7, 6.3], &[1.05, 1.7]);
+    let mut direct = vec![0.0; h * w];
+    let mut combined = vec![0.0; h * w];
+    let mut jacobian = vec![0.0; theta.len() * h * w];
+    psf::model_var_sigma_ax(
+        &theta,
+        &ay,
+        &ax,
+        None,
+        &mut psf::Factors::new(h, w, 2),
+        &mut direct,
+    );
+    psf::model_and_jac_var_sigma_ax(
+        &theta,
+        &ay,
+        &ax,
+        None,
+        &mut psf::Factors::new(h, w, 2),
+        &mut combined,
+        &mut jacobian,
+    );
+    assert_all_rel(&direct, &combined, 1e-14, "variable-sigma render");
+}

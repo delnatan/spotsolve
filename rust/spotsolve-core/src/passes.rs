@@ -31,7 +31,7 @@
 //! that distinction visible: a [`Validity`] may only annotate an
 //! already-computed evidence; only a [`Decision`] may reject.
 
-use crate::evidence::{Evidence, Prior, COND_GUARD};
+use crate::evidence::{COND_GUARD, Evidence, Prior};
 use crate::grid::EmitterGrid;
 use crate::lmcl::{self, Bounds, FitOpts, FitWorkspace};
 use crate::moves;
@@ -232,7 +232,13 @@ impl Frame<'_> {
 /// surface into the known term would leave `b` wanting to sit at 0, which is
 /// its lower bound, and that is the one thing Coleman-Li scaling cannot
 /// tolerate [P1].
-fn window_bg(bmap: &[f64], w_img: usize, b: &BBox, shape: &mut Vec<f64>, buf: &mut Vec<f64>) -> f64 {
+fn window_bg(
+    bmap: &[f64],
+    w_img: usize,
+    b: &BBox,
+    shape: &mut Vec<f64>,
+    buf: &mut Vec<f64>,
+) -> f64 {
     // `shape` is filled in RASTER order and `buf` is the scratch the median
     // sorts. They must be separate: `median` reorders what it is given, and
     // `shape` is indexed by pixel.
@@ -257,7 +263,11 @@ fn median(v: &mut [f64]) -> f64 {
     }
     let n = v.len();
     v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    if n % 2 == 1 { v[n / 2] } else { 0.5 * (v[n / 2 - 1] + v[n / 2]) }
+    if n % 2 == 1 {
+        v[n / 2]
+    } else {
+        0.5 * (v[n / 2 - 1] + v[n / 2])
+    }
 }
 
 /// Box constraints for one window's fit, in LOCAL coordinates.
@@ -265,7 +275,15 @@ fn median(v: &mut [f64]) -> f64 {
 /// Positions are confined to the sub-image. Letting a centre leave the frame
 /// was tried -- it lets the fit put rim flux where it actually came from -- and
 /// measurably lost 10 real detections elsewhere, so the bounds stay closed.
-fn set_bounds(lo: &mut Vec<f64>, hi: &mut Vec<f64>, k: usize, h: usize, w: usize, b_max: f64, a_max: f64) {
+fn set_bounds(
+    lo: &mut Vec<f64>,
+    hi: &mut Vec<f64>,
+    k: usize,
+    h: usize,
+    w: usize,
+    b_max: f64,
+    a_max: f64,
+) {
     let a_min = moves::A_MIN.max(A_MIN_REL * a_max);
     lo.clear();
     hi.clear();
@@ -302,8 +320,19 @@ fn fit_window(
     }
     let bounds = Bounds::new(lo, hi);
     lmcl::fit(
-        ws, theta0, h, w, sigma, sub, &bounds, halo,
-        FitOpts { max_iter, tol_obj, ..Default::default() },
+        ws,
+        theta0,
+        h,
+        w,
+        sigma,
+        sub,
+        &bounds,
+        halo,
+        FitOpts {
+            max_iter,
+            tol_obj,
+            ..Default::default()
+        },
     )
 }
 
@@ -319,7 +348,17 @@ fn build_halo(
     shape: &mut Vec<f64>,
 ) -> f64 {
     let level = window_bg(frame.bmap, frame.w, b, shape, buf);
-    render::halo_image(&em.pos, &em.amp, frozen, frame.sigma, b.y0, b.x0, b.h(), b.w(), halo);
+    render::halo_image(
+        &em.pos,
+        &em.amp,
+        frozen,
+        frame.sigma,
+        b.y0,
+        b.x0,
+        b.h(),
+        b.w(),
+        halo,
+    );
     for (v, &s) in halo.iter_mut().zip(shape.iter()) {
         *v += s;
     }
@@ -337,7 +376,9 @@ fn pack_window(theta: &mut Vec<f64>, level: f64, em: &Emitters, idx: &[u32], b: 
 }
 
 fn sum_amplitudes(theta: &[f64]) -> f64 {
-    (0..psf::n_emitters(theta)).map(|k| psf::amp(theta, k)).sum()
+    (0..psf::n_emitters(theta))
+        .map(|k| psf::amp(theta, k))
+        .sum()
 }
 
 /// Score adding one emitter at `(cand_y, cand_x)` with initial amplitude
@@ -365,20 +406,45 @@ pub fn try_add(
 ) -> Decision {
     let n = em.len();
     let (free, frozen, bbox) = patches::window(
-        &em.pos, n, cand_y, cand_x, frame.sigma, frame.h, frame.w, frame.k_max, gridx,
+        &em.pos,
+        n,
+        cand_y,
+        cand_x,
+        frame.sigma,
+        frame.h,
+        frame.w,
+        frame.k_max,
+        gridx,
         &mut s.scratch_u32,
     );
     frame.cut(&bbox, &mut s.sub);
     let (h, w) = (bbox.h(), bbox.w());
     let mut shape = std::mem::take(&mut s.scratch_f64);
-    let level = build_halo(frame, em, &frozen, &bbox, &mut s.halo, &mut s.resid, &mut shape);
+    let level = build_halo(
+        frame,
+        em,
+        &frozen,
+        &bbox,
+        &mut s.halo,
+        &mut s.resid,
+        &mut shape,
+    );
     s.scratch_f64 = shape;
 
     // Incumbent, at K.
     pack_window(&mut s.theta, level, em, &free, &bbox);
     let inc = fit_window(
-        &mut s.fit_inc, &mut s.bounds_lo, &mut s.bounds_hi, &mut s.theta, &s.sub, h, w,
-        frame.sigma, Some(&s.halo), 100, EVIDENCE_TOL_OBJ,
+        &mut s.fit_inc,
+        &mut s.bounds_lo,
+        &mut s.bounds_hi,
+        &mut s.theta,
+        &s.sub,
+        h,
+        w,
+        frame.sigma,
+        Some(&s.halo),
+        100,
+        EVIDENCE_TOL_OBJ,
     );
     let p_inc = 3 * free.len() + 1;
     let sum_a_inc = sum_amplitudes(s.fit_inc.theta());
@@ -391,8 +457,17 @@ pub fn try_add(
     s.theta.push(cand_y - bbox.y0 as f64);
     s.theta.push(cand_x - bbox.x0 as f64);
     let prop = fit_window(
-        &mut s.fit_prop, &mut s.bounds_lo, &mut s.bounds_hi, &mut s.theta, &s.sub, h, w,
-        frame.sigma, Some(&s.halo), 100, EVIDENCE_TOL_OBJ,
+        &mut s.fit_prop,
+        &mut s.bounds_lo,
+        &mut s.bounds_hi,
+        &mut s.theta,
+        &s.sub,
+        h,
+        w,
+        frame.sigma,
+        Some(&s.halo),
+        100,
+        EVIDENCE_TOL_OBJ,
     );
     let p_prop = p_inc + 3;
 
@@ -468,8 +543,13 @@ pub fn add_pass(
     cand_amp: &[f64],
     prior: Prior,
 ) -> usize {
-    let mut gridx =
-        EmitterGrid::build(&em.pos, em.len(), frame.h, frame.w, HALO_FACTOR * frame.sigma);
+    let mut gridx = EmitterGrid::build(
+        &em.pos,
+        em.len(),
+        frame.h,
+        frame.w,
+        HALO_FACTOR * frame.sigma,
+    );
     let mut n_added = 0;
     for c in 0..cand_amp.len() {
         let (cy, cx) = (cand[2 * c], cand[2 * c + 1]);
@@ -509,7 +589,15 @@ pub fn try_split(
 ) -> Decision {
     let n = em.len();
     let (free, frozen, bbox) = patches::window(
-        &em.pos, n, em.y(gi), em.x(gi), frame.sigma, frame.h, frame.w, frame.k_max, gridx,
+        &em.pos,
+        n,
+        em.y(gi),
+        em.x(gi),
+        frame.sigma,
+        frame.h,
+        frame.w,
+        frame.k_max,
+        gridx,
         &mut s.scratch_u32,
     );
     // The emitter being split must be free in its own window; if the k_max cap
@@ -521,13 +609,30 @@ pub fn try_split(
     frame.cut(&bbox, &mut s.sub);
     let (h, w) = (bbox.h(), bbox.w());
     let mut shape = std::mem::take(&mut s.scratch_f64);
-    let level = build_halo(frame, em, &frozen, &bbox, &mut s.halo, &mut s.resid, &mut shape);
+    let level = build_halo(
+        frame,
+        em,
+        &frozen,
+        &bbox,
+        &mut s.halo,
+        &mut s.resid,
+        &mut shape,
+    );
     s.scratch_f64 = shape;
 
     pack_window(&mut s.theta, level, em, &free, &bbox);
     let inc = fit_window(
-        &mut s.fit_inc, &mut s.bounds_lo, &mut s.bounds_hi, &mut s.theta, &s.sub, h, w,
-        frame.sigma, Some(&s.halo), 100, EVIDENCE_TOL_OBJ,
+        &mut s.fit_inc,
+        &mut s.bounds_lo,
+        &mut s.bounds_hi,
+        &mut s.theta,
+        &s.sub,
+        h,
+        w,
+        frame.sigma,
+        Some(&s.halo),
+        100,
+        EVIDENCE_TOL_OBJ,
     );
     let p_inc = 3 * free.len() + 1;
     let sum_a_inc = sum_amplitudes(s.fit_inc.theta());
@@ -544,10 +649,19 @@ pub fn try_split(
     {
         let (ay, ax) = (psf::local_axis(h), psf::local_axis(w));
         let mut f = psf::Factors::new(h, w, free.len().max(1));
-        psf::model_ax(&s.theta, &ay, &ax, frame.sigma, Some(&s.halo), &mut f, &mut model);
+        psf::model_ax(
+            &s.theta,
+            &ay,
+            &ax,
+            frame.sigma,
+            Some(&s.halo),
+            &mut f,
+            &mut model,
+        );
     }
     s.resid.clear();
-    s.resid.extend(s.sub.iter().zip(model.iter()).map(|(&d, &m)| d - m));
+    s.resid
+        .extend(s.sub.iter().zip(model.iter()).map(|(&d, &m)| d - m));
     s.scratch_f64 = model;
 
     let (u, _) = moves::residual_axis(
@@ -567,8 +681,17 @@ pub fn try_split(
     for disp in moves::SPLIT_DISPS {
         let mut th = moves::split(&s.theta, lk, u, disp * frame.sigma);
         let prop = fit_window(
-            &mut s.fit_prop, &mut s.bounds_lo, &mut s.bounds_hi, &mut th, &s.sub, h, w,
-            frame.sigma, Some(&s.halo), 100, EVIDENCE_TOL_OBJ,
+            &mut s.fit_prop,
+            &mut s.bounds_lo,
+            &mut s.bounds_hi,
+            &mut th,
+            &s.sub,
+            h,
+            w,
+            frame.sigma,
+            Some(&s.halo),
+            100,
+            EVIDENCE_TOL_OBJ,
         );
         let (log_bf, cond) = s.ev.log_bf_add(
             inc.i_div,
@@ -583,7 +706,9 @@ pub fn try_split(
             prior,
             Some(ld_inc),
         );
-        if log_bf.is_finite() && log_bf > 0.0 && cond <= COND_GUARD
+        if log_bf.is_finite()
+            && log_bf > 0.0
+            && cond <= COND_GUARD
             && best.is_none_or(|b| log_bf > b)
         {
             best = Some(log_bf);
@@ -636,25 +761,38 @@ pub fn split_pass(
         let x1 = ((((cx as i64) + pad + 1).max(0)) as usize).min(frame.w);
         win.clear();
         for r in y0..y1 {
-            win.extend(
-                (x0..x1).map(|c| frame.d_e[r * frame.w + c] - model[r * frame.w + c]),
-            );
+            win.extend((x0..x1).map(|c| frame.d_e[r * frame.w + c] - model[r * frame.w + c]));
         }
         // Scored against a bare emitter with no background, exactly as the
         // Python does: the quadrupole is a shape statistic, and the pedestal
         // under it is common to both lobes.
         let (_, strength) = moves::residual_axis(
-            cy, cx, em.amp[i], y0 as f64, x0 as f64, y1 - y0, x1 - x0, frame.sigma, &win,
+            cy,
+            cx,
+            em.amp[i],
+            y0 as f64,
+            x0 as f64,
+            y1 - y0,
+            x1 - x0,
+            frame.sigma,
+            &win,
         );
         strengths.push((strength, i as u32));
     }
     // Descending strength, index as an explicit tiebreak.
     strengths.sort_by(|a, b| {
-        b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal).then(a.1.cmp(&b.1))
+        b.0.partial_cmp(&a.0)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.1.cmp(&b.1))
     });
 
-    let mut gridx =
-        EmitterGrid::build(&em.pos, em.len(), frame.h, frame.w, HALO_FACTOR * frame.sigma);
+    let mut gridx = EmitterGrid::build(
+        &em.pos,
+        em.len(),
+        frame.h,
+        frame.w,
+        HALO_FACTOR * frame.sigma,
+    );
     let mut n_split = 0;
     for &(strength, gi) in &strengths {
         if strength <= 0.0 {
@@ -807,7 +945,13 @@ fn refine_sweep(
         Some(p) => p,
         None => {
             owned = patches::build_patches(
-                &em.pos, em.len(), frame.sigma, frame.h, frame.w, frame.k_max);
+                &em.pos,
+                em.len(),
+                frame.sigma,
+                frame.h,
+                frame.w,
+                frame.k_max,
+            );
             &owned
         }
     };
@@ -822,7 +966,12 @@ fn refine_sweep(
         // group, which dirties ITS neighbours, which is how a global sweep
         // manufactures the churn that keeps it from ever converging.
         if let Some(d) = dirty {
-            if !p.indices.iter().chain(p.frozen.iter()).any(|&i| d[i as usize]) {
+            if !p
+                .indices
+                .iter()
+                .chain(p.frozen.iter())
+                .any(|&i| d[i as usize])
+            {
                 continue;
             }
         }
@@ -837,7 +986,15 @@ fn refine_sweep(
         // Gauss-Seidel reads `out`, picking up groups already updated in THIS
         // pass: faster convergence, at the cost of that order-independence.
         let src: &Emitters = if gauss_seidel { &*out } else { em };
-        let level = build_halo(frame, src, &p.frozen, b, &mut s.halo, &mut s.resid, &mut shape);
+        let level = build_halo(
+            frame,
+            src,
+            &p.frozen,
+            b,
+            &mut s.halo,
+            &mut s.resid,
+            &mut shape,
+        );
         s.scratch_f64 = shape;
 
         pack_window(&mut s.theta, level, src, &p.indices, b);
@@ -847,8 +1004,17 @@ fn refine_sweep(
             s.pre.push(src.pos[2 * i as usize + 1]);
         }
         let info = fit_window(
-            &mut s.fit_inc, &mut s.bounds_lo, &mut s.bounds_hi, &mut s.theta, &s.sub, h, w,
-            frame.sigma, Some(&s.halo), max_iter, tol_obj,
+            &mut s.fit_inc,
+            &mut s.bounds_lo,
+            &mut s.bounds_hi,
+            &mut s.theta,
+            &s.sub,
+            h,
+            w,
+            frame.sigma,
+            Some(&s.halo),
+            max_iter,
+            tol_obj,
         );
         let theta = s.fit_inc.theta();
         let mut moved = 0.0f64;
@@ -932,7 +1098,12 @@ fn refine_sweep(
         let pn = 3 * p.indices.len() + 1;
         s.inv_diag.clear();
         s.inv_diag.resize(pn, 0.0);
-        if !s.ev.inv_diag(s.fit_inc.fisher(pn), pn, &mut s.inv_diag, &mut s.inv_scratch) {
+        if !s.ev.inv_diag(
+            s.fit_inc.fisher(pn),
+            pn,
+            &mut s.inv_diag,
+            &mut s.inv_scratch,
+        ) {
             continue; // singular: leave NaN, as the Python does
         }
         for (slot, &i) in p.indices.iter().enumerate() {
@@ -1011,8 +1182,20 @@ pub fn refine(
     // decomposition tracking the configuration.
     for _ in 0..max_sweeps.max(1) {
         let fitted = refine_sweep(
-            s, frame, em, max_iter, &mut next, &mut se, None, None, REFINE_TOL_OBJ,
-            Some(&dirty), Some(&mut moved), tol, None, REFINE_GAUSS_SEIDEL,
+            s,
+            frame,
+            em,
+            max_iter,
+            &mut next,
+            &mut se,
+            None,
+            None,
+            REFINE_TOL_OBJ,
+            Some(&dirty),
+            Some(&mut moved),
+            tol,
+            None,
+            REFINE_GAUSS_SEIDEL,
         );
         std::mem::swap(em, &mut next);
         if fitted == 0 || !moved.iter().any(|&m| m) {
@@ -1046,8 +1229,22 @@ pub fn refine_sweep_costed(
 ) -> usize {
     cost.clear();
     se.fill(f64::NAN);
-    refine_sweep(s, frame, em, max_iter, out, se, prev, Some(cost), tol_obj,
-                 dirty, moved_out, move_eps, pset, gauss_seidel)
+    refine_sweep(
+        s,
+        frame,
+        em,
+        max_iter,
+        out,
+        se,
+        prev,
+        Some(cost),
+        tol_obj,
+        dirty,
+        moved_out,
+        move_eps,
+        pset,
+        gauss_seidel,
+    )
 }
 
 /// One pass of removal tests, faintest first.
@@ -1097,18 +1294,36 @@ pub fn prune(s: &mut Solver, frame: &Frame, em: &mut Emitters, prior: Prior) -> 
         // full index and skipping the dead gives the same set as the Python's
         // `_window(positions[others], ...)` with global indices already.
         let (mut free, frozen, bbox) = patches::window(
-            &em.pos, n, cy, cx, frame.sigma, frame.h, frame.w, frame.k_max, &gridx,
+            &em.pos,
+            n,
+            cy,
+            cx,
+            frame.sigma,
+            frame.h,
+            frame.w,
+            frame.k_max,
+            &gridx,
             &mut s.scratch_u32,
         );
         free.retain(|&i| alive[i as usize] && i as usize != gi);
         free.truncate(frame.k_max.saturating_sub(1));
-        let frozen: Vec<u32> =
-            frozen.into_iter().filter(|&i| alive[i as usize] && i as usize != gi).collect();
+        let frozen: Vec<u32> = frozen
+            .into_iter()
+            .filter(|&i| alive[i as usize] && i as usize != gi)
+            .collect();
 
         frame.cut(&bbox, &mut s.sub);
         let (h, w) = (bbox.h(), bbox.w());
         let mut shape = std::mem::take(&mut s.scratch_f64);
-        let level = build_halo(frame, em, &frozen, &bbox, &mut s.halo, &mut s.resid, &mut shape);
+        let level = build_halo(
+            frame,
+            em,
+            &frozen,
+            &bbox,
+            &mut s.halo,
+            &mut s.resid,
+            &mut shape,
+        );
         s.scratch_f64 = shape;
 
         // Full model: the survivors plus `gi`, which is appended last and is
@@ -1117,8 +1332,17 @@ pub fn prune(s: &mut Solver, frame: &Frame, em: &mut Emitters, prior: Prior) -> 
         keep.push(gi as u32);
         pack_window(&mut s.theta, level, em, &keep, &bbox);
         let full = fit_window(
-            &mut s.fit_inc, &mut s.bounds_lo, &mut s.bounds_hi, &mut s.theta, &s.sub, h, w,
-            frame.sigma, Some(&s.halo), 100, EVIDENCE_TOL_OBJ,
+            &mut s.fit_inc,
+            &mut s.bounds_lo,
+            &mut s.bounds_hi,
+            &mut s.theta,
+            &s.sub,
+            h,
+            w,
+            frame.sigma,
+            Some(&s.halo),
+            100,
+            EVIDENCE_TOL_OBJ,
         );
         let p_full = 3 * keep.len() + 1;
         let sum_a_full = sum_amplitudes(s.fit_inc.theta());
@@ -1129,8 +1353,17 @@ pub fn prune(s: &mut Solver, frame: &Frame, em: &mut Emitters, prior: Prior) -> 
         // Reduced model: the survivors alone.
         pack_window(&mut s.theta, level, em, &free, &bbox);
         let reduced = fit_window(
-            &mut s.fit_prop, &mut s.bounds_lo, &mut s.bounds_hi, &mut s.theta, &s.sub, h, w,
-            frame.sigma, Some(&s.halo), 100, EVIDENCE_TOL_OBJ,
+            &mut s.fit_prop,
+            &mut s.bounds_lo,
+            &mut s.bounds_hi,
+            &mut s.theta,
+            &s.sub,
+            h,
+            w,
+            frame.sigma,
+            Some(&s.halo),
+            100,
+            EVIDENCE_TOL_OBJ,
         );
         let p_red = 3 * free.len() + 1;
 
@@ -1139,9 +1372,16 @@ pub fn prune(s: &mut Solver, frame: &Frame, em: &mut Emitters, prior: Prior) -> 
         let k = keep.len() - 1;
         s.inv_diag.clear();
         s.inv_diag.resize(p_full, 0.0);
-        let var = if s.ev.inv_diag(&s.f_inc, p_full, &mut s.inv_diag, &mut s.inv_scratch) {
+        let var = if s
+            .ev
+            .inv_diag(&s.f_inc, p_full, &mut s.inv_diag, &mut s.inv_scratch)
+        {
             let v = s.inv_diag[1 + 3 * k];
-            if v.is_finite() && v > 0.0 { Some(v) } else { None }
+            if v.is_finite() && v > 0.0 {
+                Some(v)
+            } else {
+                None
+            }
         } else {
             None
         };

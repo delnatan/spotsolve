@@ -28,7 +28,9 @@ use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use spotsolve_core::evidence::{Evidence, Prior};
 use spotsolve_core::passes::{self, Emitters, Frame, Solver};
-use spotsolve_core::{linalg, lmcl, psf, render};
+use spotsolve_core::{linalg, lmcl, psf, render, sparse};
+
+mod inference;
 
 type Arr1 = Py<PyArray1<f64>>;
 type Arr2 = Py<PyArray2<f64>>;
@@ -451,6 +453,123 @@ fn lmcl_fit_var_sigma(
     ))
 }
 
+/// Aguet significance pass followed by independent one-emitter fits.
+///
+/// This deliberately assumes sparse emitters. It performs no add/split/prune
+/// loop and no joint fitting of overlapping candidates.
+#[pyfunction]
+#[pyo3(signature = (data, sigma, alpha=0.05, fit_sigma=false, sigma_bounds=(0.7, 2.2), fit_radius_sigma=4.0, max_iter=100))]
+#[allow(clippy::too_many_arguments)]
+fn localize_sparse<'py>(
+    py: Python<'py>,
+    data: PyReadonlyArray2<'py, f64>,
+    sigma: f64,
+    alpha: f64,
+    fit_sigma: bool,
+    sigma_bounds: (f64, f64),
+    fit_radius_sigma: f64,
+    max_iter: usize,
+) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
+    let shape = [data.shape()[0], data.shape()[1]];
+    let values = slice2(&data, "data")?;
+    let width = if fit_sigma {
+        sparse::Width::Fitted {
+            lower_ratio: sigma_bounds.0,
+            upper_ratio: sigma_bounds.1,
+        }
+    } else {
+        sparse::Width::Fixed
+    };
+    let mut workspace = sparse::Workspace::new();
+    let result = py
+        .detach(|| {
+            sparse::localize(
+                values,
+                shape,
+                sparse::Options {
+                    sigma,
+                    alpha,
+                    width,
+                    fit_radius_sigma,
+                    max_iter,
+                },
+                &mut workspace,
+            )
+        })
+        .map_err(PyValueError::new_err)?;
+    let n = result.localizations.len();
+    let positions = result
+        .localizations
+        .iter()
+        .flat_map(|fit| [fit.y, fit.x])
+        .collect::<Vec<_>>();
+    let standard_errors = result
+        .localizations
+        .iter()
+        .flat_map(|fit| [fit.se_flux, fit.se_y, fit.se_x])
+        .collect::<Vec<_>>();
+    let output = pyo3::types::PyDict::new(py);
+    output.set_item("positions", positions.into_pyarray(py).reshape([n, 2])?)?;
+    output.set_item(
+        "amplitudes",
+        result
+            .localizations
+            .iter()
+            .map(|fit| fit.flux)
+            .collect::<Vec<_>>()
+            .into_pyarray(py),
+    )?;
+    output.set_item(
+        "fit_sigma",
+        result
+            .localizations
+            .iter()
+            .map(|fit| fit.sigma)
+            .collect::<Vec<_>>()
+            .into_pyarray(py),
+    )?;
+    output.set_item("se", standard_errors.into_pyarray(py).reshape([n, 3])?)?;
+    output.set_item(
+        "test_statistic",
+        result
+            .localizations
+            .iter()
+            .map(|fit| fit.test_statistic)
+            .collect::<Vec<_>>()
+            .into_pyarray(py),
+    )?;
+    output.set_item(
+        "p_value",
+        result
+            .localizations
+            .iter()
+            .map(|fit| fit.p_value)
+            .collect::<Vec<_>>()
+            .into_pyarray(py),
+    )?;
+    output.set_item(
+        "iterations",
+        result
+            .localizations
+            .iter()
+            .map(|fit| fit.iterations)
+            .collect::<Vec<_>>(),
+    )?;
+    output.set_item(
+        "status",
+        result
+            .localizations
+            .iter()
+            .map(|fit| fit.status)
+            .collect::<Vec<_>>(),
+    )?;
+    output.set_item("background", result.background)?;
+    output.set_item("candidate_count", result.candidate_count)?;
+    output.set_item("model_image", result.model.into_pyarray(py).reshape(shape)?)?;
+    output.set_item("residual", result.residual.into_pyarray(py).reshape(shape)?)?;
+    Ok(output)
+}
+
 /// `(log|F|, scaled condition number, ok)`.
 #[pyfunction]
 fn logdet_cond(f: PyReadonlyArray2<'_, f64>) -> PyResult<(f64, f64, bool)> {
@@ -536,6 +655,7 @@ fn version() -> &'static str {
 
 #[pymodule]
 fn spotsolve_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_class::<inference::CalibratedModel>()?;
     m.add_function(wrap_pyfunction!(add_pass, m)?)?;
     m.add_function(wrap_pyfunction!(split_pass, m)?)?;
     m.add_function(wrap_pyfunction!(refine, m)?)?;
@@ -545,6 +665,7 @@ fn spotsolve_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(psf_model_jac, m)?)?;
     m.add_function(wrap_pyfunction!(lmcl_fit, m)?)?;
     m.add_function(wrap_pyfunction!(lmcl_fit_var_sigma, m)?)?;
+    m.add_function(wrap_pyfunction!(localize_sparse, m)?)?;
     m.add_function(wrap_pyfunction!(logdet_cond, m)?)?;
     m.add_function(wrap_pyfunction!(log_bf_add, m)?)?;
     m.add_function(wrap_pyfunction!(log_bf_remove, m)?)?;

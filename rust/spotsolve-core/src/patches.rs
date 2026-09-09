@@ -123,7 +123,14 @@ impl UnionFind {
 /// Group `n` emitters into jointly-fittable patches.
 ///
 /// Components larger than `k_max` are bisected; see [`split_component`].
-pub fn build_patches(pos: &[f64], n: usize, sigma: f64, h: usize, w: usize, k_max: usize) -> Vec<Patch> {
+pub fn build_patches(
+    pos: &[f64],
+    n: usize,
+    sigma: f64,
+    h: usize,
+    w: usize,
+    k_max: usize,
+) -> Vec<Patch> {
     if n == 0 {
         return Vec::new();
     }
@@ -195,7 +202,9 @@ fn split_component(idx: &[u32], pos: &[f64], k_max: usize) -> Vec<Vec<u32>> {
     // possible nor desirable; being deterministic is.
     order.sort_by(|&a, &b| {
         let (va, vb) = (pos[2 * a as usize + axis], pos[2 * b as usize + axis]);
-        va.partial_cmp(&vb).unwrap_or(std::cmp::Ordering::Equal).then(a.cmp(&b))
+        va.partial_cmp(&vb)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.cmp(&b))
     });
     let mid = order.len() / 2;
     let mut out = split_component(&order[..mid], pos, k_max);
@@ -217,7 +226,11 @@ fn finalize(
     let bbox = bbox_for(&ys, &xs, bbox_pad, h, w);
     let mut cand = Vec::new();
     let frozen = frozen_around(pos, grid, &bbox, halo_r, &idx, &mut cand);
-    Patch { indices: idx, frozen, bbox }
+    Patch {
+        indices: idx,
+        frozen,
+        bbox,
+    }
 }
 
 /// Emitters within `halo_r` of the bbox *rectangle* (not of its centre), less
@@ -281,7 +294,9 @@ pub fn window(
         free.sort_by(|&a, &b| {
             let da = dist2(pos, a as usize, cand_y, cand_x);
             let db = dist2(pos, b as usize, cand_y, cand_x);
-            da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal).then(a.cmp(&b))
+            da.partial_cmp(&db)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(a.cmp(&b))
         });
         free.truncate(k_max.saturating_sub(1));
     }

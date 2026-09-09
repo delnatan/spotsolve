@@ -350,6 +350,53 @@ pub fn model_ax(
     }
 }
 
+/// Render a model with one fitted sigma per emitter, without allocating or
+/// calculating a Jacobian. Used by the sparse result image after fitting.
+pub fn model_var_sigma_ax(
+    theta: &[f64],
+    ay: &[f64],
+    ax: &[f64],
+    halo: Option<&[f64]>,
+    f: &mut Factors,
+    m: &mut [f64],
+) {
+    let (h, w) = (ay.len(), ax.len());
+    let k = n_emitters_var(theta);
+    debug_assert_eq!(m.len(), h * w);
+    m.fill(background(theta));
+    if k > 0 {
+        f.unpack_var(theta);
+        for emitter in 0..k {
+            let sigma = f.sigma[emitter];
+            shape_axis(
+                ay,
+                &f.cy[emitter..emitter + 1],
+                sigma,
+                &mut f.ey[emitter * h..emitter * h + h],
+            );
+            shape_axis(
+                ax,
+                &f.cx[emitter..emitter + 1],
+                sigma,
+                &mut f.ex[emitter * w..emitter * w + w],
+            );
+            let amplitude = f.a[emitter];
+            let ey = &f.ey[emitter * h..emitter * h + h];
+            let ex = &f.ex[emitter * w..emitter * w + w];
+            for row in 0..h {
+                for column in 0..w {
+                    m[row * w + column] += amplitude * (ey[row] * ex[column]);
+                }
+            }
+        }
+    }
+    if let Some(values) = halo {
+        for (value, extra) in m.iter_mut().zip(values) {
+            *value += extra;
+        }
+    }
+}
+
 /// Model and Jacobian in one pass -- the optimizer's inner loop.
 ///
 /// Both are always needed at the same `theta`, and the `erf`/`exp` factors are

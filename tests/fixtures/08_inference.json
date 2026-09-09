@@ -1,0 +1,22 @@
+{
+  "description": "Retained local inference port contract. Synthetic pixel-integrated Gaussian table; numerical fixture, not physical microscope calibration.",
+  "table_formula": "sigma(depth_um)=1.2+3*depth_um pixels; separable normal CDF pixel integrals, floor 1e-100",
+  "sha256": "76c312bc575a1254dedd3bce30a15b1d6f46c15fc21f39f14a1dc05d789a5031",
+  "units": {
+    "positions": "pixel centers, y/x",
+    "depth": "micrometers",
+    "flux": "1000-photon units",
+    "background_coefficients": "10 photons/pixel"
+  },
+  "parameter_layout": "16 bicubic coefficients; broad flux,y,x,depth; focus flux,y,x per source",
+  "covariance_status": "conditional_observed_hessian",
+  "sources": {
+    "src/spotsolve/inference/fit.py": "2efe262e192b89bd4ebcbb3b75542a1e084cbc3f891d1dec389c69403764d74f",
+    "src/spotsolve/inference/psf_bank.py": "502d9d54a718fa537cb4577d7a3a5a27eb0998932b5b635eb00209b6c41db7a5",
+    "src/spotsolve/inference/__init__.py": "deb648c29ec3edd6de2a4ad9e3783265075a8be46cfd4ed9c64d037c27a7c1fa",
+    "src/spotsolve/inference/types.py": "5f6a1360a00c1b7691595cba4a06320346c8de8bc13fc99d6a85c59b70a8a3f8",
+    "src/spotsolve/inference/profiled.py": "b0f62d41907c219c7e8345eb56961f454f9b9bd6890fcceba82b5f34cfa7a8e4",
+    "src/spotsolve/inference/model.py": "922fc6e32668dfdd9121994c2b56fc0651cf734d860d1739f3c06d227faeec18",
+    "src/spotsolve/inference/_numerics.py": "732481bfa4f9fb2533ad4f0af4d9dd15ca690c9010e58108b84a39963b84111c"
+  }
+}

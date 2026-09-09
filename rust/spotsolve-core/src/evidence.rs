@@ -100,7 +100,10 @@ pub type LogDet = (f64, bool);
 
 impl Evidence {
     pub fn new() -> Self {
-        Self { chol: Chol::new(linalg::P_MAX), scratch: Vec::new() }
+        Self {
+            chol: Chol::new(linalg::P_MAX),
+            scratch: Vec::new(),
+        }
     }
 
     /// `(log|F|, ok)` from one factorization, with no condition number.
@@ -174,7 +177,14 @@ impl Evidence {
         }
         (
             log_bf_add_from_logdet(
-                i_before, i_after, ld_b, ld_a, sum_a_before, sum_a_after, k_before, prior,
+                i_before,
+                i_after,
+                ld_b,
+                ld_a,
+                sum_a_before,
+                sum_a_after,
+                k_before,
+                prior,
             ),
             cond_a,
         )
@@ -257,9 +267,7 @@ fn log_bf_add_from_logdet(
     k_before: usize,
     prior: Prior,
 ) -> f64 {
-    (i_before - i_after)
-        + prior.lam.ln()
-        - ((k_before + 1) as f64).ln()
+    (i_before - i_after) + prior.lam.ln() - ((k_before + 1) as f64).ln()
         + d_log_amplitude_prior(sum_a_before, sum_a_after, prior.a_s)
         + 1.5 * (2.0 * std::f64::consts::PI).ln()
         - 0.5 * (ld_after - ld_before)

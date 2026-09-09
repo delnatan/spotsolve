@@ -42,7 +42,11 @@ pub struct Chol {
 
 impl Chol {
     pub fn new(p_max: usize) -> Self {
-        Self { n: 0, l: vec![0.0; p_max * p_max], ok: false }
+        Self {
+            n: 0,
+            l: vec![0.0; p_max * p_max],
+            ok: false,
+        }
     }
 
     /// Factorize the symmetric part of `a` (row-major `n x n`), in place.
@@ -52,7 +56,11 @@ impl Chol {
     /// "this model is ill-posed", never as evidence for anything.
     pub fn factor(&mut self, a: &[f64], n: usize) -> bool {
         debug_assert_eq!(a.len(), n * n);
-        assert!(n * n <= self.l.len(), "Chol capacity {} < {n}x{n}", self.l.len());
+        assert!(
+            n * n <= self.l.len(),
+            "Chol capacity {} < {n}x{n}",
+            self.l.len()
+        );
         self.n = n;
         self.ok = false;
 
@@ -232,11 +240,20 @@ pub const COND_GUARD: f64 = 1e3;
 /// is non-positive or non-finite. That last test is on `F` itself, not on the
 /// factor, and it is what lets a caller that skips the condition number still
 /// fail closed on exactly the same conditions.
-pub fn logdet_cond(f: &[f64], n: usize, chol: &mut Chol, scratch: &mut Vec<f64>) -> (f64, f64, bool) {
+pub fn logdet_cond(
+    f: &[f64],
+    n: usize,
+    chol: &mut Chol,
+    scratch: &mut Vec<f64>,
+) -> (f64, f64, bool) {
     if !diag_is_usable(f, n) {
         // Still report the determinant when the factorization itself succeeds,
         // matching the Python, which computes it before testing the diagonal.
-        let ld = if chol.factor(f, n) { chol.logdet() } else { f64::INFINITY };
+        let ld = if chol.factor(f, n) {
+            chol.logdet()
+        } else {
+            f64::INFINITY
+        };
         return (ld, f64::INFINITY, false);
     }
     if !chol.factor(f, n) {
