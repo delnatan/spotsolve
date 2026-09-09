@@ -626,21 +626,84 @@ fn fit_model(
 /// `dgemm`, so it is the one place the port does NOT start ahead.
 fn fisher(ws: &mut FitWorkspace, p: usize, n: usize, clip: bool) {
     // `W` multiplies the SECOND factor, matching `J.T @ (W[:,None] * J)`.
-    for q in 0..p {
-        for i in 0..n {
-            let m = if clip { ws.m[i].max(1e-9) } else { ws.m[i] };
-            ws.wj[q * n + i] = ws.j[q * n + i] / m;
+    //
+    // `clip` is loop-invariant, so it is tested once rather than `p*n` times;
+    // that leaves the inner loop a bare divide. `eval` has already floored `m`
+    // at the same 1e-9, so the clipped form is a no-op on a post-`eval` model
+    // and is kept only because `fisher` is also called on a raw `m` [P3].
+    if clip {
+        for q in 0..p {
+            for i in 0..n {
+                ws.wj[q * n + i] = ws.j[q * n + i] / ws.m[i].max(1e-9);
+            }
+        }
+    } else {
+        for q in 0..p {
+            for i in 0..n {
+                ws.wj[q * n + i] = ws.j[q * n + i] / ws.m[i];
+            }
         }
     }
+    // Four columns of `wj` per pass over `c1`.
+    //
+    // **This does not reassociate anything** [P2]. Each `s*` accumulates one
+    // output element over `i` in the same increasing order the scalar loop
+    // used, so every individual sum is bit-identical; what changes is only how
+    // many *different* sums are in flight. A lone dot product is bound by the
+    // ~3-cycle latency of the dependent `FADD`, not by throughput, so it
+    // retires one add per three cycles however wide the machine is. Several
+    // independent chains fill those slots with useful work.
+    //
+    // Measured on frame 0 of `beads_80pct-glycerol_crop.tif` (1141 emitters,
+    // 14k window fits), median of 9 runs, interleaved builds, `positions /
+    // amplitudes / se` SHA equal for every arm:
+    //
+    // ```text
+    //   scalar    2.844 s  2.888 s
+    //   width 2   2.531 s
+    //   width 4   2.541 s  2.568 s     <- 11.2% under scalar
+    //   width 8   2.637 s
+    // ```
+    //
+    // 2 and 4 tie; 8 regresses, because `p` is 5 at the median (`K = 1`) and
+    // only reaches 37, so a width-8 block almost never fills and the work
+    // falls through to the scalar tail with the wider prologue already paid.
+    // 4 is kept over 2 for the larger windows, where it has the longer runs to
+    // amortize. This buys nothing on its own if `p` is small -- see §4: at
+    // these sizes the ranking is not the FLOP count.
+    let (j, wj, f) = (&ws.j, &ws.wj, &mut ws.f);
     for q1 in 0..p {
-        for q2 in q1..p {
-            let (c1, c2) = (&ws.j[q1 * n..q1 * n + n], &ws.wj[q2 * n..q2 * n + n]);
+        let c1 = &j[q1 * n..q1 * n + n];
+        let mut q2 = q1;
+        while q2 + 4 <= p {
+            let (b0, b1) = (&wj[q2 * n..q2 * n + n], &wj[(q2 + 1) * n..(q2 + 1) * n + n]);
+            let (b2, b3) = (
+                &wj[(q2 + 2) * n..(q2 + 2) * n + n],
+                &wj[(q2 + 3) * n..(q2 + 3) * n + n],
+            );
+            let (mut s0, mut s1, mut s2, mut s3) = (0.0, 0.0, 0.0, 0.0);
+            for i in 0..n {
+                let v = c1[i];
+                s0 += v * b0[i];
+                s1 += v * b1[i];
+                s2 += v * b2[i];
+                s3 += v * b3[i];
+            }
+            for (t, s) in [s0, s1, s2, s3].into_iter().enumerate() {
+                f[q1 * p + q2 + t] = s;
+                f[(q2 + t) * p + q1] = s;
+            }
+            q2 += 4;
+        }
+        while q2 < p {
+            let c2 = &wj[q2 * n..q2 * n + n];
             let mut s = 0.0;
             for i in 0..n {
                 s += c1[i] * c2[i];
             }
-            ws.f[q1 * p + q2] = s;
-            ws.f[q2 * p + q1] = s;
+            f[q1 * p + q2] = s;
+            f[q2 * p + q1] = s;
+            q2 += 1;
         }
     }
 }
