@@ -14,6 +14,9 @@ record of every design measurement (`deprecated/box.py`): the decision rule
 (ADD_NATS), ownership, sweeps, the read-noise model, the ROI, the background
 surface, and the arms measured and rejected (a plane per box, a wider wide
 class, a rank-opening haze map, a per-pixel likelihood mask, a split move).
+A fixed-width mode was also measured and rejected on 2026-09-11: it tiled
+haze and defocused spots, inventing 8-33 spots per 64x64 frame against
+0.7-7 with fitted widths (the numbers are in the top-level README).
 Nothing in production imports it (`tests/test_import.py` checks); it will be
 retired once the Rust is hardened.
 
