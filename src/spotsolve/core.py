@@ -16,9 +16,10 @@ Pipeline
         PRUNE    per-emitter removal test, faintest first
         REFINE
 
-The loop is monotone in N: ADD and SPLIT only increase it, PRUNE only
-decreases it, and they do not alternate. There is no fixed point to chase and
-no move that can undo another, so termination is structural.
+The phases are monotone in N: ADD and SPLIT only increase it, PRUNE only
+decreases it, and they do not alternate. This prevents add/remove cycles;
+`max_rounds` and `max_settle` bound the work. It does not guarantee that growth
+reaches a no-change round or that the final configuration is locally optimal.
 
 Layers this depends on
 ----------------------
@@ -390,7 +391,7 @@ def _window_bg(bmap, y0, x0, y1, x1):
 
 def _refine_sweep(d_e, positions, amplitudes, sigmas, sigma, bmap, k_max,
                   link_radius_factor, max_iter, dirty=None, se=None,
-                  move_eps=0.0, slack=None, wprior=None):
+                  move_eps=0.0, slack=None, wprior=None, fit_backend=None):
     """One block-Jacobi pass over the patch decomposition.
 
     Jacobi, not Gauss-Seidel: the halo is built from the sweep's INPUT state
@@ -439,7 +440,8 @@ def _refine_sweep(d_e, positions, amplitudes, sigmas, sigma, bmap, k_max,
         r, _, A, cy, cx, sg = _fit_any(
             sub, yy, xx, sigma, halo, level, amplitudes[p.indices],
             loc[:, 0], loc[:, 1], sigmas[p.indices], slack,
-            max_iter=max_iter, tol_obj=REFINE_TOL_OBJ, wprior=wprior)
+            max_iter=max_iter, tol_obj=REFINE_TOL_OBJ, wprior=wprior,
+            fit_backend=fit_backend)
         out_amp[p.indices] = A
         out_sig[p.indices] = sg
         out_pos[p.indices, 0] = cy + p.y0
@@ -464,7 +466,7 @@ def _refine_sweep(d_e, positions, amplitudes, sigmas, sigma, bmap, k_max,
 def refine(d_e, positions, amplitudes, sigma, bmap, k_max=12,
            link_radius_factor=LINK_FACTOR, max_iter=None,
            max_sweeps=REFINE_SWEEPS, tol=REFINE_TOL, sigmas=None, slack=None,
-           wprior=None):
+           wprior=None, fit_backend=None):
     """Joint re-fit at fixed N in connected groups, plus per-emitter CRLBs.
 
     Returns (positions, amplitudes, se, sigmas) with `se` an (N,3) array of
@@ -500,6 +502,9 @@ def refine(d_e, positions, amplitudes, sigma, bmap, k_max=12,
     The patch decomposition is rebuilt each sweep, which is what refreshes the
     halo.
 
+    `fit_backend` optionally selects the numerical backend for variable-width
+    fits; the default uses the Python reference.
+
     `max_sweeps=1` reproduces the single-pass behaviour and is what the round
     loop uses, since the round loop iterates anyway.
     """
@@ -518,7 +523,8 @@ def refine(d_e, positions, amplitudes, sigma, bmap, k_max=12,
         positions, amplitudes, sigmas, se, moved, n_fitted = _refine_sweep(
             d_e, positions, amplitudes, sigmas, sigma, bmap, k_max,
             link_radius_factor, max_iter, dirty=dirty, se=se, move_eps=tol,
-            slack=slack, wprior=wprior)
+            slack=slack, wprior=wprior,
+            fit_backend=fit_backend)
         if n_fitted == 0 or not moved.any():
             break
         dirty = moved
@@ -850,7 +856,8 @@ class _WidthPenalty:
 
 
 def _fit_any(sub, yy, xx, sigma, halo, b, A, cy, cx, sig, slack,
-             max_iter=100, tol_obj=EVIDENCE_TOL_OBJ, wprior=None):
+             max_iter=100, tol_obj=EVIDENCE_TOL_OBJ, wprior=None,
+             fit_backend=None):
     """One window fit, taken and returned in UNPACKED parameters.
 
     Returns `(r, b, A, cy, cx, sig)`. The caller never sees a theta, which is
@@ -886,12 +893,11 @@ def _fit_any(sub, yy, xx, sigma, halo, b, A, cy, cx, sig, slack,
     lo, hi = _bounds(K, sub.shape[0], sub.shape[1], b_max, A_max, sb)
     th0 = np.clip(psf.pack_var_sigma(b, A, cy, cx, np.clip(sig, *sb)),
                   lo + 1e-9, hi - 1e-9)
-    r = lmga.fit(th0, yy, xx, sigma, sub, lo, hi, halo=halo,
-                 max_iter=max_iter, tol_obj=tol_obj,
-                 free_sigma="per_emitter",
-                 penalty=None if (wprior is None or K == 0
-                                  or wprior.is_flat)
-                 else _WidthPenalty(wprior, K))
+    if fit_backend is None:
+        fit_backend = backend_mod.get("py")
+    r = fit_backend.fit_var_sigma(
+        th0, *sub.shape, sub, halo, lo, hi, max_iter,
+        tol_obj=tol_obj, wprior=wprior)
     return (r,) + psf.unpack_var_sigma(r.theta)
 
 
@@ -921,7 +927,7 @@ def _halo_image(positions, amplitudes, frozen, sigma, yy, xx, y0, x0, base):
 
 
 def _try_add(d_e, positions, amplitudes, sigmas, bmap, cand, camp, sigma,
-             lam, A_s, k_max, slack, wprior=None):
+             lam, A_s, k_max, slack, wprior=None, fit_backend=None):
     """Score adding one emitter. Returns (accepted, positions, amplitudes,
     sigmas).
 
@@ -964,13 +970,15 @@ def _try_add(d_e, positions, amplitudes, sigmas, bmap, cand, camp, sigma,
 
     r_b, _, A_b, _, _, s_b = _fit_any(sub, yy, xx, sigma, halo, level, a0,
                                       loc[:, 0], loc[:, 1], s0, slack,
-                                      wprior=wprior)
+                                      wprior=wprior,
+                                      fit_backend=fit_backend)
 
     cl = cand - np.array([y0, x0])
     r_a, _, A, cy, cx, sg = _fit_any(
         sub, yy, xx, sigma, halo, level, np.append(a0, camp),
         np.append(loc[:, 0], cl[0]), np.append(loc[:, 1], cl[1]),
-        np.append(s0, sigma), slack, wprior=wprior)
+        np.append(s0, sigma), slack, wprior=wprior,
+        fit_backend=fit_backend)
 
     log_bf, cond = evidence.log_bf_add(
         r_b.I, r_a.I, r_b.F, r_a.F, A_b, A, len(free), lam, A_s,
@@ -994,7 +1002,7 @@ def _try_add(d_e, positions, amplitudes, sigmas, bmap, cand, camp, sigma,
 
 
 def _try_split(d_e, positions, amplitudes, sigmas, bmap, gi, sigma,
-               lam, A_s, k_max, slack, wprior=None):
+               lam, A_s, k_max, slack, wprior=None, fit_backend=None):
     """Score replacing emitter `gi` with two. Returns (accepted, pos, amp, sig).
 
     The move FIND structurally cannot make. Two emitters closer than about
@@ -1029,7 +1037,8 @@ def _try_split(d_e, positions, amplitudes, sigmas, bmap, gi, sigma,
     loc = positions[free] - np.array([y0, x0])
     r_b, b_b, A_b, cy_b, cx_b, s_b = _fit_any(
         sub, yy, xx, sigma, halo, level, amplitudes[free],
-        loc[:, 0], loc[:, 1], sigmas[free], slack, wprior=wprior)
+        loc[:, 0], loc[:, 1], sigmas[free], slack, wprior=wprior,
+        fit_backend=fit_backend)
 
     th_b = psf.pack_var_sigma(b_b, A_b, cy_b, cx_b, s_b)
     resid = sub - _model_any(b_b, A_b, cy_b, cx_b, s_b, yy, xx, sigma, slack,
@@ -1045,7 +1054,8 @@ def _try_split(d_e, positions, amplitudes, sigmas, bmap, gi, sigma,
         _, A0, cy0, cx0, s0 = psf.unpack_var_sigma(th_a)
         r_a, b_a, A_a, cy_a, cx_a, s_a = _fit_any(
             sub, yy, xx, sigma, halo, float(th_a[0]), A0, cy0, cx0, s0, slack,
-            wprior=wprior)
+            wprior=wprior,
+            fit_backend=fit_backend)
         log_bf, cond = evidence.log_bf_add(
             r_b.I, r_a.I, r_b.F, r_a.F, A_b, A_a, len(free), lam, A_s,
             before=ld_b,
@@ -1079,7 +1089,7 @@ def _try_split(d_e, positions, amplitudes, sigmas, bmap, gi, sigma,
 
 def _add_pass(d_e, bmap, positions, amplitudes, sigmas, cand, camp, sigma,
               lam, A_s, k_max, slack=None, wprior=None, band=None,
-              veto_widths=True):
+              veto_widths=True, fit_backend=None):
     """One ADD pass over a candidate list. Returns (pos, amp, sig, n_added).
 
     The proximity re-check is part of the pass rather than of `detect`: it reads
@@ -1097,13 +1107,13 @@ def _add_pass(d_e, bmap, positions, amplitudes, sigmas, cand, camp, sigma,
             continue
         ok, positions, amplitudes, sigmas = _try_add(
             d_e, positions, amplitudes, sigmas, bmap, c, a, sigma, lam, A_s,
-            k_max, slack, wprior)
+            k_max, slack, wprior, fit_backend=fit_backend)
         n_added += int(ok)
     return positions, amplitudes, sigmas, n_added
 
 
 def _split_pass(d_e, positions, amplitudes, sigmas, bmap, sigma, lam, A_s,
-                k_max, model, slack=None, wprior=None):
+                k_max, model, slack=None, wprior=None, fit_backend=None):
     """Propose a split for every emitter, most pair-like first.
 
     The ranking is not an optimization detail: a split accepted early changes
@@ -1140,7 +1150,7 @@ def _split_pass(d_e, positions, amplitudes, sigmas, bmap, sigma, lam, A_s,
             break
         ok, positions, amplitudes, sigmas = _try_split(
             d_e, positions, amplitudes, sigmas, bmap, int(gi), sigma,
-            lam, A_s, k_max, slack, wprior)
+            lam, A_s, k_max, slack, wprior, fit_backend=fit_backend)
         n_split += int(ok)
     return positions, amplitudes, sigmas, n_split
 
@@ -1170,7 +1180,7 @@ def _amplitude_var(F, k, stride=3):
 
 
 def _prune(d_e, positions, amplitudes, sigmas, bmap, sigma, lam, A_s, k_max,
-           slack=None, wprior=None, tau=PRUNE_TAU):
+           slack=None, wprior=None, tau=PRUNE_TAU, fit_backend=None):
     """One pass of removal tests. Returns (positions, amplitudes, sigmas).
 
     Runs outside the add loop and never feeds back into it: an emitter's A/SE
@@ -1215,7 +1225,8 @@ def _prune(d_e, positions, amplitudes, sigmas, bmap, sigma, lam, A_s, k_max,
         loc = positions[keep_idx] - np.array([y0, x0])
         r_full, _, A_full, _, _, s_full = _fit_any(
             sub, yy, xx, sigma, halo, level, amplitudes[keep_idx],
-            loc[:, 0], loc[:, 1], sigmas[keep_idx], slack, wprior=wprior)
+            loc[:, 0], loc[:, 1], sigmas[keep_idx], slack, wprior=wprior,
+            fit_backend=fit_backend)
 
         lr = positions[free] - np.array([y0, x0]) if len(free) \
             else np.empty((0, 2))
@@ -1223,7 +1234,8 @@ def _prune(d_e, positions, amplitudes, sigmas, bmap, sigma, lam, A_s, k_max,
             sub, yy, xx, sigma, halo, level,
             amplitudes[free] if len(free) else np.empty(0),
             lr[:, 0], lr[:, 1],
-            sigmas[free] if len(free) else np.empty(0), slack, wprior=wprior)
+            sigmas[free] if len(free) else np.empty(0), slack, wprior=wprior,
+            fit_backend=fit_backend)
 
         # `gi` is appended last in `keep_idx`, so it is the last emitter of
         # the fitted vector.
@@ -1251,6 +1263,145 @@ def _prune(d_e, positions, amplitudes, sigmas, bmap, sigma, lam, A_s, k_max,
                 amplitudes[free] = A_red
                 sigmas[free] = s_r
     return positions[alive], amplitudes[alive], sigmas[alive]
+
+
+GROUP_VISITS = 4
+# Transactions an epoch may run per emitter-or-candidate it starts with, before
+# it stops and says so in `history`. Each starts the epoch owing one visit;
+# the rest is the unsettling a commit causes in its neighbours.
+
+GROUP_REBUILDS = 6
+# Transactions one focus may run while a source it holds keeps reaching the
+# position box. Each rebuild is built around positions that moved outward, so
+# the sequence ends at the frame edge; this bounds a caller bug, it is not a
+# convergence criterion.
+
+
+def _group_epoch(engine, positions, amplitudes, sigmas, ids, cand, camp,
+                 couple_r, max_transactions):
+    """One epoch of native group transactions, under one fixed snapshot.
+
+    The whole frame schedule of `search="groups"`, and deliberately little of
+    it. Every change to the configuration -- a birth, a split, a removal, a
+    refit -- is a transaction `DenseGroupEngine.search_group` committed under
+    its one configuration score. Python decides only WHERE to look; there is no
+    add pass, no split pass and no pruning rule on this path.
+
+    Where to look:
+
+    * every FIND candidate first, each as the focus of its own transaction
+      with the candidate as its only seed: that is new light;
+    * light a transaction reports it could not reach becomes a focus too;
+    * then every emitter not yet settled. An emitter is settled once it has
+      been in the free set of a transaction in this epoch -- that transaction
+      compared its alternatives against the committed state and found none
+      better. A commit unsettles every emitter within `couple_r` of anything it
+      changed, because those emitters' groups were compared against the old
+      neighbour.
+
+    The caller bumps the engine's snapshot (background and prior) before each
+    epoch, which is why every emitter starts the epoch unsettled: a score
+    under the old snapshot says nothing under the new one.
+
+    Returns `(positions, amplitudes, sigmas, ids, se_by_id, stats)`.
+    `se_by_id` maps an id to `(SE_A, SE_y, SE_x)` from the most recent
+    transaction that held it free -- conditional on that context, as
+    `GroupOutcome::uncertainty` documents.
+    """
+    pos = np.ascontiguousarray(np.asarray(positions, float).reshape(-1, 2))
+    amp = np.ascontiguousarray(np.asarray(amplitudes, float))
+    sig = np.ascontiguousarray(np.asarray(sigmas, float))
+    ids = np.ascontiguousarray(np.asarray(ids, np.uint32))
+    se_by_id = {}
+    stats = dict(transactions=0, commits=0, birth=0, split=0, removal=0,
+                 fits=0, statuses={}, budget_exhausted=False)
+
+    queue = [("candidate", (float(c[0]), float(c[1])), float(a))
+             for c, a in zip(cand, camp)]
+    queue += [("emitter", int(i), None) for i in ids]
+    settled = set()
+    # Pixels already queued as a focus this epoch, so a peak several groups
+    # report is looked at once.
+    looked = {(round(c[0]), round(c[1])) for c in cand}
+
+    while queue:
+        kind, what, seed_amp = queue.pop(0)
+        if kind == "emitter":
+            where = np.flatnonzero(ids == what)
+            if what in settled or not len(where):
+                continue
+            focus, seeds, seed_amps = tuple(pos[where[0]]), None, None
+        else:
+            focus = what
+            seeds = np.array([what], float)
+            seed_amps = np.array([seed_amp], float)
+
+        for _ in range(GROUP_REBUILDS):
+            if stats["transactions"] >= max_transactions:
+                stats["budget_exhausted"] = True
+                queue = []
+                break
+            stats["transactions"] += 1
+            old = dict(zip(ids.tolist(), pos))
+            out = engine.search_group(pos, amp, sig, ids, focus, seeds,
+                                      seed_amps)
+            st = out["status"]
+            stats["statuses"][st] = stats["statuses"].get(st, 0) + 1
+            stats["fits"] += out["diagnostics"]["n_fits"]
+
+            # Merge the committed free set back over the frame's emitters.
+            # Emitters outside it were frozen and are unchanged.
+            free = out["ids"].astype(np.uint32)
+            gone = out["removed"].astype(np.uint32)
+            keep = ~np.isin(ids, np.concatenate([free, gone]))
+            pos = np.ascontiguousarray(np.vstack([pos[keep], out["positions"]]))
+            amp = np.ascontiguousarray(np.concatenate([amp[keep], out["amplitudes"]]))
+            sig = np.ascontiguousarray(np.concatenate([sig[keep], out["sigmas"]]))
+            ids = np.ascontiguousarray(np.concatenate([ids[keep], free]))
+
+            settled.update(free.tolist())
+            u = out["uncertainty"]
+            for j, i in enumerate(free.tolist()):
+                if u is not None:
+                    se_by_id[i] = (u[1 + 4 * j], u[2 + 4 * j], u[3 + 4 * j])
+            for i in gone.tolist():
+                se_by_id.pop(i, None)
+
+            if len(out["trace"]):
+                stats["commits"] += len(out["trace"])
+                for m in out["trace"]:
+                    stats[m["kind"]] += 1
+                # Unsettle what coupled to anything this commit changed.
+                moved = [p for i, p in zip(ids.tolist(), pos)
+                         if i in set(out["changed"].tolist())]
+                moved += [old[i] for i in gone.tolist() if i in old]
+                if moved:
+                    d = np.linalg.norm(pos[:, None, :] - np.array(moved)[None],
+                                       axis=-1).min(axis=1)
+                    near = set(ids[d <= couple_r].tolist()) - set(free.tolist())
+                    for i in near & settled:
+                        settled.discard(i)
+                        queue.append(("emitter", i, None))
+            # Light the transaction could not reach is answered by LOOKING
+            # there: each reported peak becomes a focus of its own. Rebuilding
+            # this group around it instead re-fits everything it holds to
+            # reach one place, and made 231 of 272 transactions on a 64x64
+            # frame rebuild; leaving it to the next epoch's FIND instead lost
+            # 0.016 of recall, because FIND's proximity veto hides exactly the
+            # light that sits beside an emitter.
+            for y, x in out["diagnostics"]["outside_peaks"]:
+                key = (round(y), round(x))
+                if key not in looked:
+                    looked.add(key)
+                    queue.append(("candidate", (float(y), float(x)), 0.0))
+            # A rebuild is answered for what the transaction HOLDS: a source
+            # pinned on its position box, which a context grown around the
+            # committed positions can compare properly.
+            if not (st == "context_rebuild_required"
+                    and out["diagnostics"]["position_bound_active"]):
+                break
+
+    return pos, amp, sig, ids, se_by_id, stats
 
 
 def _update_bg(d_e, positions, amplitudes, sigma, bmap, kernel, be=None,
@@ -1294,12 +1445,21 @@ def detect(data_img, sigma=1.2, offset=0.0, gain=None, lam0=0.02, A_s0=None,
            impl="py", prior=None,
            slack=SIGMA_SLACK, band=FOCUS_BAND,
            width_gamma=prior_mod.FOCUS_WIDTH_GAMMA, prune_tau=PRUNE_TAU,
-           veto_widths=True):
+           veto_widths=True, search="passes"):
     """Full detection. Returns a `DetectResult`.
 
-    `max_rounds` is a safety stop, not the termination condition: the loop ends
-    when a round accepts nothing, which it must eventually do because every
-    accepted emitter lowers the residual that produces the candidates.
+    `search="groups"` replaces the ADD/SPLIT/REFINE/PRUNE passes with native
+    group transactions (`_group_epoch`): Rust owns every local fit, proposal,
+    comparison and commit under one configuration score, and this loop owns
+    only the epoch -- FIND's candidates, the background surface and the
+    empirical priors, re-estimated between epochs. It needs `impl="rs"` and a
+    variable width. `prune`, `split`, `prune_tau` and `max_settle` belong to
+    the pass search and do not apply to it. See
+    `docs/RUST_GROUP_SEARCH_PLAN.md`.
+
+    Growth stops when a round accepts nothing or reaches `max_rounds`.
+    Monotone emitter count prevents add/remove cycles, but does not prove
+    that the residual search will reach a no-change round before that budget.
 
     `threshold=None` derives FIND's seed cut from the frame size and the PSF
     width (`calibrate.seed_threshold`) rather than carrying a constant, which
@@ -1315,8 +1475,8 @@ def detect(data_img, sigma=1.2, offset=0.0, gain=None, lam0=0.02, A_s0=None,
     smooth on the scale of the frame is nearly constant over one. What it does
     buy is a cleaner residual on real frames.
 
-    `impl` selects which implementation runs the four passes: "py" for the
-    reference in this file, "rs" for the Rust extension. Everything else -- this
+    `impl` selects the numerical implementation: "py" for the reference in
+    this file, "rs" for the Rust extension. Everything else -- this
     round loop, `find_candidates`, and `background_map`'s convolutions -- is the
     same code either way, which is what makes the two comparable. See
     `backend.py`.
@@ -1327,17 +1487,21 @@ def detect(data_img, sigma=1.2, offset=0.0, gain=None, lam0=0.02, A_s0=None,
     source it cannot represent by tiling it, and no threshold repairs a model
     space that does not contain the answer.
 
-    `impl` is IGNORED while `slack` is on, and the Python passes run: the Rust
-    core implements the fixed-width layout only. Pass `slack=None` for the
-    fast path. This older full-frame path remains separate from the calibrated
-    native local inference and the single-pass sparse localizer.
+    With variable widths, `impl="rs"` runs every local ML/MAP fit in Rust;
+    proposal construction, grouping, evidence and pass scheduling stay in
+    Python. With `slack=None`, Rust runs the complete four passes as before.
+    This full-frame path remains separate from calibrated local inference
+    and the single-pass sparse localizer.
     """
-    if slack is not None and impl != "py":
-        # Silently ignoring a performance argument is worse than being slow.
-        print(f"note: impl={impl!r} ignored -- the Rust core implements the "
-              f"fixed-width passes only.\n      Pass slack=None for it, or "
-              f"accept the Python passes.")
-    be = backend_mod.get("py" if slack is not None else impl)
+    be = backend_mod.get(impl)
+    if search not in ("passes", "groups"):
+        raise ValueError(f"search must be 'passes' or 'groups', got {search!r}")
+    groups = search == "groups"
+    if groups and (be.name != "rs" or slack is None):
+        raise ValueError(
+            "search='groups' is the native group engine: it needs impl='rs' "
+            "and a variable width (slack); there is no Python implementation "
+            "of it and no fixed-width variant")
     raw = np.asarray(data_img, dtype=float)
     H, W = raw.shape
     g_eff = calibrate.estimate_gain(raw, offset) if gain is None else float(gain)
@@ -1387,6 +1551,10 @@ def detect(data_img, sigma=1.2, offset=0.0, gain=None, lam0=0.02, A_s0=None,
     amplitudes = np.empty(0)
     sigmas = np.empty(0)
     history = []
+    # Group search state: native ids, the per-frame engine, and each id's
+    # standard errors from the last transaction that held it free.
+    ids = np.empty(0, dtype=np.uint32)
+    engine, se_by_id = None, {}
 
     # The four passes carry per-emitter widths; the backend contract does not,
     # so with `slack` on they are called directly rather than through `be`.
@@ -1409,7 +1577,7 @@ def detect(data_img, sigma=1.2, offset=0.0, gain=None, lam0=0.02, A_s0=None,
         return refine(d_e, pos, amp, sigma, bmap, k_max=k_max,
                       max_sweeps=sweeps, sigmas=sig, slack=slack,
                       wprior=_width_prior(slack, band, sigma, *_rates(sig),
-                                          gamma=width_gamma))
+                                          gamma=width_gamma), fit_backend=be)
 
     def _prune_once(pos, amp, sig):
         if slack is None:
@@ -1421,7 +1589,34 @@ def detect(data_img, sigma=1.2, offset=0.0, gain=None, lam0=0.02, A_s0=None,
                       k_max, slack,
                       _width_prior(slack, band, sigma, *_rates(sig),
                                    gamma=width_gamma),
-                      tau=prune_tau)
+                      tau=prune_tau, fit_backend=be)
+
+    def _settle_and_prune(pos, amp, sig):
+        """The pass search's tail: settle, then alternate prune and settle.
+
+        Refine BEFORE pruning. `refine` re-fits at fixed N with no separation
+        constraint and routinely pulls an accepted pair together; those
+        collapsed pairs are exactly what the removal test is for, and pruning
+        first cannot see them. So the order is settle, prune, settle again at
+        the reduced N.
+
+        Settle and prune alternate until the prune removes nothing. One pass is
+        not enough: the re-fit at the reduced N is as free to collapse a pair
+        as the first one was. This cannot cycle -- prune only removes, so N
+        strictly decreases. `max_settle` is a backstop.
+        """
+        pos, amp, se_, sig = _refine(pos, amp, sig, REFINE_SWEEPS)
+        for _ in range(max_settle if prune else 0):
+            if not len(pos):
+                break
+            n_before = len(pos)
+            pos, amp, sig = _prune_once(pos, amp, sig)
+            if len(pos) == n_before:
+                break
+            if verbose >= 1:
+                print(f"  [prune] {n_before} -> {len(pos)}")
+            pos, amp, se_, sig = _refine(pos, amp, sig, REFINE_SWEEPS)
+        return pos, amp, se_, sig
 
     for rnd in range(max_rounds):
         model = _render(positions, amplitudes, sigmas)
@@ -1431,38 +1626,62 @@ def detect(data_img, sigma=1.2, offset=0.0, gain=None, lam0=0.02, A_s0=None,
         pri = A_s if prior is None else prior
         wprior = _width_prior(slack, band, sigma, *_rates(sigmas),
                               gamma=width_gamma)
-        if slack is None:
-            positions, amplitudes, n_added = be.add_pass(
-                d_e, bmap, positions, amplitudes, cand, camp, sigma, lam, pri,
-                k_max)
-            sigmas = np.full(len(amplitudes), float(sigma))
+        n_removed = 0
+        if groups:
+            # The engine is one per frame, so ids stay unique across epochs;
+            # each epoch only re-snapshots what it compares under.
+            if engine is None:
+                engine = be.group_engine(d_e, bmap, sigma, slack, k_max,
+                                         wprior, pri)
+            else:
+                engine.set_background(bmap)
+                engine.set_prior(*backend_mod.native_prior_spec(wprior, pri))
+            positions, amplitudes, sigmas, ids, se_by_id, stats = _group_epoch(
+                engine, positions, amplitudes, sigmas, ids, cand, camp,
+                LINK_FACTOR * slack[1] * sigma,
+                GROUP_VISITS * (len(ids) + len(cand)) + GROUP_VISITS)
+            n_added, n_split, n_removed = (stats["birth"], stats["split"],
+                                           stats["removal"])
+            changed = stats["commits"] > 0
         else:
-            positions, amplitudes, sigmas, n_added = _add_pass(
-                d_e, bmap, positions, amplitudes, sigmas, cand, camp, sigma,
-                lam, pri, k_max, slack, wprior, band, veto_widths)
-
-        # SPLIT runs on the model the adds just produced: an emitter only looks
-        # like an unresolved pair once its neighbourhood is otherwise
-        # explained, and splitting against a model still missing a nearby
-        # source mostly splits emitters into that source's flux.
-        n_split = 0
-        if split:
-            if n_added:
-                model = _render(positions, amplitudes, sigmas)
             if slack is None:
-                positions, amplitudes, n_split = be.split_pass(
-                    d_e, bmap, positions, amplitudes, model, sigma, lam, pri,
-                    k_max)
+                positions, amplitudes, n_added = be.add_pass(
+                    d_e, bmap, positions, amplitudes, cand, camp, sigma, lam,
+                    pri, k_max)
                 sigmas = np.full(len(amplitudes), float(sigma))
             else:
-                positions, amplitudes, sigmas, n_split = _split_pass(
-                    d_e, positions, amplitudes, sigmas, bmap, sigma, lam, pri,
-                    k_max, model, slack, wprior)
+                positions, amplitudes, sigmas, n_added = _add_pass(
+                    d_e, bmap, positions, amplitudes, sigmas, cand, camp,
+                    sigma, lam, pri, k_max, slack, wprior, band, veto_widths,
+                    fit_backend=be)
 
-        if n_added or n_split:
-            # One sweep here; the round loop is the outer iteration.
-            positions, amplitudes, _, sigmas = _refine(
-                positions, amplitudes, sigmas, 1)
+            # SPLIT runs on the model the adds just produced: an emitter only
+            # looks like an unresolved pair once its neighbourhood is otherwise
+            # explained, and splitting against a model still missing a nearby
+            # source mostly splits emitters into that source's flux.
+            n_split = 0
+            if split:
+                if n_added:
+                    model = _render(positions, amplitudes, sigmas)
+                if slack is None:
+                    positions, amplitudes, n_split = be.split_pass(
+                        d_e, bmap, positions, amplitudes, model, sigma, lam,
+                        pri, k_max)
+                    sigmas = np.full(len(amplitudes), float(sigma))
+                else:
+                    positions, amplitudes, sigmas, n_split = _split_pass(
+                        d_e, positions, amplitudes, sigmas, bmap, sigma, lam,
+                        pri, k_max, model, slack, wprior, fit_backend=be)
+
+            changed = bool(n_added or n_split)
+
+        if changed:
+            # One sweep here; the round loop is the outer iteration. The group
+            # search has no separate estimation step: every transaction
+            # already refitted its free set jointly before committing it.
+            if not groups:
+                positions, amplitudes, _, sigmas = _refine(
+                    positions, amplitudes, sigmas, 1)
             # Both estimated from the IN-FOCUS class alone. Counting the
             # nuisance objects in `lam` would be a positive feedback loop --
             # more objects raises the count prior, which makes the next add
@@ -1485,39 +1704,29 @@ def detect(data_img, sigma=1.2, offset=0.0, gain=None, lam0=0.02, A_s0=None,
 
         history.append(dict(round=rnd, N=len(positions), added=n_added,
                             split=n_split, candidates=len(cand),
-                            background=float(np.median(bmap))))
+                            background=float(np.median(bmap)),
+                            **({"removed": n_removed,
+                                "transactions": stats["transactions"],
+                                "fits": stats["fits"],
+                                "statuses": stats["statuses"],
+                                "budget_exhausted": stats["budget_exhausted"]}
+                               if groups else {})))
         if verbose >= 1:
             print(f"  [round {rnd}] {len(cand):3d} candidates, "
                   f"{n_added:3d} added, {n_split:3d} split "
+                  + (f"{n_removed:3d} removed " if groups else "") +
                   f"-> N={len(positions):3d}  "
                   f"bg={np.median(bmap):.3f} "
                   f"[{bmap.min():.2f}, {bmap.max():.2f}]")
-        if n_added == 0 and n_split == 0:
+        if not changed:
             break
 
-    # Refine BEFORE pruning. `refine` re-fits at fixed N with no separation
-    # constraint and routinely pulls an accepted pair together; those collapsed
-    # pairs are exactly what the removal test is for, and pruning first cannot
-    # see them. So the order is settle, prune, settle again at the reduced N.
-    positions, amplitudes, se, sigmas = _refine(positions, amplitudes, sigmas,
-                                               REFINE_SWEEPS)
-
-    # Settle and prune alternate until the prune removes nothing. One pass is
-    # not enough: the re-fit at the reduced N is as free to collapse a pair as
-    # the first one was. This cannot cycle -- prune only removes, so N strictly
-    # decreases. `max_settle` is a backstop.
-    for _ in range(max_settle if prune else 0):
-        if not len(positions):
-            break
-        n_before = len(positions)
-        positions, amplitudes, sigmas = _prune_once(positions, amplitudes,
-                                                    sigmas)
-        if len(positions) == n_before:
-            break
-        if verbose >= 1:
-            print(f"  [prune] {n_before} -> {len(positions)}")
-        positions, amplitudes, se, sigmas = _refine(positions, amplitudes,
-                                                    sigmas, REFINE_SWEEPS)
+    if groups:
+        se = np.array([se_by_id.get(int(i), (np.nan,) * 3) for i in ids],
+                      float).reshape(-1, 3)
+    else:
+        positions, amplitudes, se, sigmas = _settle_and_prune(
+            positions, amplitudes, sigmas)
     model = _render(positions, amplitudes, sigmas)
 
     # The reporting split, and the ONLY place it happens. Everything above this

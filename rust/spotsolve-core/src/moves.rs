@@ -148,3 +148,117 @@ pub fn split(theta: &[f64], k: usize, u: [f64; 2], disp: f64) -> Vec<f64> {
     }
     out
 }
+
+// ---------------------------------------------------------------------------
+// Width-aware constructors, `theta = [b, (A, y, x, sigma) * K]`
+// ---------------------------------------------------------------------------
+//
+// Ports `moves.py`'s `residual_axis_var` / `split_var` and adds the two
+// constructors the group search needs that the pass-based search never had a
+// use for: a birth and a removal as *proposals* rather than as pass outcomes.
+//
+// Nothing here fits, scores or decides. In particular a removal constructor is
+// not a pruning rule: it builds the K-1 vector, and `dense_group` scores it by
+// exactly the same expression it scores a birth by.
+
+/// [`residual_axis`] on a variable-width theta, weighted at emitter `k`'s OWN
+/// width.
+///
+/// The weight decides which pixels count as "around this emitter". Weighting a
+/// defocused source at the in-focus width sees only its core -- exactly the
+/// region where a broadened PSF and an unresolved pair look most alike -- so
+/// the ranking this feeds would put defocused singles at the top, which is the
+/// failure the free width exists to remove.
+#[allow(clippy::too_many_arguments)]
+pub fn residual_axis_var(
+    theta: &[f64],
+    k: usize,
+    y_origin: f64,
+    x_origin: f64,
+    h: usize,
+    w: usize,
+    resid: &[f64],
+) -> ([f64; 2], f64) {
+    residual_axis(
+        crate::psf::cy_var(theta, k),
+        crate::psf::cx_var(theta, k),
+        crate::psf::amp_var(theta, k),
+        y_origin,
+        x_origin,
+        h,
+        w,
+        crate::psf::sigma_var(theta, k),
+        resid,
+    )
+}
+
+/// Replace emitter `k` with two at `c_k +/- (disp/2) * u`, each of half its
+/// flux. Both children inherit the PARENT's width.
+///
+/// Not the in-focus width: a proposal and the incumbent it is compared against
+/// must start in the same basin, because the comparison differences their two
+/// objectives and a proposal started worse is under-credited -- the bias
+/// `lmcl::fit`'s convergence note describes.
+///
+/// The untouched emitters keep their order and the two children are appended,
+/// so the returned vector is `[free without k] + [child0, child1]`.
+pub fn split_var(theta: &[f64], k: usize, u: [f64; 2], disp: f64) -> Vec<f64> {
+    let n = crate::psf::n_emitters_var(theta);
+    debug_assert!(k < n);
+    let mut out = Vec::with_capacity(4 * (n + 1) + 1);
+    out.push(theta[0]);
+    for j in 0..n {
+        if j != k {
+            push_emitter_var(&mut out, theta, j);
+        }
+    }
+    let half = (crate::psf::amp_var(theta, k) / 2.0).max(A_MIN);
+    let (cy, cx) = (crate::psf::cy_var(theta, k), crate::psf::cx_var(theta, k));
+    let sigma = crate::psf::sigma_var(theta, k);
+    for s in [1.0f64, -1.0] {
+        out.push(half);
+        out.push(cy + s * 0.5 * disp * u[0]);
+        out.push(cx + s * 0.5 * disp * u[1]);
+        out.push(sigma);
+    }
+    out
+}
+
+/// Drop emitter `k`, keeping every other emitter's order.
+///
+/// The flux it carried is NOT redistributed. Handing it to a neighbour would
+/// make the removal hypothesis a different move -- a merge -- started from a
+/// state the joint refit did not choose, and the two would then be compared as
+/// though they were the same proposal. The refit reassigns that light itself,
+/// which is the whole reason every hypothesis is jointly refitted.
+pub fn remove_var(theta: &[f64], k: usize) -> Vec<f64> {
+    let n = crate::psf::n_emitters_var(theta);
+    debug_assert!(k < n);
+    let mut out = Vec::with_capacity(4 * (n - 1) + 1);
+    out.push(theta[0]);
+    for j in 0..n {
+        if j != k {
+            push_emitter_var(&mut out, theta, j);
+        }
+    }
+    out
+}
+
+/// Append one emitter at `(y, x)` with flux `a` and width `sigma`.
+pub fn birth_var(theta: &[f64], a: f64, y: f64, x: f64, sigma: f64) -> Vec<f64> {
+    let mut out = Vec::with_capacity(theta.len() + 4);
+    out.extend_from_slice(theta);
+    out.push(a.max(A_MIN));
+    out.push(y);
+    out.push(x);
+    out.push(sigma);
+    out
+}
+
+#[inline]
+fn push_emitter_var(out: &mut Vec<f64>, theta: &[f64], j: usize) {
+    out.push(crate::psf::amp_var(theta, j));
+    out.push(crate::psf::cy_var(theta, j));
+    out.push(crate::psf::cx_var(theta, j));
+    out.push(crate::psf::sigma_var(theta, j));
+}

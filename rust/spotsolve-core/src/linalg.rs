@@ -24,8 +24,45 @@
 
 /// Cap on emitters in one joint fit, matching `core.py`'s `k_max`.
 pub const K_MAX: usize = 12;
-/// Cap on the parameter count, `3*K_MAX + 1`.
+/// Cap on the parameter count in the **fixed-width** layout, `3*K_MAX + 1`.
+///
+/// This is 37, and it describes `passes.rs` and nothing else. A variable-width
+/// fit is `4*K + 1`, and a group transaction has to hold the temporary `K+1`
+/// alternative as well, so it needs [`P_MAX_VAR`] -- 53 -- which does not fit
+/// here. See that constant for the audit.
 pub const P_MAX: usize = 3 * K_MAX + 1;
+
+/// Cap on emitters in one variable-width group transaction.
+///
+/// One more than `K_MAX`, because a transaction compares `K` against `K+1`:
+/// the free set is capped at `K_MAX` and every birth and split hypothesis
+/// carries one extra emitter. Sizing to `K_MAX` would make exactly the
+/// alternative being tested the one that does not fit.
+pub const K_MAX_GROUP: usize = K_MAX + 1;
+
+/// Cap on the parameter count in a variable-width group fit, `4*K_MAX_GROUP + 1`.
+///
+/// # Why this is a separate constant and not a wider `P_MAX`
+///
+/// [`P_MAX`] is consumed as a *fixed capacity* in one place --
+/// `evidence::Evidence::new` allocates `Chol::new(P_MAX)` once and never grows
+/// it -- and as a documentation constant everywhere else. Widening `P_MAX` to
+/// 53 would silently grow that allocation by 2.1x for the fixed-width passes
+/// that will never use it, and would stop describing the layout it names.
+///
+/// The audit behind this constant, checked when the group path was added:
+///
+/// | consumer | capacity | grows? | safe for `4*K+1`? |
+/// |---|---|---|---|
+/// | `lmcl::FitWorkspace::ensure` | `p*p` from `theta0.len()` | yes, on demand | yes |
+/// | `evidence::Evidence::chol` | `P_MAX` = 37, fixed | no | **no** -- fixed-width only |
+/// | `Chol::factor` | asserts `n*n <= capacity` | -- | fails loudly, not silently |
+///
+/// So `Evidence` is a fixed-width consumer and the group path must not reuse
+/// it; `dense_group` carries its own [`Chol`] sized here. [`Chol::ensure`]
+/// exists so that a caller who does want one buffer for both layouts can grow
+/// it explicitly rather than by reallocating behind a comparison.
+pub const P_MAX_VAR: usize = 4 * K_MAX_GROUP + 1;
 
 /// A Cholesky factorization `A = L L^T`, with reusable storage.
 ///
@@ -101,6 +138,20 @@ impl Chol {
     #[inline]
     pub fn capacity(&self) -> usize {
         self.l.len()
+    }
+
+    /// Grow so that an `n x n` factorization fits. A no-op when it already does.
+    ///
+    /// [`Chol::factor`] asserts rather than reallocating, because a
+    /// reallocation inside a comparison is a latency cliff in the middle of a
+    /// decision. Callers whose `n` is data-dependent -- a group transaction's
+    /// `4*K+1` -- call this once when the context is built.
+    pub fn ensure(&mut self, n: usize) {
+        if self.l.len() < n * n {
+            self.l = vec![0.0; n * n];
+            self.n = 0;
+            self.ok = false;
+        }
     }
 
     /// `log|A|`, from the factor already in hand.

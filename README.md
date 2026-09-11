@@ -56,5 +56,12 @@ These are fixed-count hypotheses, not selected detections. Check
 source-presence decisions and full-frame dense integration remain in progress.
 The existing `spotsolve.detect` pipeline remains available separately.
 
+For that full-frame Gaussian detector, `detect(image, sigma=1.2, gain=1.0,
+impl="rs")` now runs the default per-emitter variable-width ML/MAP fits in Rust.
+Width priors, halo contributions and posterior curvature are retained. Its
+variable-width proposal and evidence passes still run in Python; `slack=None`
+uses the existing fully native fixed-width passes. See the
+[implementation and local-search notes](docs/DENSE_DETECT.md).
+
 See the [native API and calibration contract](docs/INFERENCE_CONTRACT.md) and
 [current development plan](docs/FOCUSED_EMITTER_PROPOSAL.md).

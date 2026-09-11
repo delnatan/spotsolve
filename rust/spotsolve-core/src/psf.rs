@@ -268,7 +268,7 @@ pub fn factors_axis(ax: &[f64], centers: &[f64], sigma: f64, e: &mut [f64], de: 
     }
 }
 
-/// `(E, dE/dc, dE/dsigma)` for one axis; the free-sigma diagnostic path only.
+/// `(E, dE/dc, dE/dsigma)` for one axis in variable-width fitting.
 ///
 /// ```text
 /// d(ey)/d(sigma) = (1/(sigma*sqrt(pi))) * (u_- * exp(-u_-^2) - u_+ * exp(-u_+^2))
@@ -364,6 +364,14 @@ pub fn model_var_sigma_ax(
     let k = n_emitters_var(theta);
     debug_assert_eq!(m.len(), h * w);
     m.fill(background(theta));
+    // Add the fixed contribution first, then reuse the same amplitude*Ey
+    // factor as the Jacobian evaluator. The render-only and fitting paths
+    // must describe exactly the same mean.
+    if let Some(values) = halo {
+        for (value, extra) in m.iter_mut().zip(values) {
+            *value += extra;
+        }
+    }
     if k > 0 {
         f.unpack_var(theta);
         for emitter in 0..k {
@@ -385,14 +393,9 @@ pub fn model_var_sigma_ax(
             let ex = &f.ex[emitter * w..emitter * w + w];
             for row in 0..h {
                 for column in 0..w {
-                    m[row * w + column] += amplitude * (ey[row] * ex[column]);
+                    m[row * w + column] += (amplitude * ey[row]) * ex[column];
                 }
             }
-        }
-    }
-    if let Some(values) = halo {
-        for (value, extra) in m.iter_mut().zip(values) {
-            *value += extra;
         }
     }
 }
@@ -470,8 +473,7 @@ pub fn model_and_jac_ax(
 /// Model and Jacobian with one sigma parameter per emitter.
 ///
 /// `theta` is `[b, A0, y0, x0, sigma0, ...]`, and `j` is parameter-major with
-/// `p = 4K+1`. This is for the post-hoc out-of-focus filtering stage; the
-/// fixed-sigma detector does not call it.
+/// `p = 4K+1`. Used by variable-width ML and MAP fitting.
 pub fn model_and_jac_var_sigma_ax(
     theta: &[f64],
     ay: &[f64],
@@ -494,6 +496,12 @@ pub fn model_and_jac_var_sigma_ax(
     }
     for v in m.iter_mut() {
         *v = b;
+    }
+    if let Some(hl) = halo {
+        debug_assert_eq!(hl.len(), n);
+        for (v, &x) in m.iter_mut().zip(hl) {
+            *v += x;
+        }
     }
     if k > 0 {
         f.unpack_var(theta);
@@ -541,15 +549,9 @@ pub fn model_and_jac_var_sigma_ax(
                     j[q_y + off + c] = a_de * ex_c;
                     j[q_x + off + c] = a_e * dex[c];
                     j[q_s + off + c] = a_ds * ex_c + a_e * dsx[c];
-                    m[off + c] += a * v;
+                    m[off + c] += a_e * ex_c;
                 }
             }
-        }
-    }
-    if let Some(hl) = halo {
-        debug_assert_eq!(hl.len(), n);
-        for (v, &x) in m.iter_mut().zip(hl) {
-            *v += x;
         }
     }
 }

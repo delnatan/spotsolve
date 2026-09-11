@@ -30,6 +30,7 @@ use spotsolve_core::evidence::{Evidence, Prior};
 use spotsolve_core::passes::{self, Emitters, Frame, Solver};
 use spotsolve_core::{linalg, lmcl, psf, render, sparse};
 
+mod dense_group;
 mod inference;
 
 type Arr1 = Py<PyArray1<f64>>;
@@ -395,9 +396,10 @@ fn lmcl_fit(
 /// One bounded variable-sigma fit.
 ///
 /// `theta0` has length `4K+1`: `[b, A0, y0, x0, sigma0, ...]`. `halo` is the
-/// parameter-free local contribution, matching the Python filtering scripts.
+/// parameter-free local contribution. `width_prior` carries the Cauchy
+/// (center, scale, log normalizer); no Python callbacks run inside the fit.
 #[pyfunction]
-#[pyo3(signature = (theta0, h, w, d, halo, lower, upper, max_iter=180))]
+#[pyo3(signature = (theta0, h, w, d, halo, lower, upper, max_iter=180, *, tol_obj=1e-8, width_prior=None))]
 #[allow(clippy::too_many_arguments)]
 fn lmcl_fit_var_sigma(
     py: Python<'_>,
@@ -409,6 +411,8 @@ fn lmcl_fit_var_sigma(
     lower: PyReadonlyArray1<'_, f64>,
     upper: PyReadonlyArray1<'_, f64>,
     max_iter: usize,
+    tol_obj: f64,
+    width_prior: Option<(f64, f64, f64)>,
 ) -> PyResult<(Arr1, f64, Arr2, usize, bool, bool)> {
     let t = slice1(&theta0, "theta0")?;
     if t.len() % 4 != 1 {
@@ -416,16 +420,54 @@ fn lmcl_fit_var_sigma(
     }
     let data = slice2(&d, "d")?;
     let halo = slice2(&halo, "halo")?;
-    let bounds = lmcl::Bounds::new(slice1(&lower, "lower")?, slice1(&upper, "upper")?);
-    if data.len() != h * w {
+    let lo = slice1(&lower, "lower")?;
+    let hi = slice1(&upper, "upper")?;
+    if lo.len() != t.len()
+        || hi.len() != t.len()
+        || t.iter().any(|v| !v.is_finite())
+        || lo
+            .iter()
+            .zip(hi)
+            .any(|(&l, &u)| !l.is_finite() || !u.is_finite() || l >= u)
+        || lo.iter().skip(4).step_by(4).any(|&s| s <= 0.0)
+    {
+        return Err(PyValueError::new_err(
+            "expected finite theta and matching, ordered bounds with positive sigma limits",
+        ));
+    }
+    if !tol_obj.is_finite() || tol_obj <= 0.0 {
+        return Err(PyValueError::new_err(
+            "`tol_obj` must be positive and finite",
+        ));
+    }
+    let penalty = match width_prior {
+        Some((sigma0, scale, log_z)) => {
+            if !sigma0.is_finite()
+                || sigma0 <= 0.0
+                || !scale.is_finite()
+                || scale <= 0.0
+                || !log_z.is_finite()
+            {
+                return Err(PyValueError::new_err("invalid Cauchy width prior"));
+            }
+            Some(lmcl::WidthPenalty {
+                sigma0,
+                scale,
+                log_z,
+            })
+        }
+        None => None,
+    };
+    let bounds = lmcl::Bounds::new(lo, hi);
+    if h == 0 || w == 0 || d.shape() != [h, w] || data.iter().any(|v| !v.is_finite()) {
         return Err(PyValueError::new_err("`d` does not match (h, w)"));
     }
-    if halo.len() != h * w {
+    if halo.len() != h * w || halo.iter().any(|v| !v.is_finite()) {
         return Err(PyValueError::new_err("`halo` does not match (h, w)"));
     }
     let p = t.len();
     let mut ws = lmcl::FitWorkspace::new();
-    let info = lmcl::fit_var_sigma(
+    let info = lmcl::fit_var_sigma_map(
         &mut ws,
         t,
         h,
@@ -435,8 +477,10 @@ fn lmcl_fit_var_sigma(
         Some(halo),
         lmcl::FitOpts {
             max_iter,
+            tol_obj,
             ..Default::default()
         },
+        penalty,
     );
     Ok((
         ws.theta().to_vec().into_pyarray(py).unbind(),
@@ -656,6 +700,7 @@ fn version() -> &'static str {
 #[pymodule]
 fn spotsolve_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<inference::CalibratedModel>()?;
+    dense_group::register(m)?;
     m.add_function(wrap_pyfunction!(add_pass, m)?)?;
     m.add_function(wrap_pyfunction!(split_pass, m)?)?;
     m.add_function(wrap_pyfunction!(refine, m)?)?;

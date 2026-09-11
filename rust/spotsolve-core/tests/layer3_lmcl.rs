@@ -13,6 +13,70 @@ use spotsolve_core::lmcl::{self, Bounds, FitOpts, FitWorkspace, Interior};
 use spotsolve_core::psf;
 
 #[test]
+fn variable_sigma_objectives_do_not_regress_against_the_reference() {
+    let fx = load("02_lmga");
+    let mut ws = FitWorkspace::new();
+    for case in fx.root["var_sigma_cases"].as_array().unwrap() {
+        let (h, w) = (usize_at(case, "h"), usize_at(case, "w"));
+        let (_, _, d) = mat_at(case, "data");
+        let theta0 = vec_at(case, "theta0");
+        let bounds = Bounds::new(&vec_at(case, "lower"), &vec_at(case, "upper"));
+        let prior = &case["penalty"];
+        let sigma0 = f64_at(prior, "sigma0");
+        let scale = f64_at(prior, "scale");
+        let log_z = scale.ln()
+            + (((f64_at(prior, "hi") - sigma0) / scale).atan()
+                - ((f64_at(prior, "lo") - sigma0) / scale).atan())
+            .ln();
+        for mode in ["ml", "map"] {
+            let penalty = (mode == "map").then_some(lmcl::WidthPenalty {
+                sigma0,
+                scale,
+                log_z,
+            });
+            let info = lmcl::fit_var_sigma_map(
+                &mut ws,
+                &theta0,
+                h,
+                w,
+                &d,
+                &bounds,
+                None,
+                FitOpts::default(),
+                penalty,
+            );
+            let want = &case[mode];
+            let reference = vec_at(want, "theta");
+            let objective = |theta: &[f64], data_i: f64| {
+                data_i
+                    + if mode == "map" {
+                        theta
+                            .iter()
+                            .skip(4)
+                            .step_by(4)
+                            .map(|s| {
+                                let u = (s - sigma0) / scale;
+                                (u * u).ln_1p() + log_z
+                            })
+                            .sum::<f64>()
+                    } else {
+                        0.0
+                    }
+            };
+            let got = objective(ws.theta(), info.i_div);
+            let expected = objective(&reference, f64_at(want, "I"));
+            assert!(
+                got <= expected + 1e-6,
+                "{mode}: native objective {got} > reference {expected}"
+            );
+            for (q, &value) in ws.theta().iter().enumerate() {
+                assert!(value > bounds.lo()[q] && value < bounds.hi()[q]);
+            }
+        }
+    }
+}
+
+#[test]
 fn converged_objective_matches_the_fixture() {
     let fx = load("02_lmga");
     let mut ws = FitWorkspace::new();
@@ -230,6 +294,42 @@ fn variable_sigma_fit_from_truth_is_a_fixed_point() {
     for q in 0..theta.len() {
         assert_abs(ws.theta()[q], theta[q], 1e-6, &format!("theta[{q}] moved"));
     }
+}
+
+#[test]
+fn tiny_damped_width_steps_do_not_certify_convergence() {
+    let (h, w) = (13, 13);
+    let truth = psf::pack_var(4.0, &[900.0], &[6.2], &[6.7], &[1.3]);
+    let initial = psf::pack_var(20.0, &[300.0], &[3.0], &[3.0], &[1.0]);
+    let (ay, ax) = (psf::local_axis(h), psf::local_axis(w));
+    let mut factors = psf::Factors::new(h, w, 1);
+    let mut data = vec![0.0; h * w];
+    psf::model_var_sigma_ax(&truth, &ay, &ax, None, &mut factors, &mut data);
+    let bounds = Bounds::new(
+        &[0.0, 1e-4, -0.5, -0.5, 0.84],
+        &[100.0, 5000.0, 12.5, 12.5, 2.64],
+    );
+    let mut ws = FitWorkspace::new();
+    let info = lmcl::fit_var_sigma(
+        &mut ws,
+        &initial,
+        h,
+        w,
+        &data,
+        &bounds,
+        None,
+        FitOpts {
+            max_iter: 2,
+            lambda0: 1e12,
+            tol_obj: 1e-4,
+            ..Default::default()
+        },
+    );
+    assert!(!info.converged, "damping hid a nonstationary iterate");
+    assert!(
+        info.i_div > 100.0,
+        "control must remain far from the exact solution"
+    );
 }
 
 /// `F` is symmetric by construction, and this port computes only its upper
