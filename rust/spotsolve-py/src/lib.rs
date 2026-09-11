@@ -2,8 +2,7 @@
 //!
 //! The boundary sits at the FRAME: `box_localize` and `box_localize_stack`
 //! (see `boxsearch`) run a whole frame natively with the GIL released.
-//! `lmcl_fit_var_sigma` exposes one fit, for the deprecated Python reference
-//! and for the fitter's own tests.
+//! `lmcl_fit_var_sigma` exposes one fit, for the fitter's own tests.
 //!
 //! Arrays must be C-contiguous f64; `as_slice()` fails loudly otherwise rather
 //! than silently transposing.

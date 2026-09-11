@@ -10,17 +10,5 @@ def test_public_names_exist():
 
 def test_submodules_import():
     for name in ("native", "results", "calibration", "aggregates", "loctable",
-                 "audit", "metrics", "simulate", "psf",
-                 "deprecated.box", "deprecated.core", "deprecated.lmga",
-                 "deprecated.backend", "deprecated.patches",
-                 "deprecated.calibrate", "deprecated.structs"):
+                 "audit", "metrics", "simulate", "psf"):
         __import__(f"spotsolve.{name}")
-
-
-def test_production_does_not_import_the_reference():
-    import subprocess, sys
-    code = ("import sys, spotsolve, spotsolve.loctable; "
-            "print([m for m in sys.modules if m.startswith('spotsolve.deprecated')])")
-    out = subprocess.run([sys.executable, "-c", code], capture_output=True,
-                         text=True, check=True).stdout.strip()
-    assert out == "[]", out

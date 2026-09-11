@@ -9,7 +9,7 @@ the extension, so there is no second copy of them here.
 
 In each box an emitter exists iff it lowers the box's Poisson deviance by
 `spotsolve_rs.BOX_ADD_NATS` nats. The reasoning and measurement behind every
-constant is in the Python reference, `spotsolve.deprecated.box`.
+constant sit beside it in `rust/spotsolve-core/src/boxsearch.rs`.
 
 Frames of a timecourse are independent, so `localize_stack` hands them to a
 pool of native threads, each with its own workspace.

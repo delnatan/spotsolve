@@ -247,8 +247,10 @@ pub fn gaussian_laplace(img: &[f64], h: usize, w: usize, sigma: f64, mode: Mode)
 
 /// L2 norm of the 2-D LoG kernel: the null sd of a `gaussian_laplace`
 /// response to unit-variance white noise, and so the unit that turns it into
-/// a z-score. `core.log_kernel_l2`: the kernel is `g2 (x) g0 + g0 (x) g2`, so
-/// `||w||^2 = 2 ||g0||^2 ||g2||^2 + 2 (g0 . g2)^2` exactly.
+/// a z-score. The kernel is `g2 (x) g0 + g0 (x) g2`, so
+/// `||w||^2 = 2 ||g0||^2 ||g2||^2 + 2 (g0 . g2)^2` exactly (checked
+/// bit-identical to the norm of a filtered impulse at sigma 0.8 to 3.0), at
+/// O(taps) instead of a 2-D filter.
 pub fn log_kernel_l2(sigma: f64) -> f64 {
     let radius = kernel_radius(sigma);
     let g0 = gaussian_kernel1d(sigma, 0, radius);

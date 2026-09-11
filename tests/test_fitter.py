@@ -1,4 +1,5 @@
-"""The Rust variable-width fitter against the Python reference's fixture."""
+"""The Rust variable-width fitter against the frozen `02_lmga` fixture, and
+against `psf`'s analytic model and Jacobian."""
 
 import json
 from pathlib import Path
@@ -7,30 +8,38 @@ import numpy as np
 import pytest
 
 from spotsolve import psf
-from spotsolve.deprecated import backend, lmga
 
 rs = pytest.importorskip("spotsolve_rs")
+
+
+def _i_divergence(d, m):
+    d = np.asarray(d, float)
+    term = np.where(d > 0, d * np.log(np.where(d > 0, d, 1.0) / m), 0.0)
+    return float(np.sum(term - (d - m)))
 
 
 def test_objective_and_information_match_the_reference():
     fixture = json.loads((Path(__file__).parent / "fixtures/02_lmga.json").read_text())
     for case in fixture["var_sigma_cases"]:
-        r = backend.get("rs").fit_var_sigma(
-            case["theta0"], case["h"], case["w"], case["data"], 0.0,
-            case["lower"], case["upper"], 100)
-        # No worse than the reference optimum.
-        assert r.I <= case["ml"]["I"] + 1e-6
-        yy, xx = np.mgrid[:case["h"], :case["w"]].astype(float)
-        model = psf.model_var_sigma(r.theta, yy, xx)
-        jac = psf.jac_var_sigma(r.theta, yy, xx).reshape(-1, len(r.theta))
+        h, w = case["h"], case["w"]
+        data = np.ascontiguousarray(case["data"], dtype=float)
+        theta, i_div, fit_f, _, converged, _ = rs.lmcl_fit_var_sigma(
+            np.asarray(case["theta0"], float), h, w, data, np.zeros((h, w)),
+            np.asarray(case["lower"], float), np.asarray(case["upper"], float),
+            100)
+        # No worse than the retired Python reference's optimum.
+        assert i_div <= case["ml"]["I"] + 1e-6
+        yy, xx = np.mgrid[:h, :w].astype(float)
+        model = psf.model_var_sigma(theta, yy, xx)
+        jac = psf.jac_var_sigma(theta, yy, xx).reshape(-1, len(theta))
         fisher = jac.T @ (jac / model.reshape(-1, 1))
-        grad = jac.T @ (1 - np.asarray(case["data"]).ravel() / model.ravel())
-        np.testing.assert_allclose(r.F, fisher, rtol=1e-10, atol=1e-10)
-        assert r.I == pytest.approx(lmga.i_divergence(case["data"], model),
-                                    rel=0, abs=1e-10)
-        if r.converged:
-            room = np.where(grad >= 0, r.theta - case["lower"],
-                            case["upper"] - r.theta)
+        grad = jac.T @ (1 - data.ravel() / model.ravel())
+        np.testing.assert_allclose(fit_f, fisher, rtol=1e-10, atol=1e-10)
+        assert i_div == pytest.approx(_i_divergence(data, model), rel=0,
+                                      abs=1e-10)
+        if converged:
+            room = np.where(grad >= 0, theta - case["lower"],
+                            case["upper"] - theta)
             score = np.max(np.abs(grad) * np.minimum(room, 1 / np.sqrt(np.diag(fisher))))
             assert score <= np.sqrt(2e-8) * (1 + 1e-6)
 

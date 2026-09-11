@@ -1,9 +1,11 @@
 //! Box-local localization: in each box, the best fit the data support wins.
 //!
-//! Ports `box.py::localize_boxes`, which stays the reference and holds the
-//! measurements behind every constant here. The port is held to statistical
-//! parity with it, not to its trajectory: same decisions on the referee
-//! cells to within seed noise, and on real frames the same count to 1%.
+//! Ported from the Python reference `box.localize_boxes`, retired on
+//! 2026-09-11 (last present in commit `ea6b17f`, `src/spotsolve/deprecated/`).
+//! At retirement the two agreed exactly -- counts, recall and precision -- on
+//! the referee cells and on both real 256x256 frames. The measurements that
+//! set each constant are recorded beside it; the ones that shaped the design
+//! as a whole are below.
 //!
 //! ```text
 //! d_e      (raw - offset) / gain + read_noise^2             shifted Poisson
@@ -18,6 +20,103 @@
 //!     BACKWARD  (K >= 2) drop the cheapest emitter while it costs < ADD_NATS
 //! POLISH   block-Jacobi refits at fixed N until nothing moves
 //! ```
+//!
+//! Each emitter is decided in the box that owns it, by one comparison rule.
+//! There is no split move, no separate removal pass, no forced-removal
+//! threshold, no conditioning guard and no width prior: a collapsed or
+//! redundant emitter explains almost no deviance, so it cannot pay
+//! `ADD_NATS` on the way in and costs almost nothing on the way out.
+//!
+//! # The gain is a dispersion parameter, not a scale
+//!
+//! Everything here works in photoelectrons, `d_e = (adu - offset) / g`; the
+//! Poisson weighting `W = 1/m` is only valid there. Three exact identities
+//! (verified numerically to machine precision):
+//!
+//! * the I-divergence is homogeneous, `I(d/g, m/g) = I(d, m) / g`;
+//! * so the FIT does not depend on `g`: positions are invariant and
+//!   amplitudes scale as `1/g`. Measured over g = 1..50, positions agreed
+//!   to 7e-7 px and amplitudes to 7e-7 relative;
+//! * `log|F| = (1 - K) log g + log|F_ADU|`.
+//!
+//! The whole gain dependence of the decision -- keep an emitter iff `I`
+//! falls by more than `ADD_NATS` -- is the `1/g` on the data term:
+//! `dI_ADU / g > ADD_NATS`. The gain moves that threshold and nothing else.
+//! It is a property of the CAMERA, not of the field: measure it once and
+//! pass it in. [`estimate_gain`] is the fallback.
+//!
+//! # Read noise: the shifted-Poisson approximation
+//!
+//! A pixel's variance is `m + sigma_r^2`, not `m`. Adding `s = sigma_r^2`
+//! (e-^2) to both data and model gives a Poisson likelihood with exactly
+//! that variance and mean `m + s`. Here it is a shift of `d_e` alone
+//! ([`localize_raw`]): every box carries a free constant background, which
+//! absorbs `s`, and FIND's `sqrt(model)` normalization then divides by the
+//! right standard deviation. The caller takes `s` back off the reported
+//! background and model.
+//!
+//! Without it, at low background a read-noise spike reads as a significant
+//! single-pixel source. Measured 2026-09-10 on 64x64 `simulate` frames with
+//! Gaussian read noise added: false detections per frame on EMPTY frames (six
+//! seeds), then recall / precision at density 0.015, flux U(150, 500) e-
+//! (three seeds):
+//!
+//! ```text
+//! bg e-  sigma_r   empty: Poisson  shifted    Poisson        shifted
+//!  1.0     1.6             1.2       0.0     .837 .937      .830 .983
+//!  1.0     2.5            13.3       0.0     .823 .811      .823 .983
+//!  3.0     2.5             5.7       0.0     .837 .922      .816 .975
+//! 10.0     2.5             0.5       0.0     .773 .965      .730 .963
+//! ```
+//!
+//! With no read noise the two are the same pipeline. The recall the shifted
+//! model gives up where `sigma_r^2` rivals the background is not yet traced
+//! to individual emitters.
+//!
+//! # Background: a smooth map, not a plane
+//!
+//! [`background_map`], a masked 25 px local mean, is each box's known shape,
+//! with the box's level free. It was chosen over a plane per box (level and
+//! slopes free) and over a free constant alone. Measured 2026-09-11 on the
+//! referee frames (64x64, flux U(900, 1900) e-, bg 20 e-, seeds 17-19),
+//! recall / precision / invented per frame. Haze `L, H` is white noise
+//! Gaussian-filtered at L px, scaled to span [0, H] e-:
+//!
+//! ```text
+//! cell               constant           plane              map
+//! flat  0.015 0.4    .702 .980  0.7     .660 .949  1.7     .695 .970  1.0
+//! flat  0.055 0.4    .424 .855 12.3     .426 .856 12.3     .438 .873 11.0
+//! haze  L15 H60      .701 .957  3.3     .707 .978  1.7     .729 .992  0.7
+//! haze  L5  H60      .682 .952  3.7     .670 .960  3.0     .704 .966  2.7
+//! haze  L15 H20      .710 .983  1.3     .698 .978  1.7     .698 .961  3.0
+//! ```
+//!
+//! The plane's two extra parameters cost sparse fields; the map costs no fit
+//! parameters or time. Weak haze (H20) is the map's one worse cell, by 3-6
+//! events over three frames. Re-estimating the map from the fitted emitters
+//! after the first sweep moved nothing beyond seed noise. A per-pixel
+//! likelihood mask and a rank-opening haze map were also measured and
+//! rejected.
+//!
+//! # No width prior
+//!
+//! Every fit is a plain ML fit over the width bounds `slack`. The retired
+//! `detect` pipeline's MAP width penalty pulled every width toward sigma0; in
+//! this search that leaves the wings of a broad emitter unexplained, and the
+//! next placement lands on them as a faint satellite. Removing it, six frames
+//! per cell, recall / precision / tiles per frame:
+//!
+//! ```text
+//! density spread     MAP width           flat width
+//!  0.015   0.4    .876 .893  3.3    .866 .940  1.7
+//!  0.034   0.2    .825 .929  5.7    .813 .949  4.2
+//!  0.034   0.4    .783 .823 11.5    .776 .858  9.0
+//!  0.055   0.2    .745 .908 10.3    .737 .941  6.7
+//! ```
+//!
+//! Widths always float. A fixed-width mode was measured and rejected on
+//! 2026-09-11: it tiled haze and defocused spots, inventing 8-33 spots per
+//! 64x64 frame against 0.7-7 with fitted widths.
 //!
 //! # Where Python spent the time, and why this module exists
 //!
@@ -39,46 +138,212 @@ use crate::render;
 use crate::statistics;
 
 /// Widths a fit may take, as multiples of `sigma`: the MODEL SPACE.
-/// `core.SIGMA_SLACK`, whose note records the measurement.
+///
+/// The model space has to cover every photon on the sensor, or the light it
+/// cannot represent gets tiled: a fixed-sigma model meets anything out of
+/// focus with two narrow Gaussians, which genuinely do fit a wide blob better
+/// than one. Measured on a confocal simulation with emitters uniform in
+/// +/- 0.5 um, at 1 emitter/um^2 the fixed-sigma search returned 7.2 extra
+/// detections per frame against 13.4 in-focus emitters, every one within
+/// 3 sigma(z) of a real emitter.
+///
+/// `SLACK.0` sits below `BAND.0` so that a broken fit -- nothing images
+/// narrower than the PSF -- reveals itself instead of being clipped to the
+/// bound and reported. The upper edge, measured under the retired `detect`
+/// (moderate arm, 6 frames, band fixed at (0.8, 2.0)):
+///
+/// ```text
+///  hi    recall   med err    RMSE   rsd z   |z|>3   tiles
+/// 2.2     92.6%     0.076   0.220    1.25    7.0%    2.33
+/// 2.6     91.1%     0.078   0.201    1.31    8.0%    2.33
+/// 3.2     90.8%     0.078   0.183    1.27    8.7%    4.00
+/// 4.0     90.5%     0.078   0.194    1.32    8.1%    2.50
+/// ```
+///
+/// Recall falls monotonically past 2.2: a larger model space buys better
+/// parameters for the objects it keeps and swallows close neighbours. The box
+/// search re-measured it: a bound of 4-6 sigma lost 3-5 recall points under
+/// haze and, on a GEM frame, swallowed emitters (N 440 -> 271). 2.2 stands.
 pub const SLACK: (f64, f64) = (0.70, 2.2);
 /// Widths reported as detections, as multiples of `sigma`: the REPORTING
-/// BAND. `core.FOCUS_BAND`.
+/// BAND, a downstream contract about what the caller is handed. Its upper
+/// edge is how far out of focus an emitter may still be reported: a point
+/// source images at 1.26x the in-focus width at |z| = 0.25 um, 1.95x at 0.35
+/// and 3.2x at 0.50, so 2.0 is |z| < ~0.36 um.
 pub const BAND: (f64, f64) = (0.80, 2.0);
 /// Most emitters one box fits jointly. `patches::K_MAX`.
 pub const K_MAX: usize = crate::patches::K_MAX;
 
-/// Nats of I-divergence an emitter must explain to exist. `box.ADD_NATS`.
+/// Nats of I-divergence an emitter must explain to exist: the whole decision
+/// rule.
+///
+/// Measured 2026-09-10 by replacing every Laplace Bayes factor in the
+/// retired `detect` with `dI - c` (its conditioning guard, prune threshold
+/// and MAP width fit unchanged), 64x64 `simulate` fields, three seeds per
+/// cell, recall / precision / tiles per frame:
+///
+/// ```text
+/// density spread     Laplace BF          c = 10            c = 14
+///  0.015   0.4    .888 .920  2.3    .888 .938  2.0    .898 .969  1.0
+///  0.034   0.4    .832 .807 13.3    .815 .868  8.3    .805 .899  6.0
+///  0.055   0.4    .721 .797 20.0    .704 .833 15.3    .688 .867 11.3
+/// ```
+///
+/// c = 10 matched the Bayes factor within seed noise in all six cells; c = 14
+/// trades 2-3 recall points for about half the tiles. The Bayes factor's
+/// priors, log-determinants and empirical-Bayes rates were an operating point.
 pub const ADD_NATS: f64 = 10.0;
 /// sigma. A box places only on pixels this near one of its own candidates,
-/// and nearer to its own than to any other. `box.OWN_RADIUS`.
+/// and nearer to its own than to any other box's. The nearest-candidate rule
+/// stops two boxes claiming the same light; the radius stops a box reaching
+/// across empty space. Measured on six 64x64 frames at density 0.034, spread
+/// 0.2 (one sweep, MAP widths):
+///
+/// ```text
+/// radius    recall   prec   tiles/frame
+///   2.0     .783     .890      8.2
+///   3.0     .823     .886      8.8
+///   4.0     .842     .868     10.8
+///   inf     .844     .863     11.2
+/// ```
+///
+/// At 2.0 a partner 2-3 sigma from the candidate it hides behind was outside
+/// the box's reach -- those pairs were 31 of the misses, against 3 for
+/// `detect`. Past 3.0 recall rises about as fast as tiles do.
 pub const OWN_RADIUS: f64 = 3.0;
-/// Passes over every box. `box.SWEEPS`.
+/// Passes over every box. A box decides against its neighbours in the halo,
+/// and on the first sweep an undecided neighbour is only its FIND seed. A
+/// mismatched seed leaves light the current box claims, and the neighbour's
+/// source ends up split across two boxes. The second sweep re-decides every
+/// box from K = 0 against neighbours that have all been fitted. Same six
+/// frames as `OWN_RADIUS`:
+///
+/// ```text
+/// sweeps    recall   prec   tiles/frame   search+polish fits
+///   1       .823     .886      8.8             504
+///   2       .821     .927      5.8             725
+///   3       .827     .935      5.5             942
+/// ```
 pub const SWEEPS: usize = 2;
-/// `box.FIT_TOL_OBJ`, `box.FIT_MAX_ITER`.
+/// nats. A search fit only has to resolve `dI` against `ADD_NATS`. Measured
+/// 2026-09-11 against 1e-8 and 1e-4 on the eight referee cells (flat and
+/// haze, three seeds): recall and precision agreed to within one emitter per
+/// cell at all three. On the real frames, 1e-8 moved positions by 0.006 px
+/// (glycerol f0) and 0.036 px (GEM f0), and 1e-4 by 0.03-0.04 px.
 pub const FIT_TOL_OBJ: f64 = 1e-6;
 pub const FIT_MAX_ITER: usize = 100;
-/// `core.REFINE_SWEEPS`, `REFINE_MAX_ITER`, `REFINE_TOL_OBJ`, `REFINE_TOL` (px).
+/// Most sweeps of the polish; see `polish` for why the queue does not
+/// drain on its own.
 pub const POLISH_SWEEPS: usize = 4;
+/// LM iterations one polish fit may take. A BUDGET, not a convergence
+/// criterion.
+///
+/// A few groups per frame never converge: they are not stalled -- they keep
+/// taking accepted steps to the cap -- because they are descending a
+/// direction the data carries almost no information about. At 256x256 they
+/// are ~1% of emitters and 10-19% of the polish's LM iterations, and they are
+/// NOT disposable: 36 of 38 of their emitters survive to the output. What
+/// that descent is worth is boundable: a decrease of `t` nats moves a
+/// parameter about `sqrt(2t)` standard errors, and each iteration continues
+/// only while it predicts more than `POLISH_TOL_OBJ`. Measured under the
+/// retired `detect` at 256x256, against the same fit run to 400 iterations:
+///
+/// ```text
+///   max_iter   frame s        N   audit   max |dpos|/SE
+///         25      7.24     3166   clean          0.0820
+///         50      7.80     3166   clean          0.0023   <- here
+///        100      8.19     3168   clean          0.0006
+///        200      8.73     3169   clean          0.0077
+///        400      9.00     3168   clean          0.0006
+/// ```
+///
+/// N wanders by +-3 at EVERY budget, 400 included: the usual churn at
+/// marginal decisions, not a signal. 50 is where the agreement band is
+/// tightest for the least work; on a sweep with no stuck group it is
+/// bit-identical to a budget of 4000.
 pub const POLISH_MAX_ITER: usize = 50;
+/// nats of predicted decrease. Near the optimum
+/// `I(t) ~ I_min + 0.5 dt' F dt`, so stopping at a predicted decrease of
+/// `tol` leaves a parameter about `sqrt(2 tol)` standard errors short.
+/// Measured under the retired `detect` (256 px, N = 3169, Python-vs-Rust
+/// band in SE):
+///
+/// ```text
+///   tol_obj    frame s        N     max |dpos|/SE
+///     1e-8        9.78     3169            0.0010
+///     1e-6        8.66     3169            0.0015   <- here
+///     1e-5        7.68     3168            0.1466
+///     1e-4        7.08     3161            0.2828
+/// ```
+///
+/// 1e-6 is the last value that leaves N and the agreement band where 1e-8
+/// does.
 pub const POLISH_TOL_OBJ: f64 = 1e-6;
+/// px. An emitter that moved less than this in a polish sweep does not
+/// dirty the groups that read it.
 pub const POLISH_MOVE_TOL: f64 = 1e-3;
-/// `core.BG_KERNEL`, `BG_FLOOR`, `BG_MASK_RADIUS`, `BG_MIN_PIXELS`.
+/// Side, px, of the window [`background_map`] averages over.
 pub const BG_KERNEL: usize = 25;
+/// e-. `W = 1/m` is singular at `m = 0`; this is far below one photoelectron.
 pub const BG_FLOOR: f64 = 1e-3;
+/// sigma. Emitter support excluded from the background estimate.
 pub const BG_MASK_RADIUS: f64 = 3.0;
+/// Unmasked pixels a window needs before its local mean is believed.
 pub const BG_MIN_PIXELS: f64 = 25.0;
-/// `calibrate.SEED_ALPHA`: FIND's family-wise false-seed rate per frame.
+/// FIND's family-wise false-seed rate per frame, and the only free number in
+/// [`seed_threshold`].
+///
+/// It can be this loose because FIND IS A SEEDER, NOT A DECISION RULE: every
+/// candidate still has to lower its box's deviance by `ADD_NATS`, and every
+/// placement inside a box passes this same test, so a spurious seed costs
+/// runtime rather than a detection. An over-tight seed costs what cannot be
+/// recovered -- a box never forms around light FIND did not seed.
+///
+/// Measured under the retired `detect`, whose ADD step played the same role:
+/// the historical cut at alpha ~ 2e-8 missed faint emitters that a looser
+/// seed found (peak SNR 1.1: recall 23.1% against 65.8% at a 10x lower
+/// threshold), while at alpha = 0.05 the decision rule, not the seed, did the
+/// rejecting. The derived cut is a LOWER bound on the seeder's conservatism:
+/// the LoG response is standard normal only where the model is right, and on
+/// frames with model mismatch the effective test count is larger than the
+/// pixel geometry says.
 pub const SEED_ALPHA: f64 = 0.05;
-/// `core.A_MIN` and `core.A_MIN_REL`: the amplitude floor of a fit.
+/// The amplitude floor of a fit: `max(A_MIN, A_MIN_REL * A_max)`, with
+/// `A_max` the window's own amplitude bound. `A_MIN` is only a backstop for a
+/// window whose `A_max` is itself tiny.
+///
+/// The floor has to be relative because what it protects is a RATIO. An
+/// emitter's position block of the Fisher matrix scales as `A^2`, so at bead
+/// fluxes of ~2000 e- an amplitude of 1e-4 puts those entries at ~5.7e-12
+/// against a largest diagonal of ~768 -- a ratio of 3e-14, about 130x float64
+/// epsilon. There the LM step along that direction is unbounded: traced on
+/// such a patch, the fit predicted a 5.2e4 nat decrease, delivered 1.05e-3,
+/// and crawled for 3000+ iterations still 364 nats above the optimum.
+/// Smallest over largest `diag(F)` with a second emitter parked at the floor:
+///
+/// ```text
+///   floor / A_max     min/max diag(F)
+///     0 (1e-4 abs)        3.0e-14      <- float64 noise
+///         1e-6            6.4e-10
+///         1e-4            4.8e-07      (saturates; a different parameter
+///         3e-3            4.8e-07       becomes the smallest)
+/// ```
+///
+/// 1e-6 buys six orders of margin over epsilon while remaining physically
+/// negligible -- on a bead patch, a floor of ~0.02 e- of total flux. A larger
+/// floor would start to decide how faint an emitter may be, and that decision
+/// belongs to the search, not to a numerical guard.
 pub const A_MIN: f64 = 1e-4;
 pub const A_MIN_REL: f64 = 1e-6;
 /// sigma. An out-of-band fit this near the frame border is `Edge`, not a
-/// width flag. `box.EDGE_MARGIN`.
+/// width flag. On beads_60x_still (in-focus beads on the coverslip, sigma0
+/// 1.0 px) the fits the border cut off sat 0-0.5 px from it; the two narrow
+/// interior fits sat 1.9 px and further in.
 pub const EDGE_MARGIN: f64 = 1.0;
-/// `calibrate.estimate_gain`'s share of dimmest pixels.
+/// [`estimate_gain`]'s share of dimmest pixels; see its note.
 pub const GAIN_FRAC: f64 = 0.2;
 
-/// What a fitted emitter is reported as. `box._result`'s rule.
+/// What a fitted emitter is reported as, by [`classify`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
 pub enum Class {
@@ -159,9 +424,13 @@ impl Default for Workspace {
     }
 }
 
-/// FIND's seed cut, `calibrate.seed_threshold`: the Bonferroni cut at a
-/// family-wise rate `alpha` over the frame's independent LoG maxima, one per
-/// `(2*ceil(sigma)+1)^2` pixels.
+/// FIND's seed cut in sd of the LoG null, derived rather than carried: the
+/// Bonferroni cut `Phi^-1(1 - alpha/n)` at a family-wise rate `alpha` over the
+/// frame's `n` independent LoG maxima, one per `(2*ceil(sigma)+1)^2` pixels
+/// (the local-maximum window of [`find_candidates`]).
+///
+/// So it scales with the frame and the PSF, which a constant cannot: 3.70 on
+/// 64^2 at sigma 0.818, 4.43 on 512^2 at sigma 1.45.
 pub fn seed_threshold(h: usize, w: usize, sigma: f64, alpha: f64) -> f64 {
     let win = (2 * sigma.ceil() as usize + 1) as f64;
     let n = (h as f64 * w as f64 / (win * win)).max(1.0);
@@ -184,13 +453,32 @@ pub fn percentile(v: &[f64], q: f64) -> f64 {
     quantile(v, q / 100.0)
 }
 
-/// Photon-transfer gain from the dimmest pixels, ADU per photoelectron:
-/// `calibrate.estimate_gain`, whose docstring records where it fails (crowded
-/// fields; it does not transfer between fields). Prefer a measured gain.
+/// Photon-transfer gain from the dimmest pixels, ADU per photoelectron. Needs
+/// no emitter model and no camera calibration. Prefer a measured gain.
 ///
 /// On emitter-free pixels `Var = gain * (mean - offset)`, so a high-pass
 /// variance over the mean is the gain. Background is chosen on a 3x3-smoothed
-/// copy, because choosing the dimmest RAW pixels selects on their own noise.
+/// copy, because choosing the dimmest RAW pixels selects on their own noise,
+/// biasing the mean down and the gain up. `GAIN_FRAC` is small: across
+/// synthetic fields the dimmest 20% gives 1.00, 2.03, 4.69, 10.02 against a
+/// true 1, 2, 4.7, 10, while 0.4 and 0.6 drift high as density rises because
+/// PSF tails leak into the selection.
+///
+/// KNOWN LIMIT -- it fails at high density. The same leak reaches 0.2
+/// eventually: on a bead-matched field at 0.055 emitters/px^2 this returns
+/// 12.5 against a true 4.23, because even the dimmest fifth of the image sits
+/// on PSF tails. Everything downstream inherits it, and a residual-based
+/// correction cannot rescue it: the bias is baked into the units the residual
+/// is measured in.
+///
+/// SECOND KNOWN LIMIT -- it does not transfer between fields. On the two
+/// real bead frames it returns 4.23 and 2.94, though both were taken on the
+/// same camera. The fitted bead amplitudes agree across the two at 4.23
+/// (median 939 vs 933 e-), which they could not if the gain were off by 1.4x
+/// on one of them.
+///
+/// It runs BEFORE any search: a gain read off the fitted residual arrives
+/// after the search has already run with the wrong data term.
 pub fn estimate_gain(raw: &[f64], h: usize, w: usize, offset: f64) -> f64 {
     if w < 5 {
         return 1.0;
@@ -221,9 +509,10 @@ pub fn estimate_gain(raw: &[f64], h: usize, w: usize, offset: f64) -> f64 {
     (var / m).clamp(0.05, 200.0)
 }
 
-/// Each emitter's [`Class`], by `box._result`'s rule: in the band it is a
-/// detection; out of it, near the border it is `Edge`, else `Narrow` or
-/// `Wide` by which side of the band it fell.
+/// Each emitter's [`Class`]: in the band it is a detection; out of it, near
+/// the border it is `Edge`, else `Narrow` or `Wide` by which side of the band
+/// it fell. A source the border cuts is not an interior width measurement,
+/// so a width flag always means an interior fit.
 pub fn classify(pos: &[f64], sig: &[f64], h: usize, w: usize, sigma: f64, band: Option<(f64, f64)>) -> Vec<Class> {
     (0..sig.len())
         .map(|k| {
@@ -262,8 +551,17 @@ fn median(v: &[f64]) -> f64 {
 }
 
 /// FIND against a flat `level`: LoG peaks of the variance-normalized
-/// residual above `threshold`, brightest first. `core.find_candidates` with
-/// no committed emitters. Returns `(pos 2N, amp, strength)`.
+/// residual above `threshold`, brightest first. Returns
+/// `(pos 2N, amp, strength)`.
+///
+/// Two normalizations, doing different jobs. Dividing by `sqrt(level)`
+/// before the filter makes one threshold valid across the FRAME: under
+/// Poisson noise the residual's scale is the square root of the mean.
+/// Dividing by [`filters::log_kernel_l2`] after it makes one threshold valid
+/// across SIGMA: the filter's null sd is its kernel's L2 norm, which scales
+/// as sigma^-3, so without it one number is a 1.8-sigma cut at sigma 0.8 and
+/// a 100-sigma cut at sigma 3.0. `threshold` is therefore a count of standard
+/// deviations.
 pub fn find_candidates(
     d: &[f64],
     h: usize,
@@ -299,9 +597,25 @@ pub fn find_candidates(
     (pos, amp, strength)
 }
 
-/// `core.background_map`: a local mean over the pixels no candidate reaches,
-/// taken twice with a one-sided clip between, then smoothed. Windows with
-/// too few free pixels take `calibrate.robust_background`'s scalar.
+/// The smooth background surface, in photoelectrons: a local mean over the
+/// pixels no candidate reaches, taken twice with a one-sided clip between,
+/// then smoothed.
+///
+/// Estimated from masked DATA, never from the PSF-subtracted residual: that
+/// route is a feedback loop, because emitters that have absorbed background
+/// depress the residual, the surface follows them down, and they must absorb
+/// more. An undetected emitter is not masked, so the clip removes the upper
+/// tail only; its contamination is always positive, and clipping both tails
+/// biases the estimate down.
+///
+/// Windows with fewer than `BG_MIN_PIXELS` free pixels take one frame-wide
+/// scalar: at high density that is most of them, and the surface degrades to
+/// a scalar rather than to an average over four pixels. The scalar is the
+/// median of the free pixels, falling back to the 10th percentile when too
+/// few are free. Neither alone serves both regimes: the image median is no
+/// background on a crowded field (99 ADU against a true 12-19 on
+/// beads_60x_still), and a low quantile is none on a sparse one (9.7 against
+/// a true 20 on an emitter-free frame).
 pub fn background_map(d: &[f64], h: usize, w: usize, cand: &[f64], sigma: f64) -> Vec<f64> {
     let n = cand.len() / 2;
     let mut k = BG_KERNEL.min(3usize.max(h.min(w) / 3));
@@ -347,6 +661,13 @@ pub fn background_map(d: &[f64], h: usize, w: usize, cand: &[f64], sigma: f64) -
 type Em = [f64; 4];
 
 /// A window's pixels and the parameter-free part of its model.
+///
+/// The background map enters split into a free `level` (its median here,
+/// where the fit's `b` starts) and a known `shape`, added like a frozen
+/// emitter. The split keeps `b` strictly interior: folding the whole surface
+/// into the known term would leave `b` wanting to be 0, its lower bound, and
+/// Coleman-Li collapses every coordinate's step when one parameter sits on a
+/// bound (see [`lmcl`]).
 struct Window {
     y0: usize,
     x0: usize,
@@ -412,8 +733,15 @@ struct Fitted {
     em: Vec<Em>,
 }
 
-/// `core._fit_any`'s free-width branch: bounds from the window's peak, the
-/// start pulled 1e-9 inside them, one bounded ML fit.
+/// One bounded free-width ML fit: bounds from the window's peak, the start
+/// pulled 1e-9 inside them.
+///
+/// `a_max` is raised by `slack.1^2`: it comes from the window's peak through
+/// `peak_factor(sigma)`, and a source `n` times the PSF width carries the
+/// same flux at `1/n^2` of the peak, so the in-focus bound would clip exactly
+/// the defocused emitters the slack exists for. Positions stay inside the
+/// window: letting a centre leave it was tried -- it lets the fit put rim
+/// flux where it came from -- and measurably lost real detections elsewhere.
 fn fit_window(
     ws: &mut Workspace,
     win: &Window,
@@ -471,11 +799,16 @@ fn fit_window(
 }
 
 /// `(y, x, A0)` of the strongest owned peak of the fit's normalized residual
-/// that passes FIND's own test, or `None`. `_Search.placement`: the test is
-/// what makes ADD_NATS mean what it was measured to mean.
+/// that passes FIND's own test, or `None`.
+///
+/// The test is not optional. The deviance of the best of many placements is
+/// a maximum over positions, and `ADD_NATS` was measured only on placements
+/// FIND had already screened; without the screen every bright emitter
+/// collected faint satellites on its wings (130 emitters for 107 true on
+/// seed 17, precision 0.74).
 ///
 /// The tests here and in [`search_box`] are written `!(a > b)` on purpose: a
-/// NaN must fail them, as `not a > b` does in the reference.
+/// NaN must fail them.
 #[allow(clippy::neg_cmp_op_on_partial_ord)]
 fn placement(
     ws: &mut Workspace,
@@ -518,8 +851,8 @@ fn placement(
 }
 
 /// One box decided from K = 0: FORWARD placements while each pays ADD_NATS,
-/// then BACKWARD removals while one costs less. `_Search.run`. Returns the
-/// box's emitters (local) and the fits spent.
+/// then BACKWARD removals while one costs less. Returns the box's emitters
+/// (local) and the fits spent.
 #[allow(clippy::neg_cmp_op_on_partial_ord)]
 fn search_box(
     ws: &mut Workspace,
@@ -544,6 +877,7 @@ fn search_box(
         state = trial;
     }
     // Not at K = 1: that removal is the K = 0 fit FORWARD already beat.
+    // Measured: output bit-identical, 11-25% fewer fits.
     while state.em.len() > 1 {
         let mut best: Option<Fitted> = None;
         for drop in 0..state.em.len() {
@@ -634,7 +968,8 @@ pub fn localize(
     let nc = camp.len();
     let mut boxes = patches::build_patches(&cand, nc, s.sigma, h, w, s.k_max);
     // Brightest first, so the strongest light is already fitted when its
-    // neighbours read it through their halos. Stable, as `list.sort` is.
+    // neighbours read it through their halos. Stable, so ties keep FIND's
+    // order.
     let peak = |p: &patches::Patch| {
         p.indices
             .iter()
@@ -647,7 +982,7 @@ pub fn localize(
     // Once per frame: each box's pixels, ownership and the boxes that can
     // reach it. A held emitter stays inside its own box's fit bounds, within
     // half a pixel of the rectangle, at a width of at most slack.1 * sigma;
-    // `_near_rect` then admits it only within HALO_FACTOR widths of this
+    // the halo then admits it only within HALO_FACTOR widths of this
     // box's pixel rectangle. Boxes farther than that can never contribute.
     let grid = EmitterGrid::build(&cand, nc, h, w, (OWN_RADIUS * s.sigma).max(1.0));
     let mut near = Vec::new();
@@ -752,9 +1087,27 @@ pub fn localize(
     }
 }
 
-/// Block-Jacobi refits at fixed N until nothing moves: `core.refine` with free
-/// widths. Every patch in a sweep reads the sweep's INPUT state, and a patch
-/// none of whose free or frozen emitters moved last sweep is skipped.
+/// Block-Jacobi refits at fixed N until nothing moves, with free widths, and
+/// per-emitter CRLBs from the Fisher matrix of the fit whose parameters are
+/// reported.
+///
+/// Jacobi, not Gauss-Seidel: every patch in a sweep reads the sweep's INPUT
+/// state, so the answer does not depend on visit order. Iterated, not run
+/// once: each patch holds its neighbours frozen where it was handed them, so
+/// one pass propagates their staleness. Measured on isolated emitters at
+/// density 0.055, a 0.5 px error in the NEIGHBOURS alone (target started at
+/// truth) takes the pull sd from 0.96 to 1.98; sweeping recovers it to 1.27.
+/// The patches are rebuilt each sweep, which refreshes the halo -- so the map
+/// is not continuous, and a fixed point need not exist (PORTING_NOTES 20).
+///
+/// Scheduled group-wise: a patch none of whose free or frozen emitters moved
+/// more than `POLISH_MOVE_TOL` last sweep is skipped. It replaces a global
+/// `max |dpos| < tol` break that could not fire (on a 906-emitter frame, 80%
+/// of emitters still moved past it after eight sweeps). Do not expect the
+/// queue to drain on a crowded field either: halos overlap and dirtiness
+/// percolates from a few degenerate groups, collapsed pairs 0.001 px apart
+/// that never converge. Neither Gauss-Seidel nor pinning the decomposition
+/// fixes that (both measured), so `POLISH_SWEEPS` bounds it.
 #[allow(clippy::too_many_arguments)]
 fn polish(
     d: &[f64],
@@ -916,9 +1269,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn seed_threshold_matches_the_reference_values() {
-        // `calibrate.seed_threshold`'s docstring: 3.70 on 64^2 at sigma
-        // 0.818, 4.43 on 512^2 at sigma 1.45.
+    fn seed_threshold_matches_the_documented_values() {
+        // [`seed_threshold`]'s note: 3.70 on 64^2 at sigma 0.818, 4.43 on
+        // 512^2 at sigma 1.45.
         assert!((seed_threshold(64, 64, 0.818, SEED_ALPHA) - 3.70).abs() < 5e-3);
         assert!((seed_threshold(512, 512, 1.45, SEED_ALPHA) - 4.43).abs() < 5e-3);
     }

@@ -136,7 +136,7 @@ if __name__ == "__main__":
                     help="which frame, if the file is a stack")
     ap.add_argument("--sigma", type=float, default=1.2)
     ap.add_argument("--gain", type=float, default=4.23,
-                    help="ADU per photoelectron; omit to estimate (calibrate.py)")
+                    help="ADU per photoelectron")
     ap.add_argument("--read-noise", type=float, default=0.0,
                     help="camera read noise, e- rms")
     ap.add_argument("--k-max", type=int, default=12)

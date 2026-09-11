@@ -8,7 +8,8 @@ Model
 
 A_k is TOTAL FLUX: the pixel-integrated Gaussian sums to A over all pixels,
 so a peak-height guess must be divided by `peak_factor(sigma)` to become an
-A. See structs.py for the full theta layout.
+A. `theta` is `[b, A_0, y_0, x_0, ...]`, with a fourth entry per emitter,
+its own sigma, in the `_var_sigma` layout (`pack_var_sigma`).
 
 Why numpy and not JAX
 ---------------------

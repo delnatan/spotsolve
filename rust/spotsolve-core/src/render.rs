@@ -1,7 +1,14 @@
 //! Rendering emitters into images, and the mask of pixels no emitter reaches.
 //!
-//! Ports `calibrate.py::render_model` and the masking loop of
-//! `core.py::background_map` and `calibrate.py::robust_background`.
+//! Ported from the retired Python reference's `calibrate.render_model` and
+//! the masking loop of its `background_map`.
+//!
+//! Contributions from overlapping emitters ADD, which is what the physics says
+//! and what every patch fit assumes locally. (An early version stitched
+//! per-patch models by AVERAGING them where boxes overlapped and filled
+//! patch-free pixels with the image median; that produced block artifacts, a
+//! systematically high model and a residual with median -3 in normalized
+//! units.)
 //!
 //! # Why the mask is stamped
 //!
@@ -21,7 +28,7 @@ use crate::psf;
 pub const RENDER_TRUNCATE: f64 = 4.0;
 
 /// The model image: `background` plus every emitter at its own width, each
-/// rendered only within `truncate` of its own sigma. `calibrate.render_model`.
+/// rendered only within `truncate` of its own sigma.
 #[allow(clippy::too_many_arguments)]
 pub fn render_model(
     pos: &[f64],

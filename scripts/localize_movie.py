@@ -39,8 +39,10 @@ from spotsolve import loctable
 
 # The hyp7gem crop, and the acquisition it was cut from. Pixel size and frame
 # interval come from the source .nd2 (65 nm, 20.005 ms); sigma and gain are
-# the values calibrated for this dataset in README sections 10b and 13.
-DEFAULT_IMAGE = "/Users/delnatan/Projects/github/sfwloc/data/hyp7gem_wt_crop.tif"
+# the values calibrated for this dataset in sections 10b and 13 of
+# docs/archive/ALGORITHM_HISTORY.md. The crop is not tracked (see .gitignore).
+DEFAULT_IMAGE = str(Path(__file__).resolve().parent.parent
+                    / "data" / "hyp7gem_wt_crop.tif")
 DEFAULT_SIGMA = 1.45      # px
 DEFAULT_GAIN = 2.401      # ADU per photoelectron
 DEFAULT_PIXEL_SIZE = 0.065   # um
@@ -175,7 +177,7 @@ if __name__ == "__main__":
                     help="um per px, for the derived physical columns")
     ap.add_argument("--interval", type=float, default=DEFAULT_INTERVAL,
                     help="seconds per frame")
-    ap.add_argument("--k-max", type=int, default=12)
+    ap.add_argument("--k-max", type=int, default=spotsolve.K_MAX)
     ap.add_argument("--read-noise", type=float, default=0.0,
                     help="camera read noise, e- rms")
     ap.add_argument("--agg-ratio", type=float, default=None,

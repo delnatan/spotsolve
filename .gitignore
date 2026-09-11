@@ -23,9 +23,8 @@ rust/dist/
 # notebooks, and the rendered figures from past runs. Kept on disk because
 # they are worth re-reading; kept out of git because none of it is source and
 # the MATLAB tree alone is ~10 MB of committed binaries (.mex*).
-# Anchored: an unanchored `reference/` also matches at depth, which silently
-# untracked `src/spotsolve/inference/reference/` -- the frozen Python
-# validation oracle for the Rust solver, which IS source.
+# Anchored, so that a source directory named `reference/` deeper in the tree
+# is never silently untracked.
 /reference/
 
 # --- Data and run artifacts ----------------------------------------------
@@ -50,10 +49,8 @@ data/hyp7_locs/
 #     python examples/simulate_spinning_disk_spots.py \
 #         --instrument bc43 --magnification 100 --pixel-size 0.085 \
 #         --size 64 --frames 20 --seed 0 --outdir sim_out
-# `--instrument widefield` builds the bright-out-of-focus arm (README 12).
-# Nothing in the test suite needs it: `04_end_to_end.json` bakes the pixels of
-# the frames it asserts on straight into the fixture, precisely so a reader
-# without this directory can still run the port against it.
+# `--instrument widefield` builds the bright-out-of-focus arm. Nothing in the
+# test suite needs it.
 data/sim_out/
 
 # Figures, logs and scratch. `docs/*.md` is tracked; nothing binary is.
@@ -67,8 +64,6 @@ data/sim_out/
 *.bak
 *.ipynb
 
-# The golden fixtures under tests/fixtures/ ARE tracked (~1.6 MB of JSON):
-# they are the contract the Rust port is tested against, and CI needs them
-# without a Python run. Regenerate with `python scripts/make_fixtures.py`.
-# The retained inference contract also includes one compact array fixture.
-!tests/fixtures/08_inference.npz
+# The golden fixtures under tests/fixtures/ ARE tracked (JSON, so no rule
+# above catches them): they are the contract the Rust layers are tested
+# against. They are frozen -- the Python reference that wrote them is retired.

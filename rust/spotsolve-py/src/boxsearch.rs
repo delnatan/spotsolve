@@ -4,7 +4,7 @@
 //! answer comes back as owned arrays: every fitted emitter with its class
 //! (0 focus, 1 narrow, 2 wide, 3 edge), the background surface, and an
 //! `info` dict of the gain used and the work counts. Python only arranges
-//! these into a `DetectResult`.
+//! these into a `Localizations`.
 
 use numpy::{
     IntoPyArray, PyArray1, PyArray2, PyArrayMethods, PyReadonlyArray1, PyReadonlyArray2,
@@ -185,7 +185,7 @@ fn box_localize_stack<'py>(
 }
 
 /// `background` plus every emitter at its own width, truncated at
-/// `truncate` of its sigma. `calibrate.render_model` with per-emitter widths.
+/// `truncate` of its sigma.
 #[pyfunction]
 #[pyo3(signature = (positions, amplitudes, sigmas, background, truncate=4.0))]
 fn box_render(
@@ -220,25 +220,6 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("BOX_SLACK", bs::SLACK)?;
     m.add("BOX_BAND", bs::BAND)?;
     m.add("BOX_K_MAX", bs::K_MAX)?;
-    // The constants the deprecated Python reference must agree with; the
-    // parity tests assert it, so a drift is a failure, not a difference.
     m.add("BOX_ADD_NATS", bs::ADD_NATS)?;
-    m.add("BOX_OWN_RADIUS", bs::OWN_RADIUS)?;
-    m.add("BOX_SWEEPS", bs::SWEEPS)?;
-    m.add("BOX_FIT_TOL_OBJ", bs::FIT_TOL_OBJ)?;
-    m.add("BOX_FIT_MAX_ITER", bs::FIT_MAX_ITER)?;
-    m.add("BOX_POLISH_SWEEPS", bs::POLISH_SWEEPS)?;
-    m.add("BOX_POLISH_MAX_ITER", bs::POLISH_MAX_ITER)?;
-    m.add("BOX_POLISH_TOL_OBJ", bs::POLISH_TOL_OBJ)?;
-    m.add("BOX_POLISH_MOVE_TOL", bs::POLISH_MOVE_TOL)?;
-    m.add("BOX_BG_KERNEL", bs::BG_KERNEL)?;
-    m.add("BOX_BG_FLOOR", bs::BG_FLOOR)?;
-    m.add("BOX_BG_MASK_RADIUS", bs::BG_MASK_RADIUS)?;
-    m.add("BOX_BG_MIN_PIXELS", bs::BG_MIN_PIXELS)?;
-    m.add("BOX_SEED_ALPHA", bs::SEED_ALPHA)?;
-    m.add("BOX_A_MIN", bs::A_MIN)?;
-    m.add("BOX_A_MIN_REL", bs::A_MIN_REL)?;
-    m.add("BOX_EDGE_MARGIN", bs::EDGE_MARGIN)?;
-    m.add("BOX_GAIN_FRAC", bs::GAIN_FRAC)?;
     Ok(())
 }

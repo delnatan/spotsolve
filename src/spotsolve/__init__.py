@@ -30,9 +30,6 @@ the data.
     loctable      results as `polars` tables
     aggregates    over-bright spots, flagged after the fact
     audit metrics simulate psf                    is the answer any good?
-
-`spotsolve.deprecated` is the Python reference implementation, kept for
-parity tests until the Rust is hardened; nothing above imports it.
 """
 
 from .native import BAND, K_MAX, SLACK, localize, localize_stack  # noqa: F401

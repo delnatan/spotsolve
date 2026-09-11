@@ -1,8 +1,9 @@
-//! Loader for the golden fixtures in `tests/fixtures/*.json`, written by
-//! `scripts/make_fixtures.py`. Every float there is emitted at 17 significant
-//! digits,
-//! so it round-trips f64 exactly and the early layers can be compared bit for
-//! bit (PORTING_NOTES.md section 16).
+//! Loader for the golden fixtures in `tests/fixtures/*.json`. They are
+//! FROZEN: the Python reference and `scripts/make_fixtures.py` that wrote
+//! them were retired on 2026-09-11 (both last present in commit `ea6b17f`).
+//! Every float there is emitted at 17 significant digits, so it round-trips
+//! f64 exactly and the early layers can be compared bit for bit
+//! (PORTING_NOTES.md section 16).
 //!
 //! Port bottom up and assert at each layer. Each fixture's own `compare` field
 //! states how exactly that layer can be reproduced; the layers genuinely
@@ -24,7 +25,7 @@ pub fn load(name: &str) -> Fixture {
         .join(format!("{name}.json"));
     let txt = std::fs::read_to_string(&p).unwrap_or_else(|e| {
         panic!(
-            "cannot read {}: {e}. Run `python scripts/make_fixtures.py` first.",
+            "cannot read {}: {e}. The fixtures are tracked in git; restore them.",
             p.display()
         )
     });
@@ -91,8 +92,8 @@ pub fn mat_at(v: &Value, key: &str) -> (usize, usize, Vec<f64>) {
     (nr, nc, data)
 }
 
-/// JSON has no NaN or Infinity, so `scripts/make_fixtures.py`'s encoder emits them as
-/// the bare strings Python's `json` produces. Accept both.
+/// JSON has no NaN or Infinity, so the fixture encoder wrote them as the bare
+/// strings Python's `json` produces. Accept both.
 fn num(v: &Value) -> f64 {
     if let Some(x) = v.as_f64() {
         return x;

@@ -1,4 +1,5 @@
-//! How closely this optimizer reproduces the Python's converged fits, and how
+//! How closely this optimizer reproduces the retired Python reference's
+//! converged fits (frozen in the `02_lmga` fixture), and how
 //! fast it is. Not a test -- a measurement, so the numbers claimed in the port
 //! notes stay checkable. Run: `cargo run --release --example lmcl_report`.
 

@@ -163,7 +163,6 @@ reported as one.
 ## Development
 
 The detector is `rust/spotsolve-core/src/boxsearch.rs`, bound in
-`rust/spotsolve-py`. `spotsolve.deprecated` is the Python reference
-implementation; `deprecated/box.py` records the measurement behind every
-constant above, and `tests/test_localize.py` holds the Rust to statistical
-parity with it until it is retired. See [docs/README.md](docs/README.md).
+`rust/spotsolve-py`; the measurement behind every constant above is recorded
+beside it there. `tests/test_localize.py` holds it to simulation truth. See
+[docs/README.md](docs/README.md).

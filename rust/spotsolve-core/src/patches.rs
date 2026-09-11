@@ -1,9 +1,9 @@
 //! Decompose a set of emitters into small, jointly-fittable patches, and pick
 //! the window for a single proposal.
 //!
-//! Ports `patches.py` and `core.py::_window`. `cKDTree` + `connected_components`
-//! become an [`EmitterGrid`] query plus union-find [P9]; the answers are the
-//! same partition, and `05_geometry` asserts it.
+//! Ported from the retired Python reference's `patches.py`. Its `cKDTree` +
+//! `connected_components` became an [`EmitterGrid`] query plus union-find
+//! [P9]; the answers are the same partition, and `05_geometry` asserts it.
 //!
 //! # The three radii, and why the halo must be wide
 //!

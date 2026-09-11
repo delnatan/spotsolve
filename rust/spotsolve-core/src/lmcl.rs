@@ -1,6 +1,7 @@
 //! Bounded Levenberg-Marquardt with Coleman-Li affine scaling.
 //!
-//! Ports `lmga.py`. **The name differs deliberately**: `lmga` meant "LM with
+//! Ported from the retired Python reference's `lmga.py` (last present in
+//! `ea6b17f`). **The name differs deliberately**: `lmga` meant "LM with
 //! geodesic acceleration", and the geodesic acceleration was implemented,
 //! measured and removed long ago -- it changed the converged objective by under
 //! 1e-13 on ordinary fits while costing 133 model/Jacobian evaluations per fit
@@ -191,12 +192,19 @@ pub struct FitInfo {
     pub stalled: bool,
 }
 
-/// Tuning, matching `lmga.fit`'s keyword defaults.
+/// Tuning. The defaults are the retired `lmga.fit`'s.
 #[derive(Clone, Copy, Debug)]
 pub struct FitOpts {
     pub max_iter: usize,
     /// Objective resolution, **in nats**: a fit has converged when its
     /// information-scaled projected score is <= sqrt(2*tol_obj).
+    ///
+    /// The only test in units the caller cares about: decisions compare
+    /// I-divergences, so "this fit cannot improve I by more than `tol_obj`"
+    /// is a statement about the decision, not the parameterization. Before
+    /// it existed, with only the absolute `tol_grad` and a step test, 34.5% of
+    /// the 9400 patch fits on a bead-matched 39x39 field exhausted
+    /// `max_iter = 100` and only 62.7% reported convergence.
     pub tol_obj: f64,
     /// Backstop only -- absolute, and the natural scale here is set by fluxes
     /// running to ~2000 electrons, so this is near f64 noise.

@@ -3,9 +3,9 @@
 //! The detector is [`boxsearch`]: in each box, an emitter exists iff it
 //! lowers the Poisson deviance by `ADD_NATS`, and a whole frame -- the gain,
 //! FIND, the background surface, the search, the polish and the
-//! classification -- runs here. Its Python reference is
-//! `spotsolve.deprecated.box`, which holds the measurements behind the
-//! constants.
+//! classification -- runs here, and the measurements behind its constants
+//! are recorded beside them. Its Python reference was retired on 2026-09-11;
+//! it is last present in commit `ea6b17f`, under `src/spotsolve/deprecated/`.
 //!
 //! The rest are the layers it is built from: [`psf`] (the
 //! pixel-integrated Gaussian and its Jacobian), [`lmcl`] (the bounded Poisson
