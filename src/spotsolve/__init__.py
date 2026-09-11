@@ -25,6 +25,14 @@ imported directly when you need them:
     audit metrics simulate                           is the answer any good?
     loctable                                         results as `polars` tables
 
+`localize` and `localize_stack` are the box search (`box.localize_boxes`,
+the reference) run natively: in each box, an emitter exists iff it lowers
+the Poisson deviance by ADD_NATS. `localize_stack` runs a timecourse's frames
+in parallel native threads, and takes the camera's `read_noise` and an `roi`.
+
+    results = spotsolve.localize_stack(movie, sigma=1.27, gain=2.0,
+                                       offset=100.0, read_noise=1.6)
+
 `localize_sparse` is the independent-source counterpart: one Rust candidate
 pass and one bounded fit per peak, with fixed or fitted width. It intentionally
 does not run the dense add/split/prune loop.
@@ -66,6 +74,7 @@ from .structs import (  # noqa: F401
     Patch,
 )
 from .sparse import SparseResult, localize_sparse  # noqa: F401
+from .native import localize, localize_stack  # noqa: F401
 
 # Tuning constants. These are the pipeline's dials and are part of the public
 # surface: `PRUNE_TAU` is its only precision/recall knob, and the Rust backend
@@ -99,6 +108,8 @@ __version__ = "0.1.0"
 
 __all__ = [
     "detect",
+    "localize",
+    "localize_stack",
     "localize_sparse",
     "SparseResult",
     "refine",

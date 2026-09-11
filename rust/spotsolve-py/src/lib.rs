@@ -30,6 +30,7 @@ use spotsolve_core::evidence::{Evidence, Prior};
 use spotsolve_core::passes::{self, Emitters, Frame, Solver};
 use spotsolve_core::{linalg, lmcl, psf, render, sparse};
 
+mod boxsearch;
 mod dense_group;
 mod inference;
 
@@ -701,6 +702,7 @@ fn version() -> &'static str {
 fn spotsolve_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<inference::CalibratedModel>()?;
     dense_group::register(m)?;
+    boxsearch::register(m)?;
     m.add_function(wrap_pyfunction!(add_pass, m)?)?;
     m.add_function(wrap_pyfunction!(split_pass, m)?)?;
     m.add_function(wrap_pyfunction!(refine, m)?)?;

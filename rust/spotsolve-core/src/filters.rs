@@ -263,6 +263,20 @@ pub fn gaussian_laplace(img: &[f64], h: usize, w: usize, sigma: f64, mode: Mode)
     out
 }
 
+/// L2 norm of the 2-D LoG kernel: the null sd of a `gaussian_laplace`
+/// response to unit-variance white noise, and so the unit that turns it into
+/// a z-score. `core.log_kernel_l2`: the kernel is `g2 (x) g0 + g0 (x) g2`, so
+/// `||w||^2 = 2 ||g0||^2 ||g2||^2 + 2 (g0 . g2)^2` exactly.
+pub fn log_kernel_l2(sigma: f64) -> f64 {
+    let radius = kernel_radius(sigma);
+    let g0 = gaussian_kernel1d(sigma, 0, radius);
+    let g2 = gaussian_kernel1d(sigma, 2, radius);
+    let n0 = g0.iter().map(|v| v * v).sum::<f64>();
+    let n2 = g2.iter().map(|v| v * v).sum::<f64>();
+    let cross = g0.iter().zip(&g2).map(|(a, b)| a * b).sum::<f64>();
+    (2.0 * n0 * n2 + 2.0 * cross * cross).sqrt()
+}
+
 /// `scipy.ndimage.uniform_filter`, `size` odd.
 pub fn uniform_filter(img: &[f64], h: usize, w: usize, size: usize, mode: Mode) -> Vec<f64> {
     let k = vec![1.0 / size as f64; size];

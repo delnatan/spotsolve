@@ -92,16 +92,6 @@ fn median(data: &[f64]) -> f64 {
     }
 }
 
-fn log_kernel_l2(sigma: f64) -> f64 {
-    let radius = filters::kernel_radius(sigma);
-    let g0 = filters::gaussian_kernel1d(sigma, 0, radius);
-    let g2 = filters::gaussian_kernel1d(sigma, 2, radius);
-    let n0 = g0.iter().map(|v| v * v).sum::<f64>();
-    let n2 = g2.iter().map(|v| v * v).sum::<f64>();
-    let cross = g0.iter().zip(&g2).map(|(a, b)| a * b).sum::<f64>();
-    (2.0 * n0 * n2 + 2.0 * cross * cross).sqrt()
-}
-
 /// Aguet fixed-PSF significance test intersected with LoG local maxima.
 ///
 /// This stage is independent of sparse fitting and can also propose sites to
@@ -141,7 +131,7 @@ pub fn aguet_candidates(
     // region. It does not decide significance.
     let log_response = filters::gaussian_laplace(data, h, w, sigma, filters::Mode::Reflect)
         .into_iter()
-        .map(|value| -value / log_kernel_l2(sigma))
+        .map(|value| -value / filters::log_kernel_l2(sigma))
         .collect::<Vec<_>>();
     let window = 2 * sigma.ceil() as usize + 1;
     let local_max = filters::maximum_filter(&log_response, h, w, window, filters::Mode::Reflect);

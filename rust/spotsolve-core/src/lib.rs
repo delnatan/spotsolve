@@ -26,6 +26,7 @@
 //! build with `-C target-cpu=native`: FMA contraction would change f64 results
 //! between machines [P2].
 
+pub mod boxsearch;
 pub mod dense_group;
 pub mod evidence;
 pub mod filters;

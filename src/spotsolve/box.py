@@ -24,9 +24,14 @@ no conditioning guard and no width prior: a collapsed or redundant emitter
 explains almost no deviance, so it cannot pay ADD_NATS on the way in and costs
 almost nothing on the way out.
 
-The box-search ladder so far: the variable-width fitter, the read-noise
-model, the ROI and the smooth background map. The wide unreported class for
-3-8 px haze is the next step.
+The design is settled: the variable-width fitter, the read-noise model, the
+ROI and the smooth background map. Two treatments of 3-8 px haze were
+measured and rejected (the notes below).
+
+This module is the REFERENCE. The fast path is its native port,
+`spotsolve.localize` / `localize_stack` (`native.py`, over Rust's
+`boxsearch.rs`), held to statistical parity with it by `tests/test_localize.py`.
+Change the algorithm here first, measure it here, then port.
 """
 
 import numpy as np
@@ -374,6 +379,28 @@ def localize_boxes(data_img, sigma=1.2, offset=0.0, gain=None, read_noise=0.0,
                                         fit_backend=be)
 
     model = bmap + calibrate.render_model(pos, amp, sig, bmap.shape, 0.0)
+    history = [dict(boxes=len(boxes), candidates=len(cand), search_fits=n_fits,
+                    N=int(len(sig)))]
+    res = _result(pos, amp, sig, se, bmap, model, d_e, shift, g_eff, sigma,
+                  band, slack, history)
+    if verbose:
+        wr = res.width_rejects
+        count = (lambda r: 0 if wr is None else int((wr["reason"] == r).sum()))
+        print(f"[boxes] {len(boxes)} boxes, {len(cand)} candidates, "
+              f"{n_fits} search fits -> N={len(res.amplitudes)} "
+              f"(+{count('too_wide')} wide, {count('too_narrow')} narrow)")
+    return res
+
+
+def _result(pos, amp, sig, se, bmap, model, d_e, shift, g_eff, sigma, band,
+            slack, history):
+    """Classify every fitted emitter and assemble the `DetectResult`.
+
+    Shared with the native path in `native.py`, so both report by one rule.
+    `bmap`, `model` and `d_e` are in shifted units, and `shift` is taken
+    back off. `model=None` skips the model and residual images.
+    """
+    H, W = bmap.shape
     focus = ((sig >= band[0] * sigma) & (sig <= band[1] * sigma)
              if band is not None else np.ones(len(sig), dtype=bool))
     # A source the frame border cuts is not an interior width measurement, so
@@ -391,17 +418,13 @@ def localize_boxes(data_img, sigma=1.2, offset=0.0, gain=None, read_noise=0.0,
         width_reject_records(idx[m], pos[m], amp[m], sig[m], sigma, reason)
         for m, reason in ((narrow, "too_narrow"), (wide, "too_wide"),
                           (edge, "edge"))])
-    if verbose:
-        print(f"[boxes] {len(boxes)} boxes, {len(cand)} candidates, "
-              f"{n_fits} search fits -> N={int(focus.sum())} "
-              f"(+{int(wide.sum())} wide, {int(narrow.sum())} narrow)")
-    history = [dict(boxes=len(boxes), candidates=len(cand), search_fits=n_fits,
-                    N=int(len(sig)))]
     return DetectResult(
         positions=pos[focus], amplitudes=amp[focus], sigma=sigma,
         lam=float(focus.sum()) / max(H * W, 1), A_s=float(np.mean(amp[focus]))
         if focus.any() else 0.0, gain=g_eff, background=bmap - shift,
-        n_outer_passes=1, model_image=model - shift, residual=d_e - model,
+        n_outer_passes=1,
+        model_image=None if model is None else model - shift,
+        residual=None if model is None else d_e - model,
         se=se[focus], history=history,
         width_rejects=rejects if len(rejects) else None,
         width_filter=dict(band=None if band is None else tuple(band),
