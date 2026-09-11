@@ -40,7 +40,8 @@ WIDTH_REJECT_DTYPE = np.dtype([
 
 Emitted by `core.detect`, which decides it during the search, and by
 `core.detect`, which decides it during the search. `reason` is `"too_narrow"`
-or `"too_wide"`; `source_index` indexes the working configuration the rejection
+or `"too_wide"`, or `"edge"` from `box.localize_boxes` for an out-of-band fit
+the frame border cuts; `source_index` indexes the working configuration the rejection
 was made against. It lives here rather than in `core` because it is a contract
 between modules, which is what this file is for.
 """
