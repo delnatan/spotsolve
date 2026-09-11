@@ -27,9 +27,12 @@
 pub mod boxsearch;
 pub mod filters;
 pub mod grid;
+pub mod lap;
 pub mod linalg;
 pub mod lmcl;
 pub mod patches;
 pub mod psf;
 pub mod render;
 pub mod statistics;
+pub mod track;
+pub mod trackparams;

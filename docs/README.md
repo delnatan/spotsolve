@@ -33,6 +33,42 @@ Identical recall, precision and inventions on all ten referee cells
 (64x64 `simulate`, flat and hazy), identical counts and search-fit counts on
 both real frames. About 87% of native time is inside the fits themselves.
 
+## The linker
+
+`spotsolve.link` / `fit_link_params` (`src/spotsolve/tracking.py`) read the
+`loctable` localization table and return it with a `track_id` column added.
+The work is `rust/spotsolve-core/src/track.rs` (the per-track filter bank
+over a D grid, the union gate, the score, the frame loop), `lap.rs` (an
+exact sparse assignment by shortest augmenting paths, over gated pairs only)
+and `trackparams.rs` (the link-free initializer and the damped soft-EM
+refinement), bound in `rust/spotsolve-py/src/track.rs`. Pixels and frames
+throughout.
+
+Ported from [tracksolve](https://github.com/delnatan/tracksolve)
+(`mode="lap"`), which stays the Python reference and holds the parts not
+ported: gap closing, multiple-hypothesis deferral, mobility classification
+and link posteriors. Two deliberate departures, both recorded in the Rust:
+
+- The gate reads the INFLATED CRLB. tracksolve's `gate.accept` sees the raw
+  `se^2` while its filter sees `se^2 * se_inflate`, so above an inflation of
+  1 its gate is tighter than its own model and the miss-rate bound does not
+  hold. The fixture was generated with that fixed on the Python side too.
+- The clutter intensity `lam_fa` and the "stop if evidence fell" rule are
+  absent. `lam_fa` cancels algebraically out of every linking decision, and
+  the rule fired in 0 of 27 fits (and cannot fire honestly in this mode,
+  since every detection lands in some track).
+
+Parity and speed when the port landed (2026-09-11), on
+`data/hyp7gem_wt_crop.tif`, 49 frames and 21,438 detections, each side
+fitting its own parameters: **100% of links identical**, every fitted
+parameter identical to the digits printed, the parameter fit 13.03 s -> 0.13 s
+and one linking 2.17 s -> 0.03 s. `tests/fixtures/08_track.json` (three
+simulated movies at step/nearest-neighbour 0.11, 0.31 and 0.53) is checked
+detection-for-detection by `rust/spotsolve-core/tests/layer6_track.rs`; it is
+FROZEN, and was written by a generator that is not part of the repository,
+like every other fixture here. `tests/test_tracking.py` holds the Python
+boundary and an accuracy floor against simulated truth.
+
 ## Retired on 2026-09-11
 
 The Python reference implementation (`src/spotsolve/deprecated/`: `box`,

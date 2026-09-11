@@ -29,15 +29,15 @@ classifiers = [
 dependencies = [
     "numpy>=1.24",
     "scipy>=1.10",
+    # `loctable` is the table the detector writes and `tracking` reads, and
+    # linking is not optional the way plotting is -- the movie-level half of
+    # this package speaks DataFrames.
+    "polars>=1.0",
 ]
 
 [project.optional-dependencies]
-# `loctable` -- the standard localization table, and what the tracking
-# downstream consumes.
-tables = ["polars>=1.0"]
 # What `scripts/` needs on top of the library: image I/O and the audit panels.
 scripts = [
-    "polars>=1.0",
     "tifffile>=2023.1.1",
     "matplotlib>=3.7",
 ]

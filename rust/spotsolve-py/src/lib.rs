@@ -1,7 +1,9 @@
 //! PyO3 bindings for `spotsolve-core`, exposed to Python as `spotsolve_rs`.
 //!
-//! The boundary sits at the FRAME: `box_localize` and `box_localize_stack`
-//! (see `boxsearch`) run a whole frame natively with the GIL released.
+//! The boundary sits at the FRAME for detection: `box_localize` and
+//! `box_localize_stack` (see `boxsearch`) run a whole frame natively with the
+//! GIL released. For linking it sits at the MOVIE: `track_fit` and
+//! `track_link` (see `track`) take a whole table of localizations.
 //! `lmcl_fit_var_sigma` exposes one fit, for the fitter's own tests.
 //!
 //! Arrays must be C-contiguous f64; `as_slice()` fails loudly otherwise rather
@@ -16,6 +18,7 @@ use pyo3::prelude::*;
 use spotsolve_core::lmcl;
 
 mod boxsearch;
+mod track;
 
 type Arr1 = Py<PyArray1<f64>>;
 type Arr2 = Py<PyArray2<f64>>;
@@ -76,7 +79,9 @@ fn lmcl_fit_var_sigma(
         ));
     }
     if !tol_obj.is_finite() || tol_obj <= 0.0 {
-        return Err(PyValueError::new_err("`tol_obj` must be positive and finite"));
+        return Err(PyValueError::new_err(
+            "`tol_obj` must be positive and finite",
+        ));
     }
     if h == 0 || w == 0 || d.shape() != [h, w] || data.iter().any(|v| !v.is_finite()) {
         return Err(PyValueError::new_err("`d` does not match (h, w)"));
@@ -104,7 +109,11 @@ fn lmcl_fit_var_sigma(
     Ok((
         ws.theta().to_vec().into_pyarray(py).unbind(),
         info.i_div,
-        ws.fisher(p).to_vec().into_pyarray(py).reshape([p, p])?.unbind(),
+        ws.fisher(p)
+            .to_vec()
+            .into_pyarray(py)
+            .reshape([p, p])?
+            .unbind(),
         info.n_iter,
         info.converged,
         info.stalled,
@@ -119,6 +128,7 @@ fn version() -> &'static str {
 #[pymodule]
 fn spotsolve_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     boxsearch::register(m)?;
+    track::register(m)?;
     m.add_function(wrap_pyfunction!(lmcl_fit_var_sigma, m)?)?;
     m.add_function(wrap_pyfunction!(version, m)?)?;
     Ok(())

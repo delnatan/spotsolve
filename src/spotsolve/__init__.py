@@ -24,10 +24,16 @@ fitted jointly with every emitter at its own width. It runs in Rust.
 `gain=None` estimates it per frame. `calibrate_sigma` measures `sigma` from
 the data.
 
+Linking is the movie-level half, and it reads that table rather than the
+detector's objects:
+
+    tracks = spotsolve.link(locs)     # the table plus a `track_id` column
+
     native        localize, localize_stack        the detector
     results       Localizations                   what it returns
     calibration   calibrate_sigma                 the in-focus PSF width
     loctable      results as `polars` tables
+    tracking      link, fit_link_params           trajectories from the table
     aggregates    over-bright spots, flagged after the fact
     audit metrics simulate psf                    is the answer any good?
 """
@@ -35,6 +41,7 @@ the data.
 from .native import BAND, K_MAX, SLACK, localize, localize_stack  # noqa: F401
 from .results import REJECT_DTYPE, Localizations  # noqa: F401
 from .calibration import SigmaCalibration, calibrate_sigma  # noqa: F401
+from .tracking import LinkParams, fit_link_params, link  # noqa: F401
 from .aggregates import (  # noqa: F401
     AGG_AMP_RATIO,
     AGG_LINK,
@@ -51,6 +58,9 @@ __all__ = [
     "REJECT_DTYPE",
     "calibrate_sigma",
     "SigmaCalibration",
+    "link",
+    "fit_link_params",
+    "LinkParams",
     "SLACK",
     "BAND",
     "K_MAX",
