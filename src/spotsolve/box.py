@@ -289,8 +289,8 @@ def localize_boxes(data_img, sigma=1.2, offset=0.0, gain=None, read_noise=0.0,
                    verbose=0):
     """Box-local localization. Returns a `DetectResult`.
 
-    `slack` and `band` mean what they mean in `detect`: the widths a fit may
-    represent, and the widths reported as in-focus detections. Everything
+    `slack` and `band` are the widths a fit may represent and the widths
+    reported as in-focus detections, as multiples of `sigma`. Everything
     outside `band` is still fitted, and returned in `width_rejects`.
     `history[0]` records the box and fit counts.
 
@@ -319,8 +319,7 @@ def localize_boxes(data_img, sigma=1.2, offset=0.0, gain=None, read_noise=0.0,
     b0 = max(float(np.percentile(d_e, 10.0)), core.BG_FLOOR)
     bmap = np.full((H, W), b0)
 
-    cand, camp, strength = core.find_candidates(d_e, bmap, sigma,
-                                                np.empty((0, 2)), threshold)
+    cand, camp, strength = core.find_candidates(d_e, bmap, sigma, threshold)
     # The smooth background, from the pixels no candidate reaches -- every
     # candidate, the ROI's or not, so light outside the ROI stays masked. It
     # is a known shape in every box and in the polish; each keeps a free

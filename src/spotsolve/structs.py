@@ -38,11 +38,10 @@ WIDTH_REJECT_DTYPE = np.dtype([
 ])
 """One object the model fitted but the reporting band does not accept.
 
-Emitted by `core.detect`, which decides it during the search, and by
-`core.detect`, which decides it during the search. `reason` is `"too_narrow"`
-or `"too_wide"`, or `"edge"` from `box.localize_boxes` for an out-of-band fit
-the frame border cuts; `source_index` indexes the working configuration the rejection
-was made against. It lives here rather than in `core` because it is a contract
+Emitted by `spotsolve.localize` and its reference `box.localize_boxes`.
+`reason` is `"too_narrow"` or `"too_wide"`, or `"edge"` for an out-of-band fit
+the frame border cuts; `source_index` indexes every fit of the frame, in the
+order the search returned them. It lives here rather than in `core` because it is a contract
 between modules, which is what this file is for.
 """
 
@@ -101,8 +100,8 @@ class DetectResult:
     positions: np.ndarray      # (N,2) global (y,x)
     amplitudes: np.ndarray     # (N,) total flux, photoelectrons
     sigma: float
-    lam: float                 # emitters per px^2 (empirical-Bayes)
-    A_s: float                 # amplitude prior scale (empirical-Bayes)
+    lam: float                 # detections per px^2
+    A_s: float                 # mean detected flux, photoelectrons
     gain: float                # g_eff used, ADU per photoelectron
     background: np.ndarray     # (H,W) background surface, photoelectrons/px
     n_outer_passes: int
@@ -110,28 +109,12 @@ class DetectResult:
     residual: np.ndarray
     se: np.ndarray = None      # (N,3) CRLB (SE_A, SE_y, SE_x) where available
     history: list = field(default_factory=list)   # per-pass convergence record
-    aggregates: np.ndarray = None
-    """The WIDE CLASS: objects the search fitted at a width above `FOCUS_BAND`.
-
-    A structured array with fields `y`, `x`, `sigma`, `flux`, `radius`, or
-    `None` when the frame held none. These are NOT localizations -- `sigma` is
-    the object's fitted width and `flux` its total, and neither is comparable
-    to `amplitudes`, which are point emitters inside the band.
-
-    They are modelled to the end and ARE in `model_image` and `residual`, which
-    is the whole point: a defocused object whose flux is left in the residual
-    refills FIND's candidate list and gets tiled. Reported rather than silently
-    dropped, because what a frame contains that is not a point emitter is a
-    data-quality fact about that frame. See README section 8b.
-    """
     fit_sigma: np.ndarray = None
     """Per-emitter fitted sigma, aligned with `positions`.
 
     A RESULT, not a diagnostic: with a free width these are the widths that
     produced the reported positions, amplitudes and CRLBs, and `sigma_ratio`
-    is a per-emitter defocus readout. Note it is a SHRUNK estimate of defocus,
-    not an unbiased one -- the width prior pulls it toward the PSF width, which
-    is what makes close pairs resolvable; see README section 15.
+    is a per-emitter defocus readout: a plain maximum-likelihood width.
     """
     sigma_ratio: np.ndarray = None
     width_rejects: np.ndarray = None

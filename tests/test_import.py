@@ -9,13 +9,11 @@ def test_public_names_exist():
 
 
 def test_submodules_import():
-    for name in ("psf", "lmga", "evidence", "patches", "moves", "calibrate",
-                 "backend", "audit", "metrics", "simulate", "prior", "core",
-                 "sparse"):
+    for name in ("psf", "lmga", "patches", "calibrate", "backend", "audit",
+                 "metrics", "simulate", "core", "box", "native", "sparse"):
         __import__(f"spotsolve.{name}")
 
 
-def test_rust_constants_agree_if_extension_present():
-    """`backend.available()` includes "rs" only if the constants matched."""
+def test_backends_are_reported():
     from spotsolve import backend
     assert "py" in backend.available()

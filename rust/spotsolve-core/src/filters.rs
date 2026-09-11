@@ -277,14 +277,49 @@ pub fn log_kernel_l2(sigma: f64) -> f64 {
     (2.0 * n0 * n2 + 2.0 * cross * cross).sqrt()
 }
 
-/// `scipy.ndimage.uniform_filter`, `size` odd.
+/// `scipy.ndimage.uniform_filter`, `size` odd, axis 0 then axis 1.
+///
+/// scipy's own algorithm, not a convolution with `1/size` taps: a running
+/// sum kept undivided, `sum += entering - leaving`, and each output that sum
+/// divided by `size`. The two differ in the last bits, and the last bits
+/// matter where the result is compared for ties -- `estimate_gain` selects
+/// pixels at a quantile of this filter's output, and on integer-valued
+/// counts many of them tie exactly at the cut. With 1/size taps the native
+/// gain estimate came out 0.2% off the Python reference's on a simulated
+/// frame; with this, bit-identical.
 pub fn uniform_filter(img: &[f64], h: usize, w: usize, size: usize, mode: Mode) -> Vec<f64> {
-    let k = vec![1.0 / size as f64; size];
     let mut a = vec![0.0; h * w];
     let mut b = vec![0.0; h * w];
-    convolve1d(img, &mut a, h, w, &k, 0, mode);
-    convolve1d(&a, &mut b, h, w, &k, 1, mode);
+    uniform1d(img, &mut a, h, w, size, 0, mode);
+    uniform1d(&a, &mut b, h, w, size, 1, mode);
     b
+}
+
+/// One axis of [`uniform_filter`]: `NI_UniformFilter1D`'s running sum.
+fn uniform1d(src: &[f64], dst: &mut [f64], h: usize, w: usize, size: usize, axis: usize, mode: Mode) {
+    let n = if axis == 0 { h } else { w };
+    let lines = if axis == 0 { w } else { h };
+    let r1 = (size / 2) as isize;
+    let size_f = size as f64;
+    for line in 0..lines {
+        let at = |i: isize| -> usize {
+            let k = mode.index(i, n);
+            if axis == 0 {
+                k * w + line
+            } else {
+                line * w + k
+            }
+        };
+        let mut sum = 0.0;
+        for k in 0..size as isize {
+            sum += src[at(k - r1)];
+        }
+        dst[at(0)] = sum / size_f;
+        for i in 1..n as isize {
+            sum += src[at(i + size as isize - 1 - r1)] - src[at(i - 1 - r1)];
+            dst[at(i)] = sum / size_f;
+        }
+    }
 }
 
 /// `scipy.ndimage.maximum_filter` over a square window, `size` odd.

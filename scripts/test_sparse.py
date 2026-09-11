@@ -20,12 +20,11 @@ res = spotsolve.localize_sparse(
 )
 
 # %%
-dres = spotsolve.detect(
+dres = spotsolve.localize(
     img[0],
-    sigma=1.05,
+    sigma=1.27,
     offset=100.0,
-    gain=1.97,
-    slack=spotsolve.SIGMA_SLACK,
+    gain=2.0,
 )
 
 # %%

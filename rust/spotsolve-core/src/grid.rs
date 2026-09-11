@@ -15,9 +15,8 @@
 //! | 96 | 507 | 2.1% |
 //! | 128 | 901 | 3.0% |
 //!
-//! Small now; not small at 512x512. Three other terms have the same shape --
-//! the background's emitter mask, `_split_pass`'s visit, and `render_model` --
-//! and they all use this index [P9].
+//! Small then; not small at 512x512. The box search's ownership masks and
+//! patch decomposition have the same shape, and use this index [P9].
 //!
 //! # Layout
 //!

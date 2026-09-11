@@ -22,12 +22,9 @@ import pathlib
 import numpy as np
 import scipy.ndimage as ndi
 
-import spotsolve
 from spotsolve import calibrate
 from spotsolve import core
-from spotsolve import evidence
 from spotsolve import lmga
-from spotsolve import prior
 from spotsolve import psf
 from spotsolve import simulate
 
@@ -250,13 +247,9 @@ def fx_lmga():
                           stalled=res.stalled,
                           grad_inf_norm=float(np.max(np.abs(
                               _grad(res.theta, yy, xx, SIGMA, d))))))
-    # Free widths, ML and MAP. The pair is the point: the same data and the
-    # same start, differing only by the penalty, so a port can tell "my
-    # optimizer is wrong" from "my penalty is wrong".
+    # Free widths, maximum likelihood.
     var_cases = []
     s0 = SIGMA
-    wp = prior.FocusMixtureWidth(0.006, 0.0004, 0.70 * s0, 2.0 * s0,
-                                 2.2 * s0, s0, prior.FOCUS_WIDTH_GAMMA)
     for K, seed in ((1, 31), (2, 32)):
         r = np.random.default_rng(seed)
         h = w = 15
@@ -272,35 +265,21 @@ def fx_lmga():
                          h - 0.5, w - 0.5, 2.2 * s0] * K)
         t0 = np.clip(th * np.append([1.0], np.tile([1.1, 1.0, 1.0, 1.0], K)),
                      lo + 1e-9, hi - 1e-9)
-        out = {}
-        for name, pen in (("ml", None), ("map", core._WidthPenalty(wp, K))):
-            res = lmga.fit(t0, yy, xx, s0, d, lo, hi, max_iter=100,
-                           free_sigma="per_emitter", penalty=pen)
-            out[name] = dict(theta=res.theta, I=res.I, F=res.F,
-                             converged=res.converged, stalled=res.stalled)
+        res = lmga.fit(t0, yy, xx, s0, d, lo, hi, max_iter=100,
+                       free_sigma="per_emitter")
         var_cases.append(dict(K=K, h=h, w=w, sigma=s0, data=d, theta0=t0,
                               lower=lo, upper=hi,
-                              penalty=dict(kind="focus_mixture",
-                                           lo=wp.lo, mid=wp.mid, hi=wp.hi,
-                                           sigma0=wp.sigma0, scale=wp.scale,
-                                           lam_focus=wp.lam_focus,
-                                           lam_wide=wp.lam_wide),
-                              **out))
+                              ml=dict(theta=res.theta, I=res.I, F=res.F,
+                                      converged=res.converged,
+                                      stalled=res.stalled)))
 
     return dict(
         what="lmga.fit: bounded Fisher-scoring LM on the Poisson "
-             "I-divergence, at fixed and per-emitter width, ML and MAP",
+             "I-divergence, at fixed and per-emitter width",
         compare="I to 1e-8 ABSOLUTE (nats -- the unit decisions are made in); "
                 "theta to 1e-6 px / 1e-4 relative on amplitude; F to 1e-9 "
                 "relative. Do NOT assert on n_iter: the gain-ratio branch "
                 "makes it sensitive to the last ulp of the model.",
-        contract="In `var_sigma_cases`, `I` is the DATA term with the penalty "
-                 "EXCLUDED and `F` is the Gauss-Newton matrix with the "
-                 "penalty's curvature INCLUDED. That asymmetry is deliberate: "
-                 "`evidence` adds the prior itself, so a penalized `I` would "
-                 "charge it twice, while the Laplace volume wants the Hessian "
-                 "of the log posterior. A port that adds the penalty to `I` "
-                 "will pass `ml` and fail `map`.",
         cases=cases,
         var_sigma_cases=var_cases)
 
@@ -312,232 +291,15 @@ def _grad(theta, yy, xx, sigma, d):
     return J.T @ ((m - d.reshape(-1)) / m)
 
 
-# ---------------------------------------------------------------- layer 3
-def fx_evidence():
-    """The Laplace Bayes factor and its two guards. Pure arithmetic on inputs
-    supplied here, so this layer IS bit-reproducible -- the only non-trivial
-    part is the Cholesky, and log|F| is a sum of logs of its diagonal."""
-    cases = []
-    r = np.random.default_rng(21)
-    for K in (1, 2, 4):
-        p = 3 * K + 1
-        Ab = r.normal(size=(p, p)); Fb = Ab @ Ab.T + p * np.eye(p)
-        Aa = r.normal(size=(p + 3, p + 3)); Fa = Aa @ Aa.T + (p + 3) * np.eye(p + 3)
-        ld_b, cond_b, ok_b = evidence.logdet_cond(Fb)
-        ld_a, cond_a, ok_a = evidence.logdet_cond(Fa)
-        # Per-emitter amplitude ARRAYS, not their sums: under a general
-        # flux prior `sum_k log g(A_k)` is not `log g(sum_k A_k)`.
-        A_b = r.uniform(400.0, 1600.0, K)
-        A_a = np.append(A_b, r.uniform(400.0, 1600.0))
-        bf, c = evidence.log_bf_add(120.0, 100.0, Fb, Fa, A_b, A_a,
-                                    K, 0.02, 950.0)
-        rem = evidence.log_bf_remove(100.0, 120.0, Fa, Fb, A_a, A_b,
-                                     K + 1, 0.02, 950.0)
-        theta = psf.pack(4.0, r.uniform(200, 1500, K), r.uniform(2, 9, K),
-                         r.uniform(2, 9, K))
-        cases.append(dict(
-            K=K, F_before=Fb, F_after=Fa,
-            logdet_before=ld_b, cond_before=cond_b, ok_before=ok_b,
-            logdet_after=ld_a, cond_after=cond_a, ok_after=ok_a,
-            I_before=120.0, I_after=100.0, A_before=A_b, A_after=A_a,
-            lam=0.02, A_s=950.0,
-            log_bf_add=bf, cond_reported=c, log_bf_remove=rem,
-            antisymmetry_residual=float(bf + rem),
-            theta=theta))
-
-    # The width layer: the prior itself, then the Bayes factor that reads it.
-    # Separated because a port that gets `log_config` wrong will fail the
-    # second in a way that says nothing about which term is at fault.
-    s0 = SIGMA
-    wp_u = prior.UniformWidth(0.02, 0.70 * s0, 2.2 * s0)
-    wp_m = prior.FocusMixtureWidth(0.006, 0.0004, 0.70 * s0, 2.0 * s0,
-                                   2.2 * s0, s0, prior.FOCUS_WIDTH_GAMMA)
-    probe = np.array([0.75, 1.0, 1.2, 1.6, 1.99, 2.1]) * s0
-    width_cases = []
-    for name, wp in (("uniform", wp_u), ("focus_mixture", wp_m)):
-        cfgs = [np.array([1.0]) * s0,
-                np.array([0.98, 1.05, 1.4]) * s0,
-                np.array([0.98, 1.05, 1.4, 2.1]) * s0]
-        width_cases.append(dict(
-            kind=name,
-            lo=wp.lo, hi=wp.hi, lam_focus=getattr(wp, "lam_focus", wp_u.lam),
-            mid=getattr(wp, "mid", None),
-            lam_wide=getattr(wp, "lam_wide", None),
-            sigma0=getattr(wp, "sigma0", None),
-            scale=getattr(wp, "scale", None),
-            probe_sigma=probe,
-            logpdf=np.asarray(wp.logpdf(probe)),
-            curvature=np.asarray(wp.curvature(probe)),
-            configs=[dict(sigmas=c, log_config=wp.log_config(c)) for c in cfgs],
-        ))
-
-    # `log_bf_add` on the 4K+1 layout: K free widths before, K+1 after.
-    var_cases = []
-    for K in (1, 3):
-        p = 4 * K + 1
-        Ab = r.normal(size=(p, p)); Fb = Ab @ Ab.T + p * np.eye(p)
-        Aa = r.normal(size=(p + 4, p + 4)); Fa = Aa @ Aa.T + (p + 4) * np.eye(p + 4)
-        A_b = r.uniform(400.0, 1600.0, K)
-        A_a = np.append(A_b, r.uniform(400.0, 1600.0))
-        sig_b = r.uniform(0.9, 1.6, K) * s0
-        sig_a = np.append(sig_b, 1.05 * s0)
-        bf, c = evidence.log_bf_add(120.0, 100.0, Fb, Fa, A_b, A_a, K,
-                                    0.02, 950.0,
-                                    widths=(wp_m, sig_b, sig_a))
-        rem = evidence.log_bf_remove(100.0, 120.0, Fa, Fb, A_a, A_b, K + 1,
-                                     0.02, 950.0,
-                                     widths=(wp_m, sig_b, sig_a))
-        var_cases.append(dict(
-            K=K, F_before=Fb, F_after=Fa, I_before=120.0, I_after=100.0,
-            A_before=A_b, A_after=A_a, sigmas_before=sig_b, sigmas_after=sig_a,
-            lam=0.02, A_s=950.0, log_bf_add=bf, cond_reported=c,
-            log_bf_remove=rem, antisymmetry_residual=float(bf + rem)))
-
-    return dict(
-        what="evidence.logdet_cond / log_bf_add / log_bf_remove, fixed and "
-             "free width, and the prior.WidthPrior they read",
-        invariant="log_bf_remove is the EXACT negation of log_bf_add on the "
-                  "same pair; antisymmetry_residual must be 0.0 exactly, not "
-                  "small. If it is not, the two paths have diverged.",
-        constants=dict(COND_GUARD=evidence.COND_GUARD,
-                       FOCUS_WIDTH_GAMMA=prior.FOCUS_WIDTH_GAMMA),
-        compare="log BF to 1e-10 absolute; logdet to 1e-12 relative; "
-                "logpdf / curvature / log_config to 1e-12 relative. The "
-                "free-width Laplace volume is 2*log(2pi), not 1.5*log(2pi) -- "
-                "a port that keeps the fixed-width constant fails "
-                "`var_sigma_cases` by exactly 0.5*log(2pi) = 0.919 nats.",
-        cases=cases,
-        width_prior_cases=width_cases,
-        var_sigma_cases=var_cases)
-
-
-# ---------------------------------------------------------------- layer 4
-def fx_end_to_end():
-    """Whole-pipeline results on deterministic synthetic fields.
-
-    This is the acceptance fixture, and it is built from `spotsolve` -- the port
-    target. It does NOT expect bit-equality: a port that fans `refine`'s patch
-    sweep out across threads (PORTING_NOTES section 14) legitimately lands
-    somewhere slightly different. Judge it on N, on the ground-truth match, and
-    on the audit, which is the acceptance test for this pipeline anyway
-    (README section 12)."""
-    from spotsolve import audit
-    from spotsolve import metrics
-
-    def one(adu, truth_pos, truth_amp, sigma, gain, offset, tag, extra, **kw):
-        res = spotsolve.detect(adu, sigma=sigma, offset=offset, gain=gain,
-                               k_max=12, verbose=0, **kw)
-        d_e = (adu - offset) / gain
-        a = audit.audit_result(d_e, res.model_image, sigma)
-        m = metrics.match(truth_pos, res.positions, radius=1.5)
-        order = np.lexsort((res.positions[:, 1], res.positions[:, 0]))
-        agg = res.aggregates
-        return dict(
-            tag=tag, sigma=sigma, gain=gain, offset=offset,
-            raw_adu=np.round(adu).astype(int),
-            truth_positions=truth_pos, truth_amplitudes=truth_amp,
-            N=len(res.positions),
-            positions=res.positions[order], amplitudes=res.amplitudes[order],
-            fit_sigma=(res.fit_sigma[order] if res.fit_sigma is not None
-                       else []),
-            se=np.nan_to_num(res.se[order], nan=-1.0),
-            n_wide=(0 if agg is None else len(agg)),
-            wide_sigma=(np.sort(agg["sigma"]) if agg is not None
-                        else np.empty(0)),
-            n_width_rejects=(0 if res.width_rejects is None
-                             else len(res.width_rejects)),
-            # `background` is an (H, W) SURFACE in spotsolve, not a scalar.
-            background=np.asarray(res.background), lam=res.lam, A_s=res.A_s,
-            n_passes=len(res.history),
-            N_per_pass=[h["N"] for h in res.history],
-            audit=dict(n_missed=a["n_missed"], n_piled=a["n_piled"],
-                       z_min=a["z_min"], z_max=a["z_max"],
-                       z_median=a["z_median"]),
-            match=dict(n_true=m.n_true, n_est=m.n_est, precision=m.precision,
-                       recall=m.recall, rmse=m.rmse),
-            **extra)
-
-    # --- the FIXED-width arm, on Gaussian-rendered fields. Kept because the
-    #     Rust core implements that layout today and must not regress while
-    #     the free width is being added.
-    cases = []
-    for size, dens, seed in ((39, 0.034, 1001), (39, 0.055, 1002)):
-        sim, adu = field(size, dens, seed)
-        cases.append(one(adu, sim.positions, sim.amplitudes, SIGMA, GAIN,
-                         OFFSET, f"gauss_{size}_{dens}",
-                         dict(size=size, density=dens, seed=seed),
-                         slack=None))
-
-    # --- the SHIPPED default, on the confocal simulation. This is the arm
-    #     that matters for the free-width port, and Gaussian fields cannot
-    #     replace it: every emitter there is rendered at the model's own sigma,
-    #     so nothing exercises the width prior, the class boundary or the MAP
-    #     penalty -- a port could ignore all three and still pass. `sim_out`
-    #     puts emitters at depths uniform in +/-0.5 um through a vectorial
-    #     spinning-disk PSF, so its widths are set by physics and its
-    #     pathologies are the ones the real movies have.
-    #
-    #     The PIXELS ARE BAKED IN. `data/sim_out` is a build product and is not
-    #     in the repository, so a fixture that referenced it by path would be
-    #     unreproducible for exactly the reader who needs it most.
-    sim_cases = []
-    sim_dir = pathlib.Path(__file__).resolve().parent.parent / "data" / "sim_out"
-    if sim_dir.is_dir():
-        meta = json.loads((sim_dir / "metadata.json").read_text())
-        s_gain = float(meta["camera"]["gain"])
-        s_off = float(meta["camera"]["baseline"])
-        for label, frames in (("sparse", (0, 1)), ("moderate", (0,))):
-            stack = np.load(sim_dir / f"{label}.npy").astype(float)
-            truth = np.genfromtxt(sim_dir / f"{label}_truth.csv",
-                                  delimiter=",", names=True)
-            for fr in frames:
-                m_ = np.atleast_1d(truth["frame"]) == fr
-                tp = np.column_stack([np.atleast_1d(truth["y_px"])[m_],
-                                      np.atleast_1d(truth["x_px"])[m_]])
-                sim_cases.append(one(
-                    stack[fr], tp,
-                    np.atleast_1d(truth["photons_in_frame"])[m_],
-                    SIM_SIGMA, s_gain, s_off, f"{label}_f{fr}",
-                    dict(density=label, frame=fr,
-                         truth_z_um=np.atleast_1d(truth["z_um"])[m_])))
-    else:
-        print("  NOTE: data/sim_out absent; sim_cases left empty")
-
-    return dict(
-        what="spotsolve.detect end to end, with ground truth",
-        compare="NOT bit-exact, deliberately. Accept a port if, per case: "
-                "|N - N_expected| <= 1; precision and recall each within 0.03; "
-                "rmse within 0.02 px; audit n_missed and n_piled each within "
-                "1. Positions are sorted by (y, x) so they can be matched "
-                "pairwise for a spot check, but a 1-emitter difference "
-                "renumbers everything after it -- match by nearest neighbour, "
-                "not by index. On `sim_cases` also require |n_wide - "
-                "expected| <= 1: a port whose width prior is wrong will land "
-                "the class boundary somewhere else, and N alone can hide that "
-                "because a mis-classified object leaves the model either way.",
-        settings=dict(gauss=dict(sigma=SIGMA, gain=GAIN, offset=OFFSET,
-                                 slack=None),
-                      sim=dict(sigma=SIM_SIGMA, k_max=12,
-                               slack=list(spotsolve.SIGMA_SLACK),
-                               band=list(spotsolve.FOCUS_BAND),
-                               width_gamma=prior.FOCUS_WIDTH_GAMMA,
-                               prune_tau=spotsolve.PRUNE_TAU)),
-        cases=cases,
-        sim_cases=sim_cases)
-
-
-
 # ---------------------------------------------------------------- layer 5
 def fx_geometry():
-    """Patch decomposition, window selection, model rendering and the emitter
-    free-mask -- everything that answers "which emitters, over which pixels".
+    """Patch decomposition, model rendering and the emitter free-mask -- everything that answers "which emitters, over which pixels".
 
     This layer has no Python verification of its own beyond
     `verify_geometry.py`, and it is the layer the port CHANGES: `cKDTree` +
     `connected_components` become a uniform grid plus union-find, and the
     O(N*H*W) mask loop becomes an O(N*sigma^2) stamp. Same answers, different
     algorithm -- which is exactly when a golden fixture earns its keep."""
-    from spotsolve import moves
     from spotsolve import patches as patch_mod
     cases = []
     for H, W, n, seed in ((48, 52, 12, 31), (39, 39, 40, 32), (24, 30, 3, 33)):
@@ -546,77 +308,37 @@ def fx_geometry():
         amp = rr.uniform(300.0, 1800.0, n)
 
         ps = patch_mod.build_patches(pos, SIGMA, (H, W),
-                                     link_radius_factor=spotsolve.LINK_FACTOR,
-                                     halo_radius_factor=spotsolve.HALO_FACTOR,
-                                     bbox_pad_factor=spotsolve.BBOX_PAD, k_max=12)
+                                     link_radius_factor=core.LINK_FACTOR,
+                                     halo_radius_factor=core.HALO_FACTOR,
+                                     bbox_pad_factor=core.BBOX_PAD, k_max=12)
         patches_out = [dict(indices=np.sort(p.indices),
                             frozen_indices=np.sort(p.frozen_indices),
                             y0=p.y0, x0=p.x0, y1=p.y1, x1=p.x1) for p in ps]
-
-        # `_window` at a few probe points: on top of an emitter, between two,
-        # and in empty space near the rim (where the bbox clamps).
-        probes = [pos[0], 0.5 * (pos[0] + pos[1]), np.array([1.0, 1.0]),
-                  np.array([H - 1.5, W - 1.5])]
-        windows = []
-        for c in probes:
-            free, frozen, bbox = spotsolve.core._window(pos, np.asarray(c, float),
-                                                SIGMA, (H, W), 12)
-            windows.append(dict(cand=c, free=free, frozen=np.sort(frozen),
-                                y0=bbox[0], x0=bbox[1], y1=bbox[2], x1=bbox[3]))
 
         # The emitter free-mask, exactly as background_map and
         # calibrate.robust_background build it. Moves to Rust because it is
         # O(N*H*W) as written; the convolutions around it do not.
         yy, xx = np.mgrid[0:H, 0:W]
         free_mask = np.ones((H, W), dtype=bool)
-        r2 = (spotsolve.BG_MASK_RADIUS * SIGMA) ** 2
+        r2 = (core.BG_MASK_RADIUS * SIGMA) ** 2
         for cy, cx in pos:
             free_mask &= ((yy - cy) ** 2 + (xx - cx) ** 2) > r2
 
-        # `moves.residual_axis` on a genuine unresolved pair: render two
-        # emitters 1.2 sigma apart along a known axis, fit ONE in their place,
-        # and take the residual. That is exactly the state SPLIT exists for --
-        # no peak for a LoG filter to find, but a clear quadrupole.
-        mv = []
-        for ang in (0.0, 0.7, 1.9):
-            uy, ux = np.cos(ang), np.sin(ang)
-            cy0, cx0 = H / 2.0, W / 2.0
-            d = 1.2 * SIGMA
-            yy, xx = np.mgrid[0:H, 0:W] * 1.0
-            pair = psf.model(psf.pack(0.0, [800.0, 800.0],
-                                      [cy0 + 0.5 * d * uy, cy0 - 0.5 * d * uy],
-                                      [cx0 + 0.5 * d * ux, cx0 - 0.5 * d * ux]),
-                             yy, xx, SIGMA)
-            one = psf.pack(0.0, [1600.0], [cy0], [cx0])
-            resid = pair - psf.model(one, yy, xx, SIGMA)
-            u, strength = moves.residual_axis(one, 0, yy, xx, SIGMA, resid)
-            for disp in spotsolve.SPLIT_DISPS:
-                mv.append(dict(angle=ang, theta=one, resid=resid,
-                               u=u, strength=strength, disp=disp,
-                               split=moves.split(one, 0, u, disp * SIGMA)))
         cases.append(dict(
-            H=H, W=W, sigma=SIGMA, positions=pos, amplitudes=amp, moves=mv,
-            k_max=12, link_factor=spotsolve.LINK_FACTOR,
-            halo_factor=spotsolve.HALO_FACTOR, bbox_pad=spotsolve.BBOX_PAD,
-            patches=patches_out, windows=windows,
-            mask_radius=spotsolve.BG_MASK_RADIUS,
+            H=H, W=W, sigma=SIGMA, positions=pos, amplitudes=amp,
+            k_max=12, link_factor=core.LINK_FACTOR,
+            halo_factor=core.HALO_FACTOR, bbox_pad=core.BBOX_PAD,
+            patches=patches_out,
+            mask_radius=core.BG_MASK_RADIUS,
             free_mask=free_mask.astype(int),
             render_truncate=4.0,
             render=calibrate.render_model(pos, amp, SIGMA, (H, W), 0.0)))
     return dict(
-        what="patches.build_patches / spotsolve.core._window / the emitter free-mask / "
+        what="patches.build_patches / the emitter free-mask / "
              "calibrate.render_model",
-        moves_note="`moves` holds residual_axis/split on a residual left by "
-                   "fitting ONE emitter where two sit 1.2 sigma apart -- the "
-                   "state SPLIT exists for. `u` is a principal axis, defined "
-                   "only up to SIGN: a port may return -u, in which case its "
-                   "`split` lists the two children in the other order. Compare "
-                   "|u . u_expected| = 1 and the child positions as a SET.",
         layout="`indices` and `frozen_indices` are SORTED here so a port using "
                "a different traversal order can compare them as sets. "
-               "`windows[i].free` is NOT sorted -- it is ordered by distance "
-               "to the candidate, and that order is load-bearing: it decides "
-               "the theta layout of the fit. free_mask is (H,W) as 0/1.",
+               "free_mask is (H,W) as 0/1.",
         compare="exact. These are integer indices and integer bboxes; there is "
                 "no tolerance to spend. `render` is float, relative 1e-13 -- it "
                 "truncates each emitter at 4 sigma, so a port must truncate at "
@@ -625,121 +347,11 @@ def fx_geometry():
         cases=cases)
 
 
-# ---------------------------------------------------------------- layer 6
-def _mid_search_state(size, dens, seed, rounds):
-    """Run `detect`'s round loop for `rounds` rounds and hand back its state.
-
-    The passes must be exercised on a state the search actually reaches. On an
-    empty model every window is trivial, nothing splits and nothing prunes, so
-    a fixture built from round 0 would assert almost nothing."""
-    sim, adu = field(size, dens, seed)
-    d_e = (adu - OFFSET) / GAIN
-    H, W = d_e.shape
-    b0 = float(np.percentile(d_e, 10.0))
-    bmap = np.full((H, W), max(b0, spotsolve.BG_FLOOR))
-    A_s = max(float(d_e.max()) - b0, 10.0) / psf.peak_factor(SIGMA)
-    lam = 0.02
-    positions, amplitudes = np.empty((0, 2)), np.empty(0)
-    sigmas = np.empty(0)
-    for _ in range(rounds):
-        model = spotsolve.render(positions, amplitudes, SIGMA, bmap)
-        cand, camp, _ = spotsolve.find_candidates(d_e, model, SIGMA, positions,
-                                                  spotsolve.CAND_THRESHOLD)
-        # `slack=None`: this state is the FIXED-width passes' input, which is
-        # the layout the Rust core implements. The free-width passes are
-        # captured separately, from `detect` itself.
-        positions, amplitudes, sigmas, _ = spotsolve.core._add_pass(
-            d_e, bmap, positions, amplitudes, sigmas, cand, camp, SIGMA,
-            lam, A_s, 12, slack=None)
-        positions, amplitudes, _, sigmas = spotsolve.core.refine(
-            d_e, positions, amplitudes, SIGMA, bmap, k_max=12, max_sweeps=1,
-            sigmas=sigmas, slack=None)
-        lam = max(len(positions) / float(H * W), 1e-6)
-        if len(amplitudes):
-            A_s = max(float(np.mean(amplitudes)), 1.0)
-        bmap = spotsolve.core._update_bg(d_e, positions, amplitudes, SIGMA,
-                                         bmap, spotsolve.BG_KERNEL)
-    return sim, d_e, positions, amplitudes, bmap, lam, A_s
-
-
-def fx_passes():
-    """The four passes that ARE the port's API boundary: ADD over a candidate
-    list, SPLIT, PRUNE, and one REFINE sweep.
-
-    Each is captured from a state one round into a real search, with the full
-    input it was handed. This is where a failure has to localize: above it lies
-    only `detect`'s round loop, which stays in Python."""
-    cases = []
-    for size, dens, seed in ((39, 0.055, 1002), (39, 0.034, 1001)):
-        sim, d_e, pos, amp, bmap, lam, A_s = _mid_search_state(
-            size, dens, seed, rounds=1)
-        k_max = 12
-
-        # ADD: the candidate list `detect` would produce at this state, and the
-        # positions/amplitudes after the whole pass over it. The in-loop
-        # proximity re-check is part of the pass, not of the driver -- it reads
-        # the positions an earlier acceptance in the SAME pass wrote.
-        model = spotsolve.render(pos, amp, SIGMA, bmap)
-        cand, camp, _ = spotsolve.find_candidates(d_e, model, SIGMA, pos,
-                                               spotsolve.CAND_THRESHOLD)
-        zs = np.empty(0)
-        p_add, a_add, s_add, n_added = spotsolve.core._add_pass(
-            d_e, bmap, pos.copy(), amp.copy(), np.full(len(amp), SIGMA),
-            cand, camp, SIGMA, lam, A_s, k_max, slack=None)
-
-        # SPLIT: run against the model the adds produced, as `detect` does.
-        model_s = spotsolve.render(p_add, a_add, SIGMA, bmap)
-        p_spl, a_spl, s_spl, n_split = spotsolve.core._split_pass(
-            d_e, p_add.copy(), a_add.copy(), s_add.copy(), bmap, SIGMA, lam,
-            A_s, k_max, model_s, slack=None)
-
-        # REFINE: one sweep, which is what the round loop uses.
-        p_ref, a_ref, se_ref, s_ref = spotsolve.core.refine(
-            d_e, p_spl.copy(), a_spl.copy(), SIGMA, bmap, k_max=k_max,
-            max_sweeps=1, sigmas=s_spl.copy(), slack=None)
-
-        # PRUNE: one pass, faintest first, with write-back onto survivors.
-        p_prn, a_prn, _ = spotsolve.core._prune(
-            d_e, p_ref.copy(), a_ref.copy(), s_ref.copy(), bmap, SIGMA, lam,
-            A_s, k_max, slack=None)
-        del zs
-
-        cases.append(dict(
-            size=size, density=dens, seed=seed, sigma=SIGMA, k_max=k_max,
-            lam=lam, A_s=A_s,
-            d_e=d_e, bmap=bmap,
-            positions=pos, amplitudes=amp,
-            add=dict(cand=cand, camp=camp, n_added=n_added,
-                     positions=p_add, amplitudes=a_add),
-            split=dict(model=model_s, n_split=n_split,
-                       positions=p_spl, amplitudes=a_spl),
-            refine=dict(max_sweeps=1, positions=p_ref, amplitudes=a_ref,
-                        se=np.nan_to_num(se_ref, nan=-1.0)),
-            prune=dict(prune_tau=spotsolve.PRUNE_TAU,
-                       positions=p_prn, amplitudes=a_prn)))
-    return dict(
-        what="spotsolve's four passes -- the ADD loop over a candidate list, "
-             "_split_pass, one refine sweep, and one _prune pass -- each from "
-             "a state one round into a real search",
-        order="Run them in the order given: ADD's output is SPLIT's input, "
-              "SPLIT's is REFINE's, REFINE's is PRUNE's. That is `detect`'s "
-              "own order and the passes are not independent of it.",
-        compare="positions to 1e-6 px and amplitudes to 1e-4 relative, per "
-                "emitter, ONLY while the counts match. If a count differs the "
-                "port has made a different decision somewhere and pairwise "
-                "comparison is meaningless -- chase that first, in the layer "
-                "below. `se` is -1.0 where the Python reported NaN.",
-        cases=cases)
-
-
 def main():
     print("writing fixtures for the Rust port:")
     write("01_psf", fx_psf())
     write("02_lmga", fx_lmga())
-    write("03_evidence", fx_evidence())
-    write("04_end_to_end", fx_end_to_end())
     write("05_geometry", fx_geometry())
-    write("06_passes", fx_passes())
     write("07_filters", fx_filters())
     print("\nport in this order; each layer is meaningless until the one "
           "below it passes.")

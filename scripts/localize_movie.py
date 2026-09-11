@@ -11,29 +11,19 @@ answer, so the output is an honest input for a tracker rather than something
 already smoothed in time. Linking is the next stage and is not this script's
 business.
 
-Which aggregate test, and why this one
---------------------------------------
-`spotsolve` has two, for two physically different objects (README section 10b):
+Aggregates
+----------
+An over-bright detection (sigma_fit ~ sigma, flux >> the frame median) is
+representable, so the search fits it as one bright emitter and it stays
+identifiable; `spotsolve.flag_aggregates` flags it AFTER the search. On
+hyp7gem they fit sigma 1.01-1.14x the PSF while carrying 100-176x the median
+flux: no width signal at all. Objects genuinely wider than the reporting band
+come back in `width_rejects` as "too_wide".
 
-  * OVER-WIDE (sigma_fit >> sigma): the fixed-sigma model cannot represent it,
-    so the search tiles it into dozens of pieces that no later statistic can
-    recover. It must be excluded BEFORE the search -- `detect(...,
-    reject_aggregates=True)`.
-  * OVER-BRIGHT (sigma_fit ~ sigma, flux >> the frame median): representable,
-    so the search fits it correctly as one bright emitter and it stays
-    identifiable. Filter it AFTER -- `spotsolve.flag_aggregates`.
-
-hyp7gem is the second kind, measured: its aggregates fit sigma 1.47-1.65
-against a PSF sigma of 1.45 -- 1.01-1.14x, no width signal at all -- while
-carrying 100-176x the median flux. They look wide on screen only because the
-display saturates. So this script uses the post-hoc filter and leaves
-`reject_aggregates` off; turning it on here does measurable harm, because a
-PSF-width object frozen into the background double-counts against the
-emitters fitted beside it.
-
-The consequence to read, not to hide: on frame 0, 47% of all detected flux is
-in 8 aggregates. That is a fact about the sample, and it is why the flag is
-carried in the table instead of being applied silently.
+The consequence to read, not to hide: on frame 0 of hyp7gem a large share of
+all detected flux sits in a handful of aggregates. That is a fact about the
+sample, and it is why the flag is carried in the table instead of being
+applied silently.
 """
 
 import argparse
@@ -75,17 +65,22 @@ def main(args):
     stack, first = load_stack(args.image, *args.frames)
     print(f"{args.image}: frames {first}..{first + len(stack) - 1}, "
           f"{stack.shape[1]}x{stack.shape[2]} px, sigma={args.sigma}, "
-          f"gain={args.gain}, backend={args.impl}")
+          f"gain={args.gain}, read noise={args.read_noise} e-")
+
+    # One native call for the whole range: frames run in parallel threads.
+    t0 = time.time()
+    results = spotsolve.localize_stack(stack, sigma=args.sigma,
+                                       offset=CAMERA_OFFSET, gain=args.gain,
+                                       read_noise=args.read_noise,
+                                       k_max=args.k_max)
+    dt = (time.time() - t0) / len(stack)
+    print(f"  {len(stack)} frames in {dt * len(stack):.2f} s "
+          f"({1 / dt:.1f} frames/s)")
 
     locs_parts, frame_parts, agg_parts, width_parts = [], [], [], []
     loc_id = 0
-    for k, raw in enumerate(stack):
+    for k, res in enumerate(results):
         frame = first + k
-        t0 = time.time()
-        res = spotsolve.detect(raw, sigma=args.sigma, offset=CAMERA_OFFSET,
-                            gain=args.gain, k_max=args.k_max, impl=args.impl,
-                            verbose=0)
-        dt = time.time() - t0
 
         locs, row, aggs = loctable.frame_tables(
             res, frame=frame, t=frame * args.interval,
@@ -108,7 +103,7 @@ def main(args):
               f"{r['n_width_pruned']:3d}/"
               f"{r['n_width_too_narrow'] + r['n_width_too_wide']:3d}  "
               f"aggregates {r['n_aggregates']:2d} "
-              f"({100 * r['agg_flux_fraction']:4.1f}% of flux)  {dt:.1f}s")
+              f"({100 * r['agg_flux_fraction']:4.1f}% of flux)")
 
     locs = loctable.concat(locs_parts)
     frames = loctable.concat(frame_parts)
@@ -157,7 +152,7 @@ def main(args):
         "sigma_px": args.sigma, "gain": args.gain,
         "camera_offset_adu": CAMERA_OFFSET,
         "pixel_size_um": args.pixel_size, "frame_interval_s": args.interval,
-        "k_max": args.k_max, "impl": args.impl,
+        "k_max": args.k_max, "read_noise_e": args.read_noise,
         "agg_ratio": args.agg_ratio if args.agg_ratio is not None
         else spotsolve.AGG_AMP_RATIO,
         "flux_units": "photoelectrons", "position_units": "px (y, x)",
@@ -183,7 +178,8 @@ if __name__ == "__main__":
     ap.add_argument("--interval", type=float, default=DEFAULT_INTERVAL,
                     help="seconds per frame")
     ap.add_argument("--k-max", type=int, default=12)
-    ap.add_argument("--impl", choices=["py", "rs"], default="rs")
+    ap.add_argument("--read-noise", type=float, default=0.0,
+                    help="camera read noise, e- rms")
     ap.add_argument("--agg-ratio", type=float, default=None,
                     help=f"over-bright cut, flux / the frame's median "
                          f"detection (default {spotsolve.AGG_AMP_RATIO:.0f})")

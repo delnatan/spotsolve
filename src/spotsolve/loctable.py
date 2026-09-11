@@ -1,6 +1,6 @@
 """The standard localization table: `spotsolve` results as `polars` DataFrames.
 
-`core.detect` answers a question about ONE image. Everything downstream --
+`spotsolve.localize` answers a question about ONE image. Everything downstream --
 trajectory linking first among them -- asks questions about a MOVIE, and needs
 the per-frame results in one table with a fixed, documented set of columns.
 This module defines that table and nothing else: no detection, no linking, no
@@ -20,7 +20,7 @@ Units
 Pixels and frames are CANONICAL; micrometres and seconds are derived columns,
 present only because the linker's motion model lives in physical units and
 converting in two places invites two conventions. `flux` is in
-photoelectrons, as everywhere downstream of `detect` (README section 2) --
+photoelectrons, as everywhere downstream of `localize` --
 never ADU, and never a peak height.
 
 What the linker actually needs from this table
@@ -96,7 +96,7 @@ FRAME_SCHEMA = {
     "lam": pl.Float64,                # fitted emitters per px^2
     "gain": pl.Float64,
     "n_rounds": pl.UInt32,
-    "seconds": pl.Float64,            # wall clock for this frame's detect()
+    "seconds": pl.Float64,            # wall clock for this frame's search
 }
 
 WIDTH_REJECT_SCHEMA = {

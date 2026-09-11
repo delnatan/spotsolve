@@ -84,3 +84,13 @@ def test_stack_is_frame_by_frame_and_thread_count_free():
     np.testing.assert_allclose(with_images.model_image,
                                L.localize(stack[0], sigma=SIGMA,
                                           gain=1.0).model_image)
+
+
+def test_gain_estimate_is_the_reference_estimator():
+    from spotsolve import calibrate
+    for seed in (17, 18):
+        raw = 2.0 * _sim(seed, background=20.0).image + 100.0
+        got = L.localize(raw, sigma=SIGMA, offset=100.0).gain
+        assert got == pytest.approx(calibrate.estimate_gain(raw, 100.0), rel=1e-9)
+    # A frame too narrow to high-pass falls back to unit gain, as in Python.
+    assert L.localize(np.full((8, 4), 120.0), sigma=SIGMA, offset=100.0).gain == 1.0

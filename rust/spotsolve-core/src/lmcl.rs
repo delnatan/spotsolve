@@ -331,7 +331,7 @@ impl FitWorkspace {
         &self.f[..p * p]
     }
 
-    /// The penalized objective's gradient at the returned parameters.
+    /// The objective's gradient at the returned parameters.
     ///
     /// Valid after a variable-width fit only; the fixed-width path does not
     /// re-evaluate it at exit. Interior components are zero to the
@@ -358,124 +358,6 @@ fn grow(v: &mut Vec<f64>, n: usize) {
 enum ModelKind {
     FixedSigma(f64),
     PerEmitterSigma,
-}
-
-/// Continuous Cauchy width density used by `FocusMixtureWidth` in Python.
-/// Class counts belong to model selection, not this continuous fit penalty.
-#[derive(Clone, Copy, Debug)]
-pub struct WidthPenalty {
-    pub sigma0: f64,
-    pub scale: f64,
-    pub log_z: f64,
-}
-
-impl WidthPenalty {
-    /// The width log density at `sigma`. Public so the derivatives below can
-    /// be checked against it by finite differences rather than by inspection.
-    pub fn logpdf(self, sigma: f64) -> f64 {
-        let u = (sigma - self.sigma0) / self.scale;
-        -(u * u).ln_1p() - self.log_z
-    }
-
-    /// `-sum_k log pi(sigma_k)`.
-    pub fn value(self, theta: &[f64]) -> f64 {
-        -theta
-            .iter()
-            .skip(4)
-            .step_by(4)
-            .map(|&s| self.logpdf(s))
-            .sum::<f64>()
-    }
-
-    /// `d/dsigma (-log pi)`.
-    pub fn gradient(self, sigma: f64) -> f64 {
-        // Analytic derivative: no differencing two nearly equal log densities
-        // in the flat directions of a crowded fit.
-        let u = (sigma - self.sigma0) / self.scale;
-        2.0 * u / (self.scale * (1.0 + u * u))
-    }
-
-    /// `-d^2/dsigma^2 log pi`, clamped at zero.
-    pub fn curvature(self, sigma: f64) -> f64 {
-        let u = (sigma - self.sigma0) / self.scale;
-        (2.0 * (1.0 - u * u) / (1.0 + u * u).powi(2)).max(0.0) / (self.scale * self.scale)
-    }
-}
-
-/// Continuous `Exp(1/a_s)` flux density, as a MAP penalty on the amplitudes.
-///
-/// # Why this exists, when the width prior did not need an argument
-///
-/// The flux prior has always been charged by the *evidence* and omitted from
-/// the *fit*. That is not a small inconsistency: it means the objective the
-/// optimizer minimizes is not the objective the comparison scores, so the
-/// reported configuration is not the mode of the density whose Laplace volume
-/// is then taken around it, and the volume is expanded about the wrong point.
-/// `prior.py`'s header makes the same argument for the width prior -- "a fit
-/// and an evidence that disagree about what a width costs will disagree about
-/// what exists" -- and the amplitude is no different.
-///
-/// The exponential's negative log density is linear in `A`, so its gradient is
-/// the constant `1/a_s` and **its curvature is exactly zero**. It therefore
-/// changes the fitted mode (every amplitude is shrunk until the data's own
-/// gradient balances `1/a_s`) while leaving the Fisher matrix, the Laplace
-/// volume and the reported standard errors untouched. A curved flux prior
-/// would also contribute a `Lambda` block on the amplitudes, which `evidence`
-/// does not carry -- see `prior.py` on the NPMLE that was removed for exactly
-/// that reason. This penalty is deliberately restricted to the exponential.
-#[derive(Clone, Copy, Debug)]
-pub struct FluxPenalty {
-    pub a_s: f64,
-}
-
-impl FluxPenalty {
-    /// `-sum_k log g(A_k)`, the amount the objective is raised by.
-    pub fn value(self, theta: &[f64]) -> f64 {
-        let k = psf::n_emitters_var(theta);
-        let sum: f64 = theta.iter().skip(1).step_by(4).take(k).sum();
-        k as f64 * self.a_s.ln() + sum / self.a_s
-    }
-
-    /// `d/dA (-log g)`, constant. The curvature is zero and is not added.
-    #[inline]
-    pub fn gradient(self) -> f64 {
-        1.0 / self.a_s
-    }
-}
-
-/// The continuous part of the configuration prior, as the fit sees it.
-///
-/// Only the terms that depend on a *continuous* parameter belong here. The
-/// count and class terms of `prior.WidthPrior::log_config` jump at the focus
-/// boundary and are model-selection events, not something the optimizer may
-/// walk across; `dense_group` handles them as discrete alternatives.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct Penalty {
-    pub width: Option<WidthPenalty>,
-    pub flux: Option<FluxPenalty>,
-}
-
-impl Penalty {
-    /// True when there is nothing to charge, so the fit is the plain ML fit.
-    ///
-    /// A flat prior must contribute *no term at all*, not a constant one: the
-    /// LM loop compares `i_cur - i_trial` against `tol_obj = 1e-8`, and a
-    /// constant added to both sides of that subtraction costs low-order bits
-    /// of it. `prior.WidthPrior.is_flat` records the same reasoning.
-    pub fn is_empty(self) -> bool {
-        self.width.is_none() && self.flux.is_none()
-    }
-
-    fn value(self, theta: &[f64]) -> f64 {
-        let mut v = 0.0;
-        if let Some(w) = self.width {
-            v += w.value(theta);
-        }
-        if let Some(f) = self.flux {
-            v += f.value(theta);
-        }
-        v
-    }
 }
 
 /// Fit `theta0` by bounded Fisher-scoring LM on a `h x w` patch.
@@ -522,15 +404,14 @@ pub fn fit(
         bounds,
         halo,
         opts,
-        None,
     )
 }
 
-/// Fit a variable-sigma theta `[b, A0, y0, x0, sigma0, ...]`.
+/// Fit a variable-sigma theta `[b, A0, y0, x0, sigma0, ...]`, by maximum
+/// likelihood.
 ///
-/// Maximum likelihood; use [`fit_var_sigma_map`] for a width prior.
-/// Both width-aware entry points assess the actual feasible quadratic step
-/// and certify convergence using an information-scaled projected gradient.
+/// The width-aware fit assesses the actual feasible quadratic step and
+/// certifies convergence using an information-scaled projected gradient.
 /// They intentionally need not follow the Python reference's trajectory.
 pub fn fit_var_sigma(
     ws: &mut FitWorkspace,
@@ -552,75 +433,6 @@ pub fn fit_var_sigma(
         bounds,
         halo,
         opts,
-        None,
-    )
-}
-
-/// Variable-width MAP fit. Returns the data-only I-divergence, while the
-/// returned Fisher matrix includes the prior's nonnegative curvature, matching
-/// `lmga.fit`: evidence adds the prior itself and must not pay it twice.
-pub fn fit_var_sigma_map(
-    ws: &mut FitWorkspace,
-    theta0: &[f64],
-    h: usize,
-    w: usize,
-    d: &[f64],
-    bounds: &Bounds,
-    halo: Option<&[f64]>,
-    opts: FitOpts,
-    penalty: Option<WidthPenalty>,
-) -> FitInfo {
-    fit_var_sigma_prior(
-        ws,
-        theta0,
-        h,
-        w,
-        d,
-        bounds,
-        halo,
-        opts,
-        Penalty {
-            width: penalty,
-            flux: None,
-        },
-    )
-}
-
-/// Variable-width MAP fit under the full continuous prior: the width density
-/// **and** the exponential flux density.
-///
-/// The same contract as [`fit_var_sigma_map`] -- the returned `i_div` is the
-/// data-only I-divergence, and the returned Fisher matrix carries the width
-/// prior's nonnegative curvature -- because the flux prior's curvature is
-/// exactly zero. See [`FluxPenalty`] for what charging it in the fit changes
-/// and what it deliberately does not.
-#[allow(clippy::too_many_arguments)]
-pub fn fit_var_sigma_prior(
-    ws: &mut FitWorkspace,
-    theta0: &[f64],
-    h: usize,
-    w: usize,
-    d: &[f64],
-    bounds: &Bounds,
-    halo: Option<&[f64]>,
-    opts: FitOpts,
-    penalty: Penalty,
-) -> FitInfo {
-    fit_model(
-        ws,
-        theta0,
-        h,
-        w,
-        ModelKind::PerEmitterSigma,
-        d,
-        bounds,
-        halo,
-        opts,
-        if penalty.is_empty() {
-            None
-        } else {
-            Some(penalty)
-        },
     )
 }
 
@@ -634,7 +446,6 @@ fn fit_model(
     bounds: &Bounds,
     halo: Option<&[f64]>,
     opts: FitOpts,
-    penalty: Option<Penalty>,
 ) -> FitInfo {
     let n = h * w;
     let p = theta0.len();
@@ -662,9 +473,6 @@ fn fit_model(
 
     eval(ws, h, w, model, halo, p, false);
     let mut i_cur = idiv(ws, d, n, false);
-    if let Some(pen) = penalty {
-        i_cur += pen.value(ws.theta.as_slice());
-    }
 
     let mut converged = false;
     let mut stalled = false;
@@ -686,22 +494,6 @@ fn fit_model(
             ws.grad[q] = g;
         }
         fisher(ws, p, n, false);
-        if let Some(pen) = penalty {
-            if let Some(wp) = pen.width {
-                for q in (4..p).step_by(4) {
-                    let sigma = ws.theta.as_slice()[q];
-                    ws.grad[q] += wp.gradient(sigma);
-                    ws.f[q * p + q] += wp.curvature(sigma);
-                }
-            }
-            if let Some(fp) = pen.flux {
-                // Constant gradient, zero curvature: `F` is untouched.
-                let g = fp.gradient();
-                for q in (1..p).step_by(4) {
-                    ws.grad[q] += g;
-                }
-            }
-        }
 
         let stationary = if native_width {
             projected_score(ws, bounds, p) <= opts.tol_grad.max((2.0 * opts.tol_obj).sqrt())
@@ -781,10 +573,7 @@ fn fit_model(
                 pred_dec = quadratic_decrease(&ws.grad[..p], &ws.f[..p * p], &ws.delta[..p]);
             }
             eval(ws, h, w, model, halo, p, true);
-            let mut i_trial = idiv(ws, d, n, true);
-            if let Some(pen) = penalty {
-                i_trial += pen.value(ws.theta_trial.as_slice());
-            }
+            let i_trial = idiv(ws, d, n, true);
 
             let actual_dec = i_cur - i_trial;
             // LM gain ratio: how much of the promised improvement was real.
@@ -841,42 +630,16 @@ fn fit_model(
     // whose parameters are reported, and the only one standard errors may come
     // from.
     fisher(ws, p, n, true);
-    if let Some(pen) = penalty {
-        if let Some(wp) = pen.width {
-            for q in (4..p).step_by(4) {
-                ws.f[q * p + q] += wp.curvature(ws.theta.as_slice()[q]);
-            }
-        }
-        // Return the DATA-ONLY objective. Evidence adds the prior itself and
-        // must not pay it twice.
-        i_cur = idiv(ws, d, n, false);
-    }
     if native_width {
         // A small damped step is not a stationarity certificate. Re-evaluate
         // the score at the returned parameters, including on the last allowed
         // iteration or when objective differences ran out of precision.
-        //
-        // Computed even for a zero-iteration evaluation, because the gradient
-        // is also READ: at an active bound it is the KKT multiplier that
-        // `dense_group`'s box-truncated Laplace volume needs, and a stale one
-        // from the previous fit in this workspace would be silently wrong.
+        // Computed even for a zero-iteration evaluation, so that
+        // [`FitWorkspace::gradient`] never returns the previous fit's.
         for q in 0..p {
             ws.grad[q] = (0..n)
                 .map(|i| ws.j[q * n + i] * ((ws.m[i] - d[i]) / ws.m[i]))
                 .sum();
-        }
-        if let Some(pen) = penalty {
-            if let Some(wp) = pen.width {
-                for q in (4..p).step_by(4) {
-                    ws.grad[q] += wp.gradient(ws.theta.as_slice()[q]);
-                }
-            }
-            if let Some(fp) = pen.flux {
-                let g = fp.gradient();
-                for q in (1..p).step_by(4) {
-                    ws.grad[q] += g;
-                }
-            }
         }
         if opts.max_iter > 0 {
             converged =
@@ -1129,22 +892,6 @@ fn scale_into_box(theta: &Interior, delta: &mut [f64], b: &Bounds) {
 #[cfg(test)]
 mod width_tests {
     use super::*;
-
-    #[test]
-    fn analytic_width_gradient_matches_the_objective() {
-        let prior = WidthPenalty {
-            sigma0: 1.2,
-            scale: 0.24,
-            log_z: -0.3,
-        };
-        for sigma in [0.84, 1.0, 1.2, 1.24, 1.6, 2.64] {
-            let h = 1e-5;
-            let numerical = -(prior.logpdf(sigma + h) - prior.logpdf(sigma - h)) / (2.0 * h);
-            assert!((prior.gradient(sigma) - numerical).abs() < 1e-7);
-        }
-        assert!(prior.curvature(1.2) > 0.0);
-        assert_eq!(prior.curvature(2.64), 0.0);
-    }
 
     #[test]
     fn predicted_decrease_uses_the_feasible_step() {

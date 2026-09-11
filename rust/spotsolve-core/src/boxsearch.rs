@@ -60,9 +60,29 @@ pub const BG_MASK_RADIUS: f64 = 3.0;
 pub const BG_MIN_PIXELS: f64 = 25.0;
 /// `calibrate.SEED_ALPHA`: FIND's family-wise false-seed rate per frame.
 pub const SEED_ALPHA: f64 = 0.05;
-/// `moves.A_MIN` and `core.A_MIN_REL`: the amplitude floor of a fit.
+/// `core.A_MIN` and `core.A_MIN_REL`: the amplitude floor of a fit.
 pub const A_MIN: f64 = 1e-4;
 pub const A_MIN_REL: f64 = 1e-6;
+/// sigma. An out-of-band fit this near the frame border is `Edge`, not a
+/// width flag. `box.EDGE_MARGIN`.
+pub const EDGE_MARGIN: f64 = 1.0;
+/// `calibrate.estimate_gain`'s share of dimmest pixels.
+pub const GAIN_FRAC: f64 = 0.2;
+
+/// What a fitted emitter is reported as. `box._result`'s rule.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum Class {
+    /// Width inside the reporting band: a detection.
+    Focus = 0,
+    /// Narrower than the band, away from the border.
+    Narrow = 1,
+    /// Wider than the band, away from the border.
+    Wide = 2,
+    /// Out of band within `EDGE_MARGIN` sigma of the border, which cuts it:
+    /// not an interior width measurement at all.
+    Edge = 3,
+}
 
 /// What a caller chooses per frame.
 #[derive(Clone, Copy, Debug)]
@@ -76,6 +96,9 @@ pub struct Settings {
     pub slack: (f64, f64),
     pub sweeps: usize,
     pub polish: bool,
+    /// Widths reported as detections, as multiples of `sigma`; `None`
+    /// reports every fit.
+    pub band: Option<(f64, f64)>,
 }
 
 /// One frame's answer. Every fitted emitter, in or out of any reporting band
@@ -88,6 +111,10 @@ pub struct Output {
     pub sig: Vec<f64>,
     /// `3N`: SE of `(A, y, x)` from the polish's Fisher matrix; NaN without.
     pub se: Vec<f64>,
+    /// `N`: each emitter's [`Class`].
+    pub class: Vec<Class>,
+    /// ADU per photoelectron: the caller's, or [`estimate_gain`]'s.
+    pub gain: f64,
     /// `H*W`, in the units of `d_e` (shifted by `read_noise^2`).
     pub background: Vec<f64>,
     pub n_candidates: usize,
@@ -133,14 +160,85 @@ pub fn seed_threshold(h: usize, w: usize, sigma: f64, alpha: f64) -> f64 {
     -statistics::normal_quantile(p)
 }
 
-/// `np.percentile(v, q)`, linear interpolation.
-pub fn percentile(v: &[f64], q: f64) -> f64 {
+/// `np.quantile(v, q)`, linear interpolation, `q` in `[0, 1]`.
+pub fn quantile(v: &[f64], q: f64) -> f64 {
     let mut s = v.to_vec();
     s.sort_by(f64::total_cmp);
-    let pos = (s.len() - 1) as f64 * q / 100.0;
+    let pos = (s.len() - 1) as f64 * q;
     let lo = pos.floor() as usize;
     let hi = (lo + 1).min(s.len() - 1);
     s[lo] + (pos - lo as f64) * (s[hi] - s[lo])
+}
+
+/// `np.percentile(v, q)`, `q` in `[0, 100]`.
+pub fn percentile(v: &[f64], q: f64) -> f64 {
+    quantile(v, q / 100.0)
+}
+
+/// Photon-transfer gain from the dimmest pixels, ADU per photoelectron:
+/// `calibrate.estimate_gain`, whose docstring records where it fails (crowded
+/// fields; it does not transfer between fields). Prefer a measured gain.
+///
+/// On emitter-free pixels `Var = gain * (mean - offset)`, so a high-pass
+/// variance over the mean is the gain. Background is chosen on a 3x3-smoothed
+/// copy, because choosing the dimmest RAW pixels selects on their own noise.
+pub fn estimate_gain(raw: &[f64], h: usize, w: usize, offset: f64) -> f64 {
+    if w < 5 {
+        return 1.0;
+    }
+    let wi = w - 2;
+    let mut hp = Vec::with_capacity(h * wi);
+    let mut mid = Vec::with_capacity(h * wi);
+    for r in 0..h {
+        let row = &raw[r * w..(r + 1) * w];
+        for c in 1..w - 1 {
+            hp.push((row[c - 1] - 2.0 * row[c] + row[c + 1]) / 6f64.sqrt());
+            mid.push(row[c]);
+        }
+    }
+    let smooth = filters::uniform_filter(&mid, h, wi, 3, Mode::Reflect);
+    let cut = quantile(&smooth, GAIN_FRAC);
+    let sel: Vec<usize> = (0..h * wi).filter(|&i| smooth[i] <= cut).collect();
+    if sel.len() < 32 {
+        return 1.0;
+    }
+    let n = sel.len() as f64;
+    let m = sel.iter().map(|&i| mid[i] - offset).sum::<f64>() / n;
+    if m <= 1e-6 {
+        return 1.0;
+    }
+    let hm = sel.iter().map(|&i| hp[i]).sum::<f64>() / n;
+    let var = sel.iter().map(|&i| (hp[i] - hm).powi(2)).sum::<f64>() / n;
+    (var / m).clamp(0.05, 200.0)
+}
+
+/// Each emitter's [`Class`], by `box._result`'s rule: in the band it is a
+/// detection; out of it, near the border it is `Edge`, else `Narrow` or
+/// `Wide` by which side of the band it fell.
+pub fn classify(pos: &[f64], sig: &[f64], h: usize, w: usize, sigma: f64, band: Option<(f64, f64)>) -> Vec<Class> {
+    (0..sig.len())
+        .map(|k| {
+            let Some((lo, hi)) = band else {
+                return Class::Focus;
+            };
+            let s = sig[k];
+            if s >= lo * sigma && s <= hi * sigma {
+                return Class::Focus;
+            }
+            let (y, x) = (pos[2 * k], pos[2 * k + 1]);
+            let border = (y + 0.5)
+                .min(h as f64 - 0.5 - y)
+                .min(x + 0.5)
+                .min(w as f64 - 0.5 - x);
+            if border <= EDGE_MARGIN * sigma {
+                Class::Edge
+            } else if s < lo * sigma {
+                Class::Narrow
+            } else {
+                Class::Wide
+            }
+        })
+        .collect()
 }
 
 fn median(v: &[f64]) -> f64 {
@@ -629,11 +727,14 @@ pub fn localize(
     } else {
         0
     };
+    let class = classify(&pos, &sig, h, w, s.sigma, s.band);
     Output {
         pos,
         amp,
         sig,
         se,
+        class,
+        gain: f64::NAN,
         background: bmap,
         n_candidates: nc,
         n_boxes: nb,
@@ -728,50 +829,36 @@ fn polish(
     fits
 }
 
-/// Background plus every emitter at its own width, each rendered within
-/// `truncate` of its own sigma. `calibrate.render_model`.
-pub fn render_var(
-    pos: &[f64],
-    amp: &[f64],
-    sig: &[f64],
+/// Localize one raw frame: `d_e = (raw - offset) / gain + shift`, with the
+/// gain estimated from the frame when `gain` is `None`. `shift` is
+/// `read_noise^2` (e-^2), the shifted-Poisson term.
+#[allow(clippy::too_many_arguments)]
+pub fn localize_raw(
+    raw: &[f64],
     h: usize,
     w: usize,
-    background: &[f64],
-    truncate: f64,
-) -> Vec<f64> {
-    let mut m = background.to_vec();
-    let mut f = psf::Factors::new(1, 1, 1);
-    let mut sub = Vec::new();
-    for k in 0..amp.len() {
-        let (cy, cx, sk) = (pos[2 * k], pos[2 * k + 1], sig[k]);
-        let rad = (truncate * sk).ceil() as i64;
-        let y0 = (cy.floor() as i64 - rad).max(0) as usize;
-        let y1 = ((cy.ceil() as i64 + rad + 1).max(0) as usize).min(h);
-        let x0 = (cx.floor() as i64 - rad).max(0) as usize;
-        let x1 = ((cx.ceil() as i64 + rad + 1).max(0) as usize).min(w);
-        if y1 <= y0 || x1 <= x0 {
-            continue;
-        }
-        let ay: Vec<f64> = (y0..y1).map(|v| v as f64).collect();
-        let ax: Vec<f64> = (x0..x1).map(|v| v as f64).collect();
-        sub.clear();
-        sub.resize(ay.len() * ax.len(), 0.0);
-        f.ensure(ay.len(), ax.len(), 1);
-        psf::model_ax(&[0.0, amp[k], cy, cx], &ay, &ax, sk, None, &mut f, &mut sub);
-        for r in y0..y1 {
-            for c in x0..x1 {
-                m[r * w + c] += sub[(r - y0) * (x1 - x0) + (c - x0)];
-            }
-        }
-    }
-    m
+    offset: f64,
+    gain: Option<f64>,
+    shift: f64,
+    roi: Option<&[bool]>,
+    s: &Settings,
+    ws: &mut Workspace,
+    d: &mut Vec<f64>,
+) -> Output {
+    let g = gain.unwrap_or_else(|| estimate_gain(raw, h, w, offset));
+    d.clear();
+    d.extend(raw.iter().map(|&r| (r - offset) / g + shift));
+    let mut o = localize(d, h, w, roi, s, ws);
+    o.gain = g;
+    o
 }
 
 /// Localize every frame of a stack on `n_threads` workers. Frames are
 /// independent, so each worker takes the next undone frame and keeps its own
 /// [`Workspace`]; the output is in frame order whatever the scheduling.
 ///
-/// `raw` is `n*H*W`; frame `t` becomes `(raw - offset) / gain[t] + shift`.
+/// `raw` is `n*H*W`; each frame goes through [`localize_raw`], with one
+/// `gain` for the whole stack or, if `None`, one estimated per frame.
 #[allow(clippy::too_many_arguments)]
 pub fn localize_stack(
     raw: &[f64],
@@ -779,7 +866,7 @@ pub fn localize_stack(
     h: usize,
     w: usize,
     offset: f64,
-    gain: &[f64],
+    gain: Option<f64>,
     shift: f64,
     roi: Option<&[bool]>,
     s: &Settings,
@@ -788,7 +875,6 @@ pub fn localize_stack(
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
     assert_eq!(raw.len(), n * h * w);
-    assert_eq!(gain.len(), n);
     let next = AtomicUsize::new(0);
     let out: Mutex<Vec<Option<Output>>> = Mutex::new((0..n).map(|_| None).collect());
     let workers = n_threads.clamp(1, n.max(1));
@@ -796,17 +882,14 @@ pub fn localize_stack(
         for _ in 0..workers {
             scope.spawn(|| {
                 let mut ws = Workspace::new();
-                let mut d = vec![0.0; h * w];
+                let mut d = Vec::with_capacity(h * w);
                 loop {
                     let t = next.fetch_add(1, Ordering::Relaxed);
                     if t >= n {
                         break;
                     }
                     let frame = &raw[t * h * w..(t + 1) * h * w];
-                    for (v, &r) in d.iter_mut().zip(frame) {
-                        *v = (r - offset) / gain[t] + shift;
-                    }
-                    let o = localize(&d, h, w, roi, s, &mut ws);
+                    let o = localize_raw(frame, h, w, offset, gain, shift, roi, s, &mut ws, &mut d);
                     out.lock().expect("no worker panics while holding it")[t] = Some(o);
                 }
             });
@@ -858,8 +941,10 @@ mod tests {
             slack: (0.7, 2.2),
             sweeps: SWEEPS,
             polish: true,
+            band: Some((0.8, 2.0)),
         };
         let o = localize(&d, h, w, None, &s, &mut Workspace::new());
+        assert_eq!(o.class, vec![Class::Focus]);
         assert_eq!(o.amp.len(), 1, "found {:?}", o.pos);
         assert!(o.se.iter().all(|v| v.is_finite() && *v > 0.0));
         // Noise-free, so what is left is the background map's own bias: the

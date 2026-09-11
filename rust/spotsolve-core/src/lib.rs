@@ -1,50 +1,36 @@
-//! `spotsolve` core: emitter detection and localization on one frame.
+//! `spotsolve` core: emitter detection and localization.
 //!
-//! A Rust port of the Python reference in this repository's root. `README.md`
-//! describes what the algorithm does and why; `PORTING_NOTES.md` records the
-//! implementation practices this port is built on, and its section numbers are
-//! cited throughout as `[Pn]`.
+//! The operational detector is [`boxsearch`]: in each box, an emitter exists
+//! iff it lowers the Poisson deviance by `ADD_NATS`, and a whole frame --
+//! FIND, the background surface, the search and the polish -- runs here. Its
+//! reference is `box.py`, which holds the measurements behind the constants.
+//! [`sparse`] is the independent-source alternative: one significance-tested
+//! candidate pass and one fit per peak.
 //!
-//! # What lives here, and what does not
+//! The rest are the layers those two are built from: [`psf`] (the
+//! pixel-integrated Gaussian and its Jacobian), [`lmcl`] (the bounded Poisson
+//! fitter), [`linalg`] (its Cholesky), [`filters`] (`scipy.ndimage`'s filters,
+//! matched exactly), [`grid`] and [`patches`] (spatial grouping), [`render`]
+//! (images and masks) and [`statistics`].
 //!
-//! This crate owns the per-frame compute: every emitter fit, every evidence
-//! evaluation, every window. It does **not** own `detect`'s round loop, the
-//! `scipy.ndimage` filtering in `find_candidates`, or `background_map`'s
-//! convolutions -- those stay in `core.py`. Every filter call in the pipeline
-//! is per-*round* (~40 per frame, against ~700k fits) and profiles at 0.1-0.3%,
-//! so reimplementing scipy's kernel construction and its three boundary modes
-//! would buy 0.3% for the most fidelity-fragile code in the port.
-//!
-//! The entry points are therefore *passes*, not a `detect`: see `passes`.
+//! `PORTING_NOTES.md` records the implementation practices this port is
+//! built on; its section numbers are cited throughout as `[Pn]`.
 //!
 //! # Portability
 //!
 //! Pure Rust. `libm` is the only dependency, no `build.rs`, no C toolchain, no
 //! `cfg(target_os)`. `libm::erf` is a port of musl's, so it is bit-identical on
-//! macOS, Linux and Windows -- which is what makes the fingerprint test
-//! meaningful on more than one machine. Do not enable fast-math, and do not
-//! build with `-C target-cpu=native`: FMA contraction would change f64 results
-//! between machines [P2].
+//! macOS, Linux and Windows. Do not enable fast-math, and do not build with
+//! `-C target-cpu=native`: FMA contraction would change f64 results between
+//! machines [P2].
 
 pub mod boxsearch;
-pub mod dense_group;
-pub mod evidence;
 pub mod filters;
 pub mod grid;
-pub mod inference;
 pub mod linalg;
 pub mod lmcl;
-pub mod moves;
-pub mod passes;
 pub mod patches;
 pub mod psf;
 pub mod render;
-pub mod search;
 pub mod sparse;
 pub mod statistics;
-
-pub mod affine;
-
-pub mod geometry;
-
-pub mod uncertainty;

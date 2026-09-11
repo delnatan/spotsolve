@@ -44,7 +44,7 @@ scripts = [
 # The `spotsolve_rs` extension is NOT listed here: it is a local sibling crate
 # built from `rust/spotsolve-py`, not a published dependency. Build it with
 #     maturin develop --release -m rust/spotsolve-py/Cargo.toml
-# It is required for spotsolve.inference; `detect(..., impl="rs")` also uses it.
+# `spotsolve.localize`, `localize_stack` and `localize_sparse` require it.
 # `dev` carries the build tool itself (maturin), not the extension it builds.
 dev = ["maturin>=1.4"]
 test = ["pytest>=7.0"]

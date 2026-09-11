@@ -21,53 +21,16 @@ fn variable_sigma_objectives_do_not_regress_against_the_reference() {
         let (_, _, d) = mat_at(case, "data");
         let theta0 = vec_at(case, "theta0");
         let bounds = Bounds::new(&vec_at(case, "lower"), &vec_at(case, "upper"));
-        let prior = &case["penalty"];
-        let sigma0 = f64_at(prior, "sigma0");
-        let scale = f64_at(prior, "scale");
-        let log_z = scale.ln()
-            + (((f64_at(prior, "hi") - sigma0) / scale).atan()
-                - ((f64_at(prior, "lo") - sigma0) / scale).atan())
-            .ln();
-        for mode in ["ml", "map"] {
-            let penalty = (mode == "map").then_some(lmcl::WidthPenalty {
-                sigma0,
-                scale,
-                log_z,
-            });
-            let info = lmcl::fit_var_sigma_map(
-                &mut ws,
-                &theta0,
-                h,
-                w,
-                &d,
-                &bounds,
-                None,
-                FitOpts::default(),
-                penalty,
-            );
-            let want = &case[mode];
-            let reference = vec_at(want, "theta");
-            let objective = |theta: &[f64], data_i: f64| {
-                data_i
-                    + if mode == "map" {
-                        theta
-                            .iter()
-                            .skip(4)
-                            .step_by(4)
-                            .map(|s| {
-                                let u = (s - sigma0) / scale;
-                                (u * u).ln_1p() + log_z
-                            })
-                            .sum::<f64>()
-                    } else {
-                        0.0
-                    }
-            };
-            let got = objective(ws.theta(), info.i_div);
-            let expected = objective(&reference, f64_at(want, "I"));
+        // Maximum likelihood: the fixture's `ml` column. (Its `map` column
+        // scored the width prior `detect` fitted with; nothing fits that now.)
+        {
+            let info = lmcl::fit_var_sigma(&mut ws, &theta0, h, w, &d, &bounds, None, FitOpts::default());
+            let want = &case["ml"];
+            let expected = f64_at(want, "I");
             assert!(
-                got <= expected + 1e-6,
-                "{mode}: native objective {got} > reference {expected}"
+                info.i_div <= expected + 1e-6,
+                "native objective {} > reference {expected}",
+                info.i_div
             );
             for (q, &value) in ws.theta().iter().enumerate() {
                 assert!(value > bounds.lo()[q] && value < bounds.hi()[q]);

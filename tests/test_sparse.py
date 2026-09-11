@@ -173,26 +173,3 @@ def test_sparse_api_has_no_python_optimizer_fallback(monkeypatch):
         ),
     )
     assert len(spotsolve.localize_sparse(image).positions) == 1
-
-
-def test_isolated_source_agrees_with_calibrated_dense_fit():
-    from scipy.special import ndtr
-    from spotsolve.inference import FocusedModel, PixelPSFBank, fit_component
-
-    depths = np.linspace(0, 0.6, 7)
-    offsets = np.arange(-22, 22.01, 0.5)
-    responses = []
-    for depth in depths:
-        width = 1.2 + 3 * depth
-        axis = ndtr((offsets + 0.5) / width) - ndtr((offsets - 0.5) / width)
-        responses.append(np.maximum(axis[:, None] * axis[None, :], 1e-100))
-    bank = PixelPSFBank(depths, offsets, np.asarray(responses))
-    model = FocusedModel((21, 21), (5, 5, 15, 15), bank, seed_sigma=1.2)
-    theta = np.r_[np.full(16, 0.4), 0.0, 10.0, 10.0, 0.25,
-                  0.9, 10.25, 9.7]
-    image = model.evaluate(1, theta)[0]
-    dense = fit_component(image, model, candidate_centres=[[10.25, 9.7]])[1]
-    sparse = spotsolve.localize_sparse(image, 1.2)
-    assert len(sparse.positions) == 1
-    np.testing.assert_allclose(sparse.positions, dense.positions, atol=2e-4)
-    np.testing.assert_allclose(sparse.amplitudes, dense.fluxes, rtol=2e-5)

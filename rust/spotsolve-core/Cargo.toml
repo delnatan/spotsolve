@@ -7,8 +7,7 @@ rust-version.workspace = true
 [dependencies]
 # The entire runtime dependency budget. libm is a pure-Rust port of musl's math,
 # so erf is bit-identical on macOS, Linux and Windows -- better for
-# reproducibility than any system libm, and it is what makes the fingerprint
-# test meaningful on more than one machine. No BLAS, no faer, no ndarray: at
+# reproducibility than any system libm, and it keeps results identical across machines. No BLAS, no faer, no ndarray: at
 # p ~ 25 the call overhead of a library exceeds the arithmetic (PORTING_NOTES
 # section 4).
 libm = "0.2"
@@ -20,11 +19,5 @@ serde_json = "1"
 [[example]]
 name = "lmcl_report"
 
-[[example]]
-name = "split_diag"
 
-[[example]]
-name = "refine_diag"
 
-[[example]]
-name = "pass_bench"

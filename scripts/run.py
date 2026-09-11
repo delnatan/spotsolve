@@ -4,7 +4,7 @@ The acceptance test is the audit panel (yellow = missed, cyan = over-modelled),
 not N and not the residual spread. Everything shown comes from the model
 `spotsolve` itself accepted; nothing here re-fits or culls afterwards.
 
-    python run.py --image beads_60x_still_02.tif --gain 4.23
+    python run.py --image beads_60x_still_02.tif --gain 4.23 --read-noise 1.6
 """
 
 import argparse
@@ -44,11 +44,9 @@ def main(args):
     print(f"{args.image}  {img.shape}  gain={args.gain}")
 
     t = time.time()
-    res = spotsolve.detect(img, sigma=args.sigma, offset=CAMERA_OFFSET,
-                        impl=args.impl,
-                        gain=args.gain, k_max=args.k_max,
-                        bg_kernel=None if args.flat_bg else spotsolve.BG_KERNEL,
-                        verbose=1)
+    res = spotsolve.localize(img, sigma=args.sigma, offset=CAMERA_OFFSET,
+                             gain=args.gain, read_noise=args.read_noise,
+                             k_max=args.k_max)
     dt = time.time() - t
 
     d_e = (img.astype(float) - CAMERA_OFFSET) / res.gain
@@ -56,8 +54,7 @@ def main(args):
     nr = (d_e - res.model_image) / np.sqrt(np.maximum(res.model_image, 1e-6))
 
     print(f"\nN={len(res.positions)}  gain={res.gain:.3f}  "
-          f"bg={np.median(res.background):.2f}  lam={res.lam:.4f}  "
-          f"A_s={res.A_s:.1f}  {dt:.1f}s")
+          f"bg={np.median(res.background):.2f}  {dt:.3f}s  {res.history[0]}")
     print(audit.format_report(a, label=args.image))
     if res.se is not None and len(res.se) and np.isfinite(res.se).any():
         sp = np.nanmedian(np.hypot(res.se[:, 1], res.se[:, 2]))
@@ -65,8 +62,6 @@ def main(args):
     if len(res.amplitudes):
         q = np.percentile(res.amplitudes, [5, 50, 95])
         print(f"amplitude e- (5/50/95): {q[0]:.0f} / {q[1]:.0f} / {q[2]:.0f}")
-    if res.history:
-        print(f"N per round: {[h['N'] for h in res.history]}")
     rep = spotsolve.aggregate_report(res, ratio=args.agg_ratio)
     if rep["n_aggregates"]:
         print(f"\naggregates (post-hoc, flux > {args.agg_ratio:.0f}x the "
@@ -79,28 +74,29 @@ def main(args):
             print(f"{o['y']:8.2f} {o['x']:8.2f} {o['flux']:11.0f} "
                   f"{o['ratio']:9.1f} {o['n']:5d}")
 
-    if res.aggregates is not None and len(res.aggregates):
+    rej = res.width_rejects
+    wide = (rej[rej["reason"] == "too_wide"] if rej is not None
+            else np.empty(0, dtype=spotsolve.WIDTH_REJECT_DTYPE))
+    if len(wide):
         print(f"\nwide objects (modelled, not reported as detections): "
-              f"{len(res.aggregates)}")
-        print(f"{'y':>8} {'x':>8} {'sigma':>7} {'flux e-':>10} {'radius':>7}")
-        for g in np.sort(res.aggregates, order="flux")[::-1]:
+              f"{len(wide)}")
+        print(f"{'y':>8} {'x':>8} {'sigma':>7} {'flux e-':>10}")
+        for g in np.sort(wide, order="flux")[::-1]:
             print(f"{g['y']:8.2f} {g['x']:8.2f} {g['sigma']:7.2f} "
-                  f"{g['flux']:10.0f} {g['radius']:7.1f}")
+                  f"{g['flux']:10.0f}")
 
     fig, ax = plt.subplots(1, 4, figsize=(15, 4.0))
     ax[0].imshow(img, cmap="gray")
     if len(res.positions):
         ax[0].plot(res.positions[:, 1], res.positions[:, 0], "r+", ms=8, mew=1.3)
-    if res.aggregates is not None and len(res.aggregates):
-        # Drawn at the object's own support, so what the model absorbed as a
-        # non-point-source is visible rather than merely tabulated.
-        for g in res.aggregates:
-            ax[0].add_patch(plt.Circle((g["x"], g["y"]), g["radius"],
-                                       fill=False, ec="orange", lw=1.4,
-                                       ls="--"))
+    # Wide objects drawn at twice their fitted width, so what the model
+    # absorbed as a non-point-source is visible rather than merely tabulated.
+    for g in wide:
+        ax[0].add_patch(plt.Circle((g["x"], g["y"]), 2 * g["sigma"],
+                                   fill=False, ec="orange", lw=1.4, ls="--"))
     ttl = f"{args.image}\nN={len(res.positions)}"
-    if res.aggregates is not None and len(res.aggregates):
-        ttl += f"  (+{len(res.aggregates)} wide)"
+    if len(wide):
+        ttl += f"  (+{len(wide)} wide)"
     ax[0].set_title(ttl, fontsize=9)
     ax[1].imshow(res.model_image, cmap="gray")
     ax[1].set_title("model", fontsize=9)
@@ -139,14 +135,11 @@ if __name__ == "__main__":
     ap.add_argument("--sigma", type=float, default=1.2)
     ap.add_argument("--gain", type=float, default=4.23,
                     help="ADU per photoelectron; omit to estimate (calibrate.py)")
-    ap.add_argument("--impl", choices=["py", "rs"], default="py",
-                    help="which implementation runs the four passes; "
-                         "'rs' needs the maturin-built spotsolve_rs (see rust/)")
+    ap.add_argument("--read-noise", type=float, default=0.0,
+                    help="camera read noise, e- rms")
     ap.add_argument("--k-max", type=int, default=12)
     ap.add_argument("--agg-ratio", type=float, default=spotsolve.AGG_AMP_RATIO,
                     help="post-hoc aggregate flag: flux as a multiple of the "
                          "frame's median detection (reported, never removed)")
-    ap.add_argument("--flat-bg", action="store_true",
-                    help="one background scalar for the frame, no surface")
     ap.add_argument("--out", default="result.png")
     main(ap.parse_args())
