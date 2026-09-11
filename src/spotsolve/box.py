@@ -2,8 +2,10 @@
 
 Pipeline
 --------
-    d_e = (raw - offset) / gain
-    FIND     LoG peaks on the image, once                   -> candidates
+    d_e = (raw - offset) / gain + read_noise^2
+    FIND     LoG peaks on the image, once, inside `roi`     -> candidates
+    BMAP     smooth background surface, candidates masked   -> each box's
+             known background shape; its level stays free
     BOXES    candidates whose footprints touch share a box, <= k_max each
     SWEEPS times, for each box, brightest first:
         fit the background alone (K = 0)
@@ -22,9 +24,9 @@ no conditioning guard and no width prior: a collapsed or redundant emitter
 explains almost no deviance, so it cannot pay ADD_NATS on the way in and costs
 almost nothing on the way out.
 
-Step 1 of the box-search ladder: a constant background per box and the
-existing variable-width fitter. The hot-pixel screen, a plane per box and the
-wide unreported class are later steps.
+The box-search ladder so far: the variable-width fitter, the read-noise
+model, the ROI and the smooth background map. The wide unreported class for
+3-8 px haze is the next step.
 """
 
 import numpy as np
@@ -88,9 +90,12 @@ SWEEPS = 2
 #     3       .827     .935      5.5             942
 
 FIT_TOL_OBJ = 1e-6
-# nats of predicted decrease. A decision here only has to resolve dI against
-# ADD_NATS; `core.EVIDENCE_TOL_OBJ`'s 1e-8 served a score differenced to
-# +0.02 nats. Provisional until measured against 1e-8 on this search.
+# nats. A decision here only has to resolve dI against ADD_NATS, where
+# `core.EVIDENCE_TOL_OBJ`'s 1e-8 served a score differenced to +0.02 nats.
+# Measured 2026-09-11 against 1e-8 and 1e-4 on the eight referee cells (flat
+# and haze, three seeds): recall and precision agreed to within one emitter
+# per cell at all three. On the real frames, 1e-8 moved positions by
+# 0.006 px (glycerol f0) and 0.036 px (GEM f0), and 1e-4 by 0.03-0.04 px.
 
 FIT_MAX_ITER = 100
 
@@ -99,6 +104,49 @@ EDGE_MARGIN = 1.0
 # frame border is reported as "edge". On beads_60x_still (in-focus beads on
 # the coverslip, sigma0 1.0 px) the fits cut off by the border sat 0-0.5 px
 # from it; the two narrow interior fits sat 1.9 px and further in.
+
+# Read noise: the shifted-Poisson approximation. A pixel's variance is
+# m + sigma_r^2, not m, and adding s = sigma_r^2 (e-^2) to both the data and
+# the model gives a Poisson likelihood with exactly that variance and mean
+# m + s. Here it is a shift of `d_e` alone: every box model already carries
+# a free constant background, which absorbs `s`, and FIND's `sqrt(model)`
+# normalization then divides by the right standard deviation. `s` is taken
+# back off the reported background and model.
+#
+# Without it, at low background a read-noise spike reads as a significant
+# single-pixel source. Measured 2026-09-10 on 64x64 `simulate` frames with
+# Gaussian read noise added, false detections per frame on EMPTY frames (six
+# seeds), then recall / precision at density 0.015, flux U(150, 500) e-
+# (three seeds):
+#
+#   bg e-  sigma_r   empty: Poisson  shifted    Poisson        shifted
+#    1.0     1.6             1.2       0.0     .837 .937      .830 .983
+#    1.0     2.5            13.3       0.0     .823 .811      .823 .983
+#    3.0     2.5             5.7       0.0     .837 .922      .816 .975
+#   10.0     2.5             0.5       0.0     .773 .965      .730 .963
+#
+# With no read noise the two are the same pipeline. The recall the shifted
+# model gives up where sigma_r^2 rivals the background is not yet traced to
+# individual emitters.
+
+# Background: `core.background_map`, a masked 25 px local mean, is each box's
+# known shape, with the box's level free. It was chosen over a plane per box
+# (b + slopes as free parameters) and over a free constant alone. Measured
+# 2026-09-11 on the referee frames (64x64, flux U(900, 1900) e-, bg 20 e-,
+# seeds 17-19), recall / precision / invented per frame. Haze `L, H` is white
+# noise Gaussian-filtered at L px, scaled to span [0, H] e-:
+#
+#   cell               constant           plane              map
+#   flat  0.015 0.4    .702 .980  0.7     .660 .949  1.7     .695 .970  1.0
+#   flat  0.055 0.4    .424 .855 12.3     .426 .856 12.3     .438 .873 11.0
+#   haze  L15 H60      .701 .957  3.3     .707 .978  1.7     .729 .992  0.7
+#   haze  L5  H60      .682 .952  3.7     .670 .960  3.0     .704 .966  2.7
+#   haze  L15 H20      .710 .983  1.3     .698 .978  1.7     .698 .961  3.0
+#
+# The plane's two extra parameters cost sparse fields; the map costs no fit
+# parameters or time. Weak haze (H20) is the map's one worse cell, by 3-6
+# events over three frames. Re-estimating the map from the fitted emitters
+# after the first sweep moved nothing beyond seed noise.
 
 # No width prior. Every fit here is a plain ML fit over the width bounds
 # `slack`. `detect`'s MAP width penalty pulls every width toward sigma0; in
@@ -134,7 +182,7 @@ def _near_rect(pos, sig, sigma, y0, x0, y1, x1):
 class _Box:
     """One box's data, grids, halo and ownership mask."""
 
-    def __init__(self, d_e, patch, own, other, halo, sigma, bg):
+    def __init__(self, d_e, patch, own, other, halo, sigma, bg, roi=None):
         self.y0, self.x0 = patch.y0, patch.x0
         self.sub = np.asarray(d_e[patch.y0:patch.y1, patch.x0:patch.x1])
         h, w = self.sub.shape
@@ -150,6 +198,8 @@ class _Box:
             d_oth = np.min(np.hypot(gy[..., None] - other[:, 0],
                                     gx[..., None] - other[:, 1]), axis=-1)
             self.owned &= d_own <= d_oth
+        if roi is not None:
+            self.owned &= roi[patch.y0:patch.y1, patch.x0:patch.x1]
 
 
 class _Search:
@@ -182,9 +232,8 @@ class _Search:
         true on seed 17, precision 0.74)."""
         _, b, A, cy, cx, sg = state
         box = self.box
-        model = (core._model_any(b, A, cy, cx, sg, box.yy, box.xx, self.sigma,
-                                 self.slack, halo=box.halo)
-                 if len(A) else b + box.halo + 0.0 * box.yy)
+        model = core._model_any(b, A, cy, cx, sg, box.yy, box.xx, self.sigma,
+                                self.slack, halo=box.halo)
         resid = box.sub - model
         nr = resid / np.sqrt(np.maximum(model, 1e-6))
         log_f = (-ndi.gaussian_laplace(nr, self.sigma, mode="nearest")
@@ -212,8 +261,10 @@ class _Search:
                 break
             state = trial
         # BACKWARD elimination: every emitter's removal is scored against the
-        # current fit, and the cheapest goes while it costs < ADD_NATS.
-        while len(state[2]) > 0:
+        # current fit, and the cheapest goes while it costs < ADD_NATS. Not
+        # at K = 1: that removal is the K = 0 fit FORWARD already beat by more
+        # than ADD_NATS. Measured: output bit-identical, 11-25% fewer fits.
+        while len(state[2]) > 1:
             r, b, A, cy, cx, sg = state
             best = None
             for k in range(len(A)):
@@ -227,8 +278,8 @@ class _Search:
         return state
 
 
-def localize_boxes(data_img, sigma=1.2, offset=0.0, gain=None, k_max=12,
-                   threshold=None, slack=core.SIGMA_SLACK,
+def localize_boxes(data_img, sigma=1.2, offset=0.0, gain=None, read_noise=0.0,
+                   roi=None, k_max=12, threshold=None, slack=core.SIGMA_SLACK,
                    band=core.FOCUS_BAND, impl="rs", sweeps=SWEEPS, polish=True,
                    verbose=0):
     """Box-local localization. Returns a `DetectResult`.
@@ -237,12 +288,27 @@ def localize_boxes(data_img, sigma=1.2, offset=0.0, gain=None, k_max=12,
     represent, and the widths reported as in-focus detections. Everything
     outside `band` is still fitted, and returned in `width_rejects`.
     `history[0]` records the box and fit counts.
+
+    `read_noise` is the camera's read noise in e- rms, from the same
+    calibration as `gain` and `offset`; see the read-noise note above. With
+    `gain=None` the gain estimate does not account for it.
+
+    `roi`, a boolean array shaped like the frame, confines the search:
+    candidates outside it are dropped, so no box forms there, and a box
+    places emitters only on ROI pixels. A box still fits every pixel of its
+    rectangle, so an emitter on the ROI's edge keeps its whole PSF. Fitted
+    positions are not clipped to the ROI.
     """
     be = backend_mod.get(impl)
     raw = np.asarray(data_img, dtype=float)
     H, W = raw.shape
+    if roi is not None:
+        roi = np.asarray(roi, dtype=bool)
+        if roi.shape != raw.shape:
+            raise ValueError(f"roi has shape {roi.shape}, frame {raw.shape}")
     g_eff = calibrate.estimate_gain(raw, offset) if gain is None else float(gain)
-    d_e = (raw - offset) / g_eff
+    shift = float(read_noise) ** 2
+    d_e = (raw - offset) / g_eff + shift
     if threshold is None:
         threshold = calibrate.seed_threshold(d_e.shape, sigma)
     b0 = max(float(np.percentile(d_e, 10.0)), core.BG_FLOOR)
@@ -250,6 +316,14 @@ def localize_boxes(data_img, sigma=1.2, offset=0.0, gain=None, k_max=12,
 
     cand, camp, strength = core.find_candidates(d_e, bmap, sigma,
                                                 np.empty((0, 2)), threshold)
+    # The smooth background, from the pixels no candidate reaches -- every
+    # candidate, the ROI's or not, so light outside the ROI stays masked. It
+    # is a known shape in every box and in the polish; each keeps a free
+    # level. See the note above `_render`.
+    bmap = core.background_map(d_e, cand, sigma)
+    if roi is not None and len(cand):
+        inside = roi[cand[:, 0].astype(int), cand[:, 1].astype(int)]
+        cand, camp, strength = cand[inside], camp[inside], strength[inside]
     boxes = build_patches(cand, sigma, d_e.shape,
                           link_radius_factor=core.LINK_FACTOR,
                           halo_radius_factor=core.HALO_FACTOR,
@@ -279,9 +353,10 @@ def localize_boxes(data_img, sigma=1.2, offset=0.0, gain=None, k_max=12,
             yy, xx = np.mgrid[0:h, 0:w] * 1.0
             halo = _render(src_pos[near] - [patch.y0, patch.x0],
                            src_amp[near], src_sig[near], yy, xx) + 0.0 * yy
-            level = float(np.median(bmap[patch.y0:patch.y1,
-                                         patch.x0:patch.x1]))
-            box = _Box(d_e, patch, own, other, halo, sigma, level)
+            level, shape_ = core._window_bg(bmap, patch.y0, patch.x0,
+                                            patch.y1, patch.x1)
+            halo = halo + shape_
+            box = _Box(d_e, patch, own, other, halo, sigma, level, roi)
             search = _Search(box, sigma, slack, be, threshold)
             _, _, A, cy, cx, sg = search.run(k_max)
             n_fits += search.n_fits
@@ -325,8 +400,8 @@ def localize_boxes(data_img, sigma=1.2, offset=0.0, gain=None, k_max=12,
     return DetectResult(
         positions=pos[focus], amplitudes=amp[focus], sigma=sigma,
         lam=float(focus.sum()) / max(H * W, 1), A_s=float(np.mean(amp[focus]))
-        if focus.any() else 0.0, gain=g_eff, background=bmap,
-        n_outer_passes=1, model_image=model, residual=d_e - model,
+        if focus.any() else 0.0, gain=g_eff, background=bmap - shift,
+        n_outer_passes=1, model_image=model - shift, residual=d_e - model,
         se=se[focus], history=history,
         width_rejects=rejects if len(rejects) else None,
         width_filter=dict(band=None if band is None else tuple(band),
