@@ -38,6 +38,15 @@ use crate::psf;
 use crate::render;
 use crate::statistics;
 
+/// Widths a fit may take, as multiples of `sigma`: the MODEL SPACE.
+/// `core.SIGMA_SLACK`, whose note records the measurement.
+pub const SLACK: (f64, f64) = (0.70, 2.2);
+/// Widths reported as detections, as multiples of `sigma`: the REPORTING
+/// BAND. `core.FOCUS_BAND`.
+pub const BAND: (f64, f64) = (0.80, 2.0);
+/// Most emitters one box fits jointly. `patches::K_MAX`.
+pub const K_MAX: usize = crate::patches::K_MAX;
+
 /// Nats of I-divergence an emitter must explain to exist. `box.ADD_NATS`.
 pub const ADD_NATS: f64 = 10.0;
 /// sigma. A box places only on pixels this near one of its own candidates,

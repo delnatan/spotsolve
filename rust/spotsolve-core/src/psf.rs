@@ -16,12 +16,14 @@
 //!
 //! # Layouts
 //!
-//! `theta` is `[b, A_0, y_0, x_0, A_1, y_1, x_1, ...]`, length `3K+1`.
+//! The fit's `theta` is `[b, A_0, y_0, x_0, sigma_0, A_1, ...]`, length
+//! `4K+1`. The render-only [`model_ax`] takes one shared width and
+//! `[b, A_0, y_0, x_0, ...]`, length `3K+1`.
 //!
 //! Pixels are row-major: `m[r*w + c]`.
 //!
 //! The Jacobian is **parameter-major**, `j[q*n + i] = d m_i / d theta_q` --
-//! i.e. transposed relative to the Python's `(h, w, 3K+1)`. `J` is only ever
+//! i.e. transposed relative to the Python's `(h, w, p)`. `J` is only ever
 //! consumed as `J^T (W r)` and `J^T (W J)`, and this layout makes both of those
 //! contiguous reductions and drops the transposes [P7]. The Python fills a
 //! `(h, w, p)` array through strided slices (`J[:, :, 2::3] = ...`), which is
@@ -30,14 +32,12 @@
 //! The separable 1-D factors are emitter-major, `ey[k*h + r]` and
 //! `ex[k*w + c]`.
 //!
-//! # Why the derivatives are split into two entry points
+//! # Why rendering has its own entry point
 //!
-//! `d(ey)/d(sigma)` is read *only* by the free-sigma diagnostic, which the
-//! production path never runs, while the fixed-sigma factors are evaluated
-//! ~1.4M times per frame. So it is emitted by a separate function rather than
-//! computed and discarded [P8]. Do not merge them behind a runtime flag and
-//! rely on dead-code elimination -- it cannot see across the write into an
-//! output slice.
+//! A render needs only `ey` and `ex`; the fit also needs their position and
+//! width derivatives, two more `exp`s per element. So [`model_ax`] and
+//! [`model_var_sigma_ax`] emit the model alone rather than computing the
+//! derivatives and discarding them [P8].
 
 use libm::erf;
 
@@ -248,26 +248,6 @@ pub fn shape_axis(ax: &[f64], centers: &[f64], sigma: f64, e: &mut [f64]) {
     }
 }
 
-/// `(E, dE/dc)` for one axis; each `[k*n + i]`.
-///
-/// ```text
-/// d(ey)/d(cy) = -(1/(sigma*sqrt(2*pi))) * (exp(-u_+^2) - exp(-u_-^2))
-/// ```
-pub fn factors_axis(ax: &[f64], centers: &[f64], sigma: f64, e: &mut [f64], de: &mut [f64]) {
-    let n = ax.len();
-    let kk = 1.0 / (sigma * SQRT2);
-    let inv = 1.0 / (sigma * SQRT2PI);
-    for (k, &c) in centers.iter().enumerate() {
-        let (er, der) = (&mut e[k * n..k * n + n], &mut de[k * n..k * n + n]);
-        for (i, &x) in ax.iter().enumerate() {
-            let up = (x - c + 0.5) * kk;
-            let um = (x - c - 0.5) * kk;
-            er[i] = 0.5 * (erf(up) - erf(um));
-            der[i] = -((-up * up).exp() - (-um * um).exp()) * inv;
-        }
-    }
-}
-
 /// `(E, dE/dc, dE/dsigma)` for one axis in variable-width fitting.
 ///
 /// ```text
@@ -331,12 +311,10 @@ pub fn model_ax(
                 let e_r = ey[r];
                 let row = &mut m[r * w..r * w + w];
                 for c in 0..w {
-                    // a * (ey*ex), NOT (a*ey) * ex. Hoisting `a*ey[r]` out of
-                    // the inner loop saves one multiply and changes the last
-                    // ulp, which puts this entry point a hair away from
-                    // `model_and_jac_ax` -- which must compute `ey*ex` anyway
-                    // for the amplitude column of the Jacobian. The two are
-                    // asserted bit-equal in tests/layer1_psf.rs [P2].
+                    // a * (ey*ex), NOT (a*ey) * ex: `psf.py`'s product order,
+                    // which the fixture asserts to 1e-13. Hoisting `a*ey[r]`
+                    // out of the loop would save a multiply and move the last
+                    // ulp [P2].
                     row[c] += a * (e_r * ex[c]);
                 }
             }
@@ -396,76 +374,6 @@ pub fn model_var_sigma_ax(
                     m[row * w + column] += (amplitude * ey[row]) * ex[column];
                 }
             }
-        }
-    }
-}
-
-/// Model and Jacobian in one pass -- the optimizer's inner loop.
-///
-/// Both are always needed at the same `theta`, and the `erf`/`exp` factors are
-/// the whole cost of either; computing them separately evaluates the axis
-/// factors four times per LM iteration instead of two.
-///
-/// `j` has length `p * n` with `p = 3K+1`, `n = h*w`, laid out parameter-major
-/// (`j[q*n + i]`) -- see the module docs.
-pub fn model_and_jac_ax(
-    theta: &[f64],
-    ay: &[f64],
-    ax: &[f64],
-    sigma: f64,
-    halo: Option<&[f64]>,
-    f: &mut Factors,
-    m: &mut [f64],
-    j: &mut [f64],
-) {
-    let (h, w) = (ay.len(), ax.len());
-    let n = h * w;
-    let k = n_emitters(theta);
-    let p = 3 * k + 1;
-    let b = background(theta);
-    debug_assert_eq!(m.len(), n);
-    debug_assert_eq!(j.len(), p * n);
-
-    // d m / d b == 1 everywhere.
-    for v in j[..n].iter_mut() {
-        *v = 1.0;
-    }
-    for v in m.iter_mut() {
-        *v = b;
-    }
-    if k > 0 {
-        f.unpack(theta);
-        factors_axis(ay, &f.cy[..k], sigma, &mut f.ey, &mut f.dey);
-        factors_axis(ax, &f.cx[..k], sigma, &mut f.ex, &mut f.dex);
-        for kk in 0..k {
-            let a = f.a[kk];
-            let ey = &f.ey[kk * h..kk * h + h];
-            let dey = &f.dey[kk * h..kk * h + h];
-            let ex = &f.ex[kk * w..kk * w + w];
-            let dex = &f.dex[kk * w..kk * w + w];
-            // The three parameter blocks are disjoint columns of j, so they are
-            // split out and written contiguously rather than strided.
-            let (q_a, q_y, q_x) = ((1 + 3 * kk) * n, (2 + 3 * kk) * n, (3 + 3 * kk) * n);
-            for r in 0..h {
-                let (e_r, de_r) = (ey[r], dey[r]);
-                let a_e = a * e_r;
-                let a_de = a * de_r;
-                let off = r * w;
-                for c in 0..w {
-                    let ex_c = ex[c];
-                    let v = e_r * ex_c;
-                    j[q_a + off + c] = v;
-                    j[q_y + off + c] = a_de * ex_c;
-                    j[q_x + off + c] = a_e * dex[c];
-                    m[off + c] += a * v;
-                }
-            }
-        }
-    }
-    if let Some(hl) = halo {
-        debug_assert_eq!(hl.len(), n);
-        for (v, &x) in m.iter_mut().zip(hl) {
-            *v += x;
         }
     }
 }

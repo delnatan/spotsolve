@@ -21,48 +21,52 @@ maturin develop --release -m rust/spotsolve-py/Cargo.toml
 import spotsolve
 
 # frame: a 2D array in ADU; sigma: the in-focus PSF width in pixels.
-result = spotsolve.localize(frame, sigma=1.27, offset=100.0, gain=2.0,
-                            read_noise=1.6)
-result.positions      # (N, 2): y, x in pixels
-result.amplitudes     # (N,): total photoelectrons
-result.se             # (N, 3): standard errors of flux, y, x
-result.fit_sigma      # (N,): each emitter's fitted width
-result.width_rejects  # fits outside the reporting band: too_narrow, too_wide, edge
+locs = spotsolve.localize(frame, sigma=1.27, offset=100.0, gain=1.93,
+                          read_noise=2.41)
+locs.positions      # (N, 2): y, x in pixels
+locs.amplitudes     # (N,): total photoelectrons
+locs.se             # (N, 3): standard errors of flux, y, x
+locs.fit_sigma      # (N,): each emitter's fitted width
+locs.rejects        # fits outside the reporting band: too_narrow, too_wide, edge
 
 # A whole (T, H, W) movie, frames on all cores:
-movie = spotsolve.localize_stack(stack, sigma=1.27, offset=100.0, gain=2.0,
-                                 read_noise=1.6)
+movie = spotsolve.localize_stack(stack, sigma=1.27, offset=100.0, gain=1.93,
+                                 read_noise=2.41)
 ```
 
 `sigma`, `offset`, `gain` and `read_noise` come from your calibration: input
 is converted as `(image - offset) / gain`, and the read noise (electrons rms)
 enters the likelihood so that read-noise spikes at low background are not
 reported as spots. `gain=None` estimates the gain from the frame; prefer a
-measured one. The median of `result.sigma_ratio` over bright spots reads 1.0
-when `sigma` is right.
+measured one.
 
 `roi=` (a boolean mask) confines the search. Pass one ROI covering everything
 you want in a single call rather than tiling a frame: a source just outside
 an ROI is fitted where it actually is, so separate tiles can report the same
 source twice at their seams.
 
+## Calibrate the PSF width
+
+```python
+cal = spotsolve.calibrate_sigma(stack, sigma_guess=1.2, offset=100.0,
+                                gain=1.93, read_noise=2.41)
+cal.sigma, cal.ci   # median fitted width, px, and its 95% bootstrap interval
+```
+
+It localizes with the reporting band off, takes the median of every fitted
+width, and repeats at that value until it settles; the guess need only be
+within ~25%. On a field of one width it lands within ~1-3% of the truth. A
+wider sub-population -- out-of-focus beads, say -- pulls the median up;
+`cal.widths` holds every fitted width for a closer look.
+
 `spotsolve.loctable` turns results into `polars` tables, and
 `spotsolve.flag_aggregates` flags over-bright spots after the fact.
 
-## Sparse emitters
-
-`localize_sparse` is the cheap alternative for isolated spots whose fitting
-windows do not overlap: one Aguet significance pass, then an independent fit
-per candidate, with no model selection between overlapping sources.
-
-```python
-spots = spotsolve.localize_sparse(image, sigma=1.2, offset=100.0, gain=2.4)
-```
-
 ## Development
 
-`src/spotsolve/box.py` is the detector's Python reference: every constant's
-measurement lives there, and the native port (`rust/spotsolve-core/src/
-boxsearch.rs`) is held to statistical parity with it by
-`tests/test_localize.py`. Change the algorithm there first, measure it, then
-port. See [docs/README.md](docs/README.md).
+The detector is `rust/spotsolve-core/src/boxsearch.rs`, bound in
+`rust/spotsolve-py`. `spotsolve.deprecated` is the Python reference
+implementation (`deprecated/box.py` holds the measurement behind every
+constant); the native path is held to statistical parity with it by
+`tests/test_localize.py`, and it will be retired once the Rust is hardened.
+See [docs/README.md](docs/README.md).

@@ -6,14 +6,14 @@ the per-frame results in one table with a fixed, documented set of columns.
 This module defines that table and nothing else: no detection, no linking, no
 plotting. It is the contract between the localizer and whatever consumes it.
 
-Three tables come out of a run, because there are three different row units
+Four tables come out of a run, because there are four different row units
 and forcing them into one would mean either duplicating frame-level facts on
 every detection or hiding them:
 
   `locs`        one row per detection          -- LOCALIZATION_SCHEMA
   `frames`      one row per frame              -- FRAME_SCHEMA
   `aggregates`  one row per flagged object     -- AGGREGATE_SCHEMA
-  `width_rejects` one row per width rejection   -- WIDTH_REJECT_SCHEMA
+  `rejects`     one row per out-of-band fit     -- REJECT_SCHEMA
 
 Units
 -----
@@ -28,7 +28,7 @@ What the linker actually needs from this table
 Position and frame are the obvious part. The part that is not obvious, and is
 the reason a table from this localizer is worth more to a multiple-hypothesis
 tracker than one from a centroid finder, is `se_y`/`se_x`: the per-detection
-CRLB, which `refine` reaches (README section 12). A gate built on them is a
+CRLB from the polish's Fisher information. A gate built on them is a
 real Mahalanobis distance rather than a hand-tuned radius, and it is
 *heteroscedastic* -- a dim emitter in a crowd carries a genuinely wider gate
 than a bright isolated one, which is exactly the distinction that decides
@@ -37,8 +37,8 @@ block of the Fisher matrix is diagonal to the precision that matters here, so
 the two numbers are the whole covariance.
 
 `flux` and `se_flux` are the second linking cue: a real trajectory's flux is
-continuous frame to frame, and `flux_snr` (= A/SE(A), the same statistic the
-search's own acceptance veto uses) says how much to trust it.
+continuous frame to frame, and `flux_snr` (= A/SE(A)) says how much to trust
+it.
 
 Filtering
 ---------
@@ -52,8 +52,8 @@ diffusion coefficients from without saying so.
 import numpy as np
 import polars as pl
 
-from . import core
-from .structs import WIDTH_REJECT_DTYPE
+from . import aggregates
+from .results import REJECT_DTYPE
 
 LOCALIZATION_SCHEMA = {
     "loc_id": pl.UInt32,      # unique over the whole movie; a stable handle
@@ -70,12 +70,11 @@ LOCALIZATION_SCHEMA = {
     "se_x_um": pl.Float64,
     "flux": pl.Float64,       # photoelectrons, total, background-free
     "se_flux": pl.Float64,
-    "flux_snr": pl.Float64,   # flux / se_flux; the search's own A/SE statistic
+    "flux_snr": pl.Float64,   # flux / se_flux
     "bg": pl.Float64,         # photoelectrons/px, background surface here
-    "sigma": pl.Float64,      # px, the PSF sigma the fit was held at
-    "fit_sigma": pl.Float64,  # px, optional post-hoc variable-sigma diagnostic
-    "sigma_ratio": pl.Float64,  # fit_sigma / sigma
-    "width_filter_state": pl.String,
+    "sigma": pl.Float64,      # px, the in-focus PSF sigma the search ran at
+    "fit_sigma": pl.Float64,  # px, this emitter's own fitted width
+    "sigma_ratio": pl.Float64,  # fit_sigma / sigma; a per-emitter defocus readout
     "flux_ratio": pl.Float64,  # flux / this frame's median detection
     "is_aggregate": pl.Boolean,
 }
@@ -84,25 +83,23 @@ FRAME_SCHEMA = {
     "frame": pl.UInt32,
     "t": pl.Float64,
     "n_locs": pl.UInt32,
-    "n_width_pruned": pl.UInt32,
-    "n_width_too_narrow": pl.UInt32,
-    "n_width_too_wide": pl.UInt32,
+    "n_too_narrow": pl.UInt32,
+    "n_too_wide": pl.UInt32,
+    "n_edge": pl.UInt32,
     "n_aggregates": pl.UInt32,        # linked objects, not detections
     "n_locs_flagged": pl.UInt32,      # detections inside those objects
     "median_flux": pl.Float64,
     "agg_flux_fraction": pl.Float64,  # share of detected flux in aggregates
     "median_se_pos": pl.Float64,
     "background": pl.Float64,         # median of the background surface
-    "lam": pl.Float64,                # fitted emitters per px^2
     "gain": pl.Float64,
-    "n_rounds": pl.UInt32,
+    "read_noise": pl.Float64,
     "seconds": pl.Float64,            # wall clock for this frame's search
 }
 
-WIDTH_REJECT_SCHEMA = {
+REJECT_SCHEMA = {
     "frame": pl.UInt32,
     "t": pl.Float64,
-    "source_index": pl.Int64,
     "y": pl.Float64,
     "x": pl.Float64,
     "y_um": pl.Float64,
@@ -138,36 +135,21 @@ def _sample_background(bmap, positions):
 
 def frame_tables(result, frame, t=0.0, pixel_size=1.0, agg_ratio=None,
                  seconds=float("nan"), loc_id0=0):
-    """One `DetectResult` -> its (locs, frame_row, aggregates) tables.
+    """One `Localizations` -> its (locs, frame_row, aggregates) tables.
 
     `agg_ratio` is the over-bright cut as a multiple of THIS frame's median
-    detection; `None` uses `core.AGG_AMP_RATIO`. Being relative to the
+    detection; `None` uses `aggregates.AGG_AMP_RATIO`. Being relative to the
     frame's own median is what lets one number serve a whole movie whose
-    illumination and bleaching drift -- see `core.flag_aggregates`.
+    illumination and bleaching drift -- see `aggregates.flag_aggregates`.
     """
-    ratio = core.AGG_AMP_RATIO if agg_ratio is None else float(agg_ratio)
-    pos = np.atleast_2d(np.asarray(result.positions, float)).reshape(-1, 2)
+    ratio = aggregates.AGG_AMP_RATIO if agg_ratio is None else float(agg_ratio)
+    pos = np.asarray(result.positions, float).reshape(-1, 2)
     amp = np.asarray(result.amplitudes, float).ravel()
+    se = np.asarray(result.se, float).reshape(-1, 3)
     n = len(amp)
-
-    # `se` is (N,3) = (SE_A, SE_y, SE_x), or None if nothing was fitted.
-    if result.se is not None and len(result.se) == n:
-        se = np.asarray(result.se, float)
-    else:
-        se = np.full((n, 3), np.nan)
-
-    mask, objs = core.flag_aggregates(result, ratio=ratio)
+    mask, objs = aggregates.flag_aggregates(result, ratio=ratio)
     med = float(np.median(amp)) if n else float("nan")
     ps = float(pixel_size)
-    if result.fit_sigma is not None and len(result.fit_sigma) == n:
-        fit_sigma = np.asarray(result.fit_sigma, float)
-    else:
-        fit_sigma = np.full(n, float(result.sigma))
-    if result.sigma_ratio is not None and len(result.sigma_ratio) == n:
-        sigma_ratio = np.asarray(result.sigma_ratio, float)
-    else:
-        sigma_ratio = np.ones(n)
-    width_state = "kept" if result.width_filter else "unchecked"
 
     locs = pl.DataFrame(
         {
@@ -185,9 +167,8 @@ def frame_tables(result, frame, t=0.0, pixel_size=1.0, agg_ratio=None,
                                   where=np.isfinite(se[:, 0]) & (se[:, 0] > 0)),
             "bg": _sample_background(result.background, pos),
             "sigma": np.full(n, float(result.sigma)),
-            "fit_sigma": fit_sigma,
-            "sigma_ratio": sigma_ratio,
-            "width_filter_state": np.full(n, width_state),
+            "fit_sigma": np.asarray(result.fit_sigma, float),
+            "sigma_ratio": np.asarray(result.sigma_ratio, float),
             "flux_ratio": amp / med if n else amp,
             "is_aggregate": mask,
         },
@@ -207,20 +188,13 @@ def frame_tables(result, frame, t=0.0, pixel_size=1.0, agg_ratio=None,
     )
 
     flux_total = float(amp.sum())
-    rejects = result.width_rejects
-    n_too_narrow = 0
-    n_too_wide = 0
-    if rejects is not None and len(rejects):
-        n_too_narrow = int(np.sum(rejects["reason"] == "too_narrow"))
-        n_too_wide = int(np.sum(rejects["reason"] == "too_wide"))
-    n_width_pruned = len(result.width_filter.get("var_pruned_indices", [])) \
-        if result.width_filter else 0
+    reason = result.rejects["reason"]
     row = pl.DataFrame(
         {
             "frame": [frame], "t": [t], "n_locs": [n],
-            "n_width_pruned": [n_width_pruned],
-            "n_width_too_narrow": [n_too_narrow],
-            "n_width_too_wide": [n_too_wide],
+            "n_too_narrow": [int(np.sum(reason == "too_narrow"))],
+            "n_too_wide": [int(np.sum(reason == "too_wide"))],
+            "n_edge": [int(np.sum(reason == "edge"))],
             "n_aggregates": [len(objs)],
             "n_locs_flagged": [int(mask.sum())],
             "median_flux": [med],
@@ -229,8 +203,8 @@ def frame_tables(result, frame, t=0.0, pixel_size=1.0, agg_ratio=None,
             "median_se_pos": [float(np.nanmedian(np.hypot(se[:, 1], se[:, 2])))
                               if n else float("nan")],
             "background": [float(np.median(result.background))],
-            "lam": [float(result.lam)], "gain": [float(result.gain)],
-            "n_rounds": [int(result.n_outer_passes)],
+            "gain": [float(result.gain)],
+            "read_noise": [float(result.read_noise)],
             "seconds": [float(seconds)],
         },
         schema=FRAME_SCHEMA,
@@ -238,17 +212,14 @@ def frame_tables(result, frame, t=0.0, pixel_size=1.0, agg_ratio=None,
     return locs, row, aggs
 
 
-def width_reject_table(result, frame, t=0.0, pixel_size=1.0):
-    """Width-filter rejected detections as a table."""
-    rec = result.width_rejects
+def reject_table(result, frame, t=0.0, pixel_size=1.0):
+    """The fits outside the reporting band, as a table."""
+    rec = result.rejects
     ps = float(pixel_size)
-    if rec is None:
-        rec = np.empty(0, dtype=WIDTH_REJECT_DTYPE)
     return pl.DataFrame(
         {
             "frame": np.full(len(rec), frame),
             "t": np.full(len(rec), t),
-            "source_index": rec["source_index"],
             "y": rec["y"], "x": rec["x"],
             "y_um": rec["y"] * ps, "x_um": rec["x"] * ps,
             "flux": rec["flux"],
@@ -256,7 +227,7 @@ def width_reject_table(result, frame, t=0.0, pixel_size=1.0):
             "sigma_ratio": rec["sigma_ratio"],
             "reason": rec["reason"],
         },
-        schema=WIDTH_REJECT_SCHEMA,
+        schema=REJECT_SCHEMA,
     )
 
 

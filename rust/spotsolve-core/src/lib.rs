@@ -1,13 +1,13 @@
 //! `spotsolve` core: emitter detection and localization.
 //!
-//! The operational detector is [`boxsearch`]: in each box, an emitter exists
-//! iff it lowers the Poisson deviance by `ADD_NATS`, and a whole frame --
-//! FIND, the background surface, the search and the polish -- runs here. Its
-//! reference is `box.py`, which holds the measurements behind the constants.
-//! [`sparse`] is the independent-source alternative: one significance-tested
-//! candidate pass and one fit per peak.
+//! The detector is [`boxsearch`]: in each box, an emitter exists iff it
+//! lowers the Poisson deviance by `ADD_NATS`, and a whole frame -- the gain,
+//! FIND, the background surface, the search, the polish and the
+//! classification -- runs here. Its Python reference is
+//! `spotsolve.deprecated.box`, which holds the measurements behind the
+//! constants.
 //!
-//! The rest are the layers those two are built from: [`psf`] (the
+//! The rest are the layers it is built from: [`psf`] (the
 //! pixel-integrated Gaussian and its Jacobian), [`lmcl`] (the bounded Poisson
 //! fitter), [`linalg`] (its Cholesky), [`filters`] (`scipy.ndimage`'s filters,
 //! matched exactly), [`grid`] and [`patches`] (spatial grouping), [`render`]
@@ -32,5 +32,4 @@ pub mod lmcl;
 pub mod patches;
 pub mod psf;
 pub mod render;
-pub mod sparse;
 pub mod statistics;

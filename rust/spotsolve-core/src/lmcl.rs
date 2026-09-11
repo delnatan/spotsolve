@@ -195,14 +195,12 @@ pub struct FitInfo {
 #[derive(Clone, Copy, Debug)]
 pub struct FitOpts {
     pub max_iter: usize,
-    /// Objective resolution, **in nats**. Fixed-width fits use predicted step
-    /// decrease; variable-width fits require projected score <= sqrt(2*tol_obj).
+    /// Objective resolution, **in nats**: a fit has converged when its
+    /// information-scaled projected score is <= sqrt(2*tol_obj).
     pub tol_obj: f64,
     /// Backstop only -- absolute, and the natural scale here is set by fluxes
     /// running to ~2000 electrons, so this is near f64 noise.
     pub tol_grad: f64,
-    /// Backstop only, absolute; see `tol_grad`.
-    pub tol_step: f64,
     pub lambda0: f64,
 }
 
@@ -212,7 +210,6 @@ impl Default for FitOpts {
             max_iter: 100,
             tol_obj: 1e-8,
             tol_grad: 1e-6,
-            tol_step: 1e-10,
             lambda0: 1e-2,
         }
     }
@@ -333,10 +330,9 @@ impl FitWorkspace {
 
     /// The objective's gradient at the returned parameters.
     ///
-    /// Valid after a variable-width fit only; the fixed-width path does not
-    /// re-evaluate it at exit. Interior components are zero to the
-    /// stationarity tolerance, so what this is actually read for is the
-    /// components at an active bound -- the KKT multipliers.
+    /// Interior components are zero to the stationarity tolerance, so what
+    /// this is actually read for is the components at an active bound -- the
+    /// KKT multipliers.
     pub fn gradient(&self, p: usize) -> &[f64] {
         &self.grad[..p]
     }
@@ -354,27 +350,19 @@ fn grow(v: &mut Vec<f64>, n: usize) {
     }
 }
 
-#[derive(Clone, Copy)]
-enum ModelKind {
-    FixedSigma(f64),
-    PerEmitterSigma,
-}
-
-/// Fit `theta0` by bounded Fisher-scoring LM on a `h x w` patch.
+/// Fit a variable-sigma theta `[b, A0, y0, x0, sigma0, ...]` on a `h x w`
+/// patch by bounded Fisher-scoring LM: the Poisson maximum likelihood.
 ///
 /// `d` is the patch data in photoelectrons, row-major. `halo` is the
 /// parameter-free additive contribution (frozen neighbours plus the
-/// background's shape term), or `None`.
+/// background's shape term), or `None`. Results are left in the workspace:
+/// [`FitWorkspace::theta`] and [`FitWorkspace::fisher`].
 ///
-/// Results are left in the workspace: [`FitWorkspace::theta`] and
-/// [`FitWorkspace::fisher`].
+/// Each step is assessed on the actual feasible quadratic step, and
+/// convergence is certified by an information-scaled projected gradient. The
+/// trajectory intentionally need not follow the Python reference's.
 ///
-/// # On `tol_obj`, and why `max_iter` must not be cut for speed
-///
-/// The primary stopping test is on the predicted decrease in `I`, which for the
-/// step solving `A delta = -grad` is `-0.5 * grad . delta`. That is the only
-/// criterion in units the caller cares about: everything downstream compares
-/// I-divergences on the scale of a log Bayes factor [P10].
+/// # Why `max_iter` must not be cut for speed
 ///
 /// Truncating iterations does *not* add symmetric noise. A proposal fit starts
 /// further from its optimum than the incumbent it is compared against, so
@@ -383,36 +371,6 @@ enum ModelKind {
 /// the moves that add an emitter. Measured: capping at 40 iterations still left
 /// 21% of fits more than 0.1 nat above their optimum, with a p99 gap of 72
 /// nats. Make each iteration cheaper instead.
-pub fn fit(
-    ws: &mut FitWorkspace,
-    theta0: &[f64],
-    h: usize,
-    w: usize,
-    sigma: f64,
-    d: &[f64],
-    bounds: &Bounds,
-    halo: Option<&[f64]>,
-    opts: FitOpts,
-) -> FitInfo {
-    fit_model(
-        ws,
-        theta0,
-        h,
-        w,
-        ModelKind::FixedSigma(sigma),
-        d,
-        bounds,
-        halo,
-        opts,
-    )
-}
-
-/// Fit a variable-sigma theta `[b, A0, y0, x0, sigma0, ...]`, by maximum
-/// likelihood.
-///
-/// The width-aware fit assesses the actual feasible quadratic step and
-/// certifies convergence using an information-scaled projected gradient.
-/// They intentionally need not follow the Python reference's trajectory.
 pub fn fit_var_sigma(
     ws: &mut FitWorkspace,
     theta0: &[f64],
@@ -423,37 +381,9 @@ pub fn fit_var_sigma(
     halo: Option<&[f64]>,
     opts: FitOpts,
 ) -> FitInfo {
-    fit_model(
-        ws,
-        theta0,
-        h,
-        w,
-        ModelKind::PerEmitterSigma,
-        d,
-        bounds,
-        halo,
-        opts,
-    )
-}
-
-fn fit_model(
-    ws: &mut FitWorkspace,
-    theta0: &[f64],
-    h: usize,
-    w: usize,
-    model: ModelKind,
-    d: &[f64],
-    bounds: &Bounds,
-    halo: Option<&[f64]>,
-    opts: FitOpts,
-) -> FitInfo {
     let n = h * w;
     let p = theta0.len();
-    let native_width = matches!(model, ModelKind::PerEmitterSigma);
-    let k = match model {
-        ModelKind::FixedSigma(_) => psf::n_emitters(theta0),
-        ModelKind::PerEmitterSigma => psf::n_emitters_var(theta0),
-    };
+    let k = psf::n_emitters_var(theta0);
     assert_eq!(d.len(), n);
     assert_eq!(bounds.len(), p);
     ws.ensure(h, w, k, p);
@@ -471,7 +401,7 @@ fn fit_model(
     let mut lam = opts.lambda0;
     let mut nu = 2.0f64;
 
-    eval(ws, h, w, model, halo, p, false);
+    eval(ws, h, w, halo, p, false);
     let mut i_cur = idiv(ws, d, n, false);
 
     let mut converged = false;
@@ -495,12 +425,7 @@ fn fit_model(
         }
         fisher(ws, p, n, false);
 
-        let stationary = if native_width {
-            projected_score(ws, bounds, p) <= opts.tol_grad.max((2.0 * opts.tol_obj).sqrt())
-        } else {
-            ws.grad[..p].iter().fold(0.0f64, |a, g| a.max(g.abs())) < opts.tol_grad
-        };
-        if stationary {
+        if projected_score(ws, bounds, p) <= opts.tol_grad.max((2.0 * opts.tol_obj).sqrt()) {
             converged = true;
             break;
         }
@@ -521,8 +446,6 @@ fn fit_model(
         }
 
         let mut step_accepted = false;
-        let mut step_norm = 0.0f64;
-        let mut pred_dec = f64::INFINITY;
 
         for _ in 0..30 {
             // Coleman-Li form:
@@ -553,26 +476,19 @@ fn fit_model(
                 continue;
             }
             ws.chol.solve_in_place(&mut ws.delta[..p]);
-
-            // Predicted decrease in I for this step, in nats. Measured BEFORE
-            // the bound scaling below, so it reflects the step the quadratic
-            // model actually proposed.
-            pred_dec = -0.5 * (0..p).map(|q| ws.grad[q] * ws.delta[q]).sum::<f64>();
-
             scale_into_box(&ws.theta, &mut ws.delta[..p], bounds);
 
             let (theta_ref, trial) = (&ws.theta, &mut ws.theta_trial);
             trial.set_step(theta_ref, &ws.delta[..p], bounds);
-            if native_width {
-                // Assess the actual feasible step, after boundary scaling and
-                // interior projection. Using the unscaled step's promise can
-                // reject a good bounded step and drive lambda to saturation.
-                for q in 0..p {
-                    ws.delta[q] = ws.theta_trial.as_slice()[q] - ws.theta.as_slice()[q];
-                }
-                pred_dec = quadratic_decrease(&ws.grad[..p], &ws.f[..p * p], &ws.delta[..p]);
+            // Predicted decrease in I, in nats, of the actual feasible step,
+            // after boundary scaling and interior projection. Using the
+            // unscaled step's promise can reject a good bounded step and drive
+            // lambda to saturation.
+            for q in 0..p {
+                ws.delta[q] = ws.theta_trial.as_slice()[q] - ws.theta.as_slice()[q];
             }
-            eval(ws, h, w, model, halo, p, true);
+            let pred_dec = quadratic_decrease(&ws.grad[..p], &ws.f[..p * p], &ws.delta[..p]);
+            eval(ws, h, w, halo, p, true);
             let i_trial = idiv(ws, d, n, true);
 
             let actual_dec = i_cur - i_trial;
@@ -593,7 +509,6 @@ fn fit_model(
             };
 
             if i_trial < i_cur && rho > 1e-4 {
-                step_norm = ws.delta[..p].iter().map(|v| v * v).sum::<f64>().sqrt();
                 i_cur = i_trial;
                 accept(ws, p, n);
                 // Nielsen (1999): aggressive for a trustworthy step, gentle for
@@ -601,7 +516,6 @@ fn fit_model(
                 lam = (lam * (1.0f64 / 3.0).max(1.0 - (2.0 * rho - 1.0).powi(3))).max(1e-12);
                 nu = 2.0;
                 step_accepted = true;
-                pred_dec = pred_dec.min(actual_dec);
                 break;
             }
             lam *= nu;
@@ -615,38 +529,27 @@ fn fit_model(
             stalled = true; // lambda saturated; NOT the same as converged
             break;
         }
-        if !native_width && pred_dec < opts.tol_obj {
-            // Nothing left to gain on the scale a Bayes factor is decided on.
-            converged = true;
-            break;
-        }
-        if !native_width && step_norm < opts.tol_step {
-            converged = true;
-            break;
-        }
     }
 
     // Final Fisher information, from the accepted model. This is the matrix
     // whose parameters are reported, and the only one standard errors may come
     // from.
     fisher(ws, p, n, true);
-    if native_width {
-        // A small damped step is not a stationarity certificate. Re-evaluate
-        // the score at the returned parameters, including on the last allowed
-        // iteration or when objective differences ran out of precision.
-        // Computed even for a zero-iteration evaluation, so that
-        // [`FitWorkspace::gradient`] never returns the previous fit's.
-        for q in 0..p {
-            ws.grad[q] = (0..n)
-                .map(|i| ws.j[q * n + i] * ((ws.m[i] - d[i]) / ws.m[i]))
-                .sum();
-        }
-        if opts.max_iter > 0 {
-            converged =
-                projected_score(ws, bounds, p) <= opts.tol_grad.max((2.0 * opts.tol_obj).sqrt());
-            if converged {
-                stalled = false;
-            }
+    // A small damped step is not a stationarity certificate. Re-evaluate
+    // the score at the returned parameters, including on the last allowed
+    // iteration or when objective differences ran out of precision.
+    // Computed even for a zero-iteration evaluation, so that
+    // [`FitWorkspace::gradient`] never returns the previous fit's.
+    for q in 0..p {
+        ws.grad[q] = (0..n)
+            .map(|i| ws.j[q * n + i] * ((ws.m[i] - d[i]) / ws.m[i]))
+            .sum();
+    }
+    if opts.max_iter > 0 {
+        converged =
+            projected_score(ws, bounds, p) <= opts.tol_grad.max((2.0 * opts.tol_obj).sqrt());
+        if converged {
+            stalled = false;
         }
     }
 
@@ -790,7 +693,6 @@ fn eval(
     ws: &mut FitWorkspace,
     h: usize,
     w: usize,
-    model: ModelKind,
     halo: Option<&[f64]>,
     p: usize,
     trial: bool,
@@ -801,27 +703,15 @@ fn eval(
     } else {
         (ws.theta.as_slice(), &mut ws.m, &mut ws.j)
     };
-    match model {
-        ModelKind::FixedSigma(sigma) => psf::model_and_jac_ax(
-            theta,
-            &ws.ay[..h],
-            &ws.ax[..w],
-            sigma,
-            halo,
-            &mut ws.factors,
-            &mut m[..n],
-            &mut j[..p * n],
-        ),
-        ModelKind::PerEmitterSigma => psf::model_and_jac_var_sigma_ax(
-            theta,
-            &ws.ay[..h],
-            &ws.ax[..w],
-            halo,
-            &mut ws.factors,
-            &mut m[..n],
-            &mut j[..p * n],
-        ),
-    }
+    psf::model_and_jac_var_sigma_ax(
+        theta,
+        &ws.ay[..h],
+        &ws.ax[..w],
+        halo,
+        &mut ws.factors,
+        &mut m[..n],
+        &mut j[..p * n],
+    );
     for v in m[..n].iter_mut() {
         *v = v.max(1e-9);
     }

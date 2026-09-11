@@ -28,10 +28,10 @@ The design is settled: the variable-width fitter, the read-noise model, the
 ROI and the smooth background map. Two treatments of 3-8 px haze were
 measured and rejected (the notes below).
 
-This module is the REFERENCE. The fast path is its native port,
-`spotsolve.localize` / `localize_stack` (`native.py`, over Rust's
-`boxsearch.rs`), held to statistical parity with it by `tests/test_localize.py`.
-Change the algorithm here first, measure it here, then port.
+This module is the REFERENCE. The detector is its native port,
+`spotsolve.localize` / `localize_stack` (over Rust's `boxsearch.rs`), held to
+statistical parity with it by `tests/test_localize.py`. Change the algorithm
+here first, measure it here, then port -- until this package is retired.
 """
 
 import numpy as np
@@ -40,7 +40,7 @@ import scipy.ndimage as ndi
 from . import backend as backend_mod
 from . import calibrate
 from . import core
-from . import psf
+from .. import psf
 from .patches import build_patches
 from .structs import DetectResult, width_reject_records
 
@@ -395,8 +395,8 @@ def _result(pos, amp, sig, se, bmap, model, d_e, shift, g_eff, sigma, band,
             slack, history):
     """Classify every fitted emitter and assemble the `DetectResult`.
 
-    Shared with the native path in `native.py`, so both report by one rule.
-    `bmap`, `model` and `d_e` are in shifted units, and `shift` is taken
+    `boxsearch::classify` is the same rule in Rust. `bmap`, `model` and `d_e`
+    are in shifted units, and `shift` is taken
     back off. `model=None` skips the model and residual images.
     """
     H, W = bmap.shape

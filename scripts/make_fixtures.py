@@ -22,11 +22,11 @@ import pathlib
 import numpy as np
 import scipy.ndimage as ndi
 
-from spotsolve import calibrate
-from spotsolve import core
-from spotsolve import lmga
 from spotsolve import psf
 from spotsolve import simulate
+from spotsolve.deprecated import calibrate
+from spotsolve.deprecated import core
+from spotsolve.deprecated import lmga
 
 REPO = pathlib.Path(__file__).resolve().parent.parent
 OUT = str(REPO / "tests" / "fixtures")
@@ -300,7 +300,7 @@ def fx_geometry():
     `connected_components` become a uniform grid plus union-find, and the
     O(N*H*W) mask loop becomes an O(N*sigma^2) stamp. Same answers, different
     algorithm -- which is exactly when a golden fixture earns its keep."""
-    from spotsolve import patches as patch_mod
+    from spotsolve.deprecated import patches as patch_mod
     cases = []
     for H, W, n, seed in ((48, 52, 12, 31), (39, 39, 40, 32), (24, 30, 3, 33)):
         rr = np.random.default_rng(seed)

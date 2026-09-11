@@ -1,9 +1,9 @@
 //! PyO3 bindings for `spotsolve-core`, exposed to Python as `spotsolve_rs`.
 //!
 //! The boundary sits at the FRAME: `box_localize` and `box_localize_stack`
-//! (see `boxsearch`) and `localize_sparse` each run a whole frame natively
-//! with the GIL released. `lmcl_fit_var_sigma` exposes one fit, for the
-//! Python reference (`box.py`) and for the fitter's own tests.
+//! (see `boxsearch`) run a whole frame natively with the GIL released.
+//! `lmcl_fit_var_sigma` exposes one fit, for the deprecated Python reference
+//! and for the fitter's own tests.
 //!
 //! Arrays must be C-contiguous f64; `as_slice()` fails loudly otherwise rather
 //! than silently transposing.
@@ -14,7 +14,7 @@ use numpy::{
 };
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
-use spotsolve_core::{lmcl, sparse};
+use spotsolve_core::lmcl;
 
 mod boxsearch;
 
@@ -112,123 +112,6 @@ fn lmcl_fit_var_sigma(
     ))
 }
 
-/// Aguet significance pass followed by independent one-emitter fits.
-///
-/// This deliberately assumes sparse emitters. It performs no add/split/prune
-/// loop and no joint fitting of overlapping candidates.
-#[pyfunction]
-#[pyo3(signature = (data, sigma, alpha=0.05, fit_sigma=false, sigma_bounds=(0.7, 2.2), fit_radius_sigma=4.0, max_iter=100))]
-#[allow(clippy::too_many_arguments)]
-fn localize_sparse<'py>(
-    py: Python<'py>,
-    data: PyReadonlyArray2<'py, f64>,
-    sigma: f64,
-    alpha: f64,
-    fit_sigma: bool,
-    sigma_bounds: (f64, f64),
-    fit_radius_sigma: f64,
-    max_iter: usize,
-) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
-    let shape = [data.shape()[0], data.shape()[1]];
-    let values = slice2(&data, "data")?;
-    let width = if fit_sigma {
-        sparse::Width::Fitted {
-            lower_ratio: sigma_bounds.0,
-            upper_ratio: sigma_bounds.1,
-        }
-    } else {
-        sparse::Width::Fixed
-    };
-    let mut workspace = sparse::Workspace::new();
-    let result = py
-        .detach(|| {
-            sparse::localize(
-                values,
-                shape,
-                sparse::Options {
-                    sigma,
-                    alpha,
-                    width,
-                    fit_radius_sigma,
-                    max_iter,
-                },
-                &mut workspace,
-            )
-        })
-        .map_err(PyValueError::new_err)?;
-    let n = result.localizations.len();
-    let positions = result
-        .localizations
-        .iter()
-        .flat_map(|fit| [fit.y, fit.x])
-        .collect::<Vec<_>>();
-    let standard_errors = result
-        .localizations
-        .iter()
-        .flat_map(|fit| [fit.se_flux, fit.se_y, fit.se_x])
-        .collect::<Vec<_>>();
-    let output = pyo3::types::PyDict::new(py);
-    output.set_item("positions", positions.into_pyarray(py).reshape([n, 2])?)?;
-    output.set_item(
-        "amplitudes",
-        result
-            .localizations
-            .iter()
-            .map(|fit| fit.flux)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    output.set_item(
-        "fit_sigma",
-        result
-            .localizations
-            .iter()
-            .map(|fit| fit.sigma)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    output.set_item("se", standard_errors.into_pyarray(py).reshape([n, 3])?)?;
-    output.set_item(
-        "test_statistic",
-        result
-            .localizations
-            .iter()
-            .map(|fit| fit.test_statistic)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    output.set_item(
-        "p_value",
-        result
-            .localizations
-            .iter()
-            .map(|fit| fit.p_value)
-            .collect::<Vec<_>>()
-            .into_pyarray(py),
-    )?;
-    output.set_item(
-        "iterations",
-        result
-            .localizations
-            .iter()
-            .map(|fit| fit.iterations)
-            .collect::<Vec<_>>(),
-    )?;
-    output.set_item(
-        "status",
-        result
-            .localizations
-            .iter()
-            .map(|fit| fit.status)
-            .collect::<Vec<_>>(),
-    )?;
-    output.set_item("background", result.background)?;
-    output.set_item("candidate_count", result.candidate_count)?;
-    output.set_item("model_image", result.model.into_pyarray(py).reshape(shape)?)?;
-    output.set_item("residual", result.residual.into_pyarray(py).reshape(shape)?)?;
-    Ok(output)
-}
-
 #[pyfunction]
 fn version() -> &'static str {
     env!("CARGO_PKG_VERSION")
@@ -238,7 +121,6 @@ fn version() -> &'static str {
 fn spotsolve_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     boxsearch::register(m)?;
     m.add_function(wrap_pyfunction!(lmcl_fit_var_sigma, m)?)?;
-    m.add_function(wrap_pyfunction!(localize_sparse, m)?)?;
     m.add_function(wrap_pyfunction!(version, m)?)?;
     Ok(())
 }

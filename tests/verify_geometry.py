@@ -1,6 +1,7 @@
 """LAYER 3: coordinate conventions, patch geometry, halo, global model."""
 import numpy as np, sys
-from spotsolve import psf, calibrate, patches as patch_mod
+from spotsolve import psf
+from spotsolve.deprecated import calibrate, patches as patch_mod
 rng=np.random.default_rng(3); fail=0
 def chk(name, ok, detail=""):
     global fail

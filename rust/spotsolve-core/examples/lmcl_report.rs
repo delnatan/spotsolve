@@ -17,10 +17,9 @@ fn main() {
         "K", "px", "n_iter", "I", "dI vs py", "us/fit"
     );
     let mut ws = FitWorkspace::new();
-    for case in root["cases"].as_array().unwrap() {
+    for case in root["var_sigma_cases"].as_array().unwrap() {
         let k = case["K"].as_u64().unwrap() as usize;
         let (h, w) = (case["h"].as_u64().unwrap() as usize, case["w"].as_u64().unwrap() as usize);
-        let sigma = case["sigma"].as_f64().unwrap();
         let d: Vec<f64> = case["data"]
             .as_array()
             .unwrap()
@@ -32,15 +31,15 @@ fn main() {
         };
         let (theta0, lo, hi) = (g("theta0"), g("lower"), g("upper"));
         let bounds = Bounds::new(&lo, &hi);
-        let want_i = case["I"].as_f64().unwrap();
+        let want_i = case["ml"]["I"].as_f64().unwrap();
 
-        let info = lmcl::fit(&mut ws, &theta0, h, w, sigma, &d, &bounds, None, FitOpts::default());
+        let info = lmcl::fit_var_sigma(&mut ws, &theta0, h, w, &d, &bounds, None, FitOpts::default());
 
         let reps = 2000;
         let t = Instant::now();
         for _ in 0..reps {
-            std::hint::black_box(lmcl::fit(
-                &mut ws, &theta0, h, w, sigma, &d, &bounds, None, FitOpts::default(),
+            std::hint::black_box(lmcl::fit_var_sigma(
+                &mut ws, &theta0, h, w, &d, &bounds, None, FitOpts::default(),
             ));
         }
         let us = t.elapsed().as_secs_f64() * 1e6 / reps as f64;

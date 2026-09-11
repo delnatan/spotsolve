@@ -1,14 +1,15 @@
-"""The box search: one frame, or a whole timecourse in parallel.
+"""The detector: one frame, or a whole timecourse in parallel.
 
-`localize` and `localize_stack` are the detector. The whole algorithm runs
-in Rust (`spotsolve_core::boxsearch`) with the GIL released: the photon
-conversion and gain estimate, FIND, the background surface, the box search,
-the polish and the classification of every fit. This module only arranges
-the arrays into a `DetectResult`.
+`localize` and `localize_stack` run the box search in Rust
+(`spotsolve_core::boxsearch`) with the GIL released: the photon conversion
+and gain estimate, FIND, the background surface, the search in each box, the
+polish and the classification of every fit. This module only arranges the
+arrays into `Localizations`. Its defaults are the Rust constants, read from
+the extension, so there is no second copy of them here.
 
-`box.localize_boxes` is the Python reference, where every constant's
-measurement lives; the port is held to statistical parity with it
-(`tests/test_localize.py`).
+In each box an emitter exists iff it lowers the box's Poisson deviance by
+`spotsolve_rs.BOX_ADD_NATS` nats. The reasoning and measurement behind every
+constant is in the Python reference, `spotsolve.deprecated.box`.
 
 Frames of a timecourse are independent, so `localize_stack` hands them to a
 pool of native threads, each with its own workspace.
@@ -25,42 +26,25 @@ import os
 
 import numpy as np
 
-from . import box, calibrate, core
-from .structs import DetectResult, width_reject_records
+from .results import REJECT_DTYPE, Localizations
 
-__all__ = ["localize", "localize_stack"]
+try:
+    import spotsolve_rs as _rs
+except ImportError as error:          # pragma: no cover - build problem
+    raise ImportError(
+        "spotsolve needs its Rust extension; build it with `maturin develop "
+        "--release -m rust/spotsolve-py/Cargo.toml`") from error
 
-_REASONS = ((1, "too_narrow"), (2, "too_wide"), (3, "edge"))
+__all__ = ["localize", "localize_stack", "SLACK", "BAND", "K_MAX"]
 
+SLACK = tuple(_rs.BOX_SLACK)
+"""Widths a fit may take, as multiples of `sigma`: the model space."""
+BAND = tuple(_rs.BOX_BAND)
+"""Widths reported as detections, as multiples of `sigma`."""
+K_MAX = int(_rs.BOX_K_MAX)
+"""Most emitters one box fits jointly."""
 
-def _rs():
-    import spotsolve_rs
-    return spotsolve_rs
-
-
-def _check_constants(rs):
-    """The Rust copies of the reference's constants, compared, so a drift is
-    a loud error rather than a quiet algorithmic difference."""
-    pairs = {
-        "BOX_ADD_NATS": box.ADD_NATS, "BOX_OWN_RADIUS": box.OWN_RADIUS,
-        "BOX_SWEEPS": box.SWEEPS, "BOX_FIT_TOL_OBJ": box.FIT_TOL_OBJ,
-        "BOX_FIT_MAX_ITER": box.FIT_MAX_ITER,
-        "BOX_EDGE_MARGIN": box.EDGE_MARGIN,
-        "BOX_POLISH_SWEEPS": core.REFINE_SWEEPS,
-        "BOX_POLISH_MAX_ITER": core.REFINE_MAX_ITER,
-        "BOX_POLISH_TOL_OBJ": core.REFINE_TOL_OBJ,
-        "BOX_POLISH_MOVE_TOL": core.REFINE_TOL,
-        "BOX_BG_KERNEL": core.BG_KERNEL, "BOX_BG_FLOOR": core.BG_FLOOR,
-        "BOX_BG_MASK_RADIUS": core.BG_MASK_RADIUS,
-        "BOX_BG_MIN_PIXELS": core.BG_MIN_PIXELS,
-        "BOX_SEED_ALPHA": calibrate.SEED_ALPHA,
-        "BOX_GAIN_FRAC": calibrate.GAIN_FRAC,
-        "BOX_A_MIN": core.A_MIN, "BOX_A_MIN_REL": core.A_MIN_REL,
-    }
-    for name, py in pairs.items():
-        if getattr(rs, name) != py:
-            raise RuntimeError(f"{name} is {getattr(rs, name)} in spotsolve_rs "
-                               f"and {py} in Python; rebuild the extension")
+_REASONS = ("too_narrow", "too_wide", "edge")    # classes 1, 2, 3
 
 
 def _roi(roi, shape):
@@ -73,83 +57,77 @@ def _roi(roi, shape):
 
 
 def _kw(sigma, offset, gain, read_noise, roi, shape, k_max, threshold, slack,
-        band, sweeps, polish):
+        band):
     return dict(sigma=float(sigma), offset=float(offset),
                 gain=None if gain is None else float(gain),
                 read_noise=float(read_noise), roi=_roi(roi, shape),
                 k_max=int(k_max), threshold=threshold,
                 slack=tuple(map(float, slack)),
-                band=None if band is None else tuple(map(float, band)),
-                sweeps=int(sweeps), polish=bool(polish))
+                band=None if band is None else tuple(map(float, band)))
 
 
-def _result(out, raw, kw, images, rs):
-    """One frame's native arrays as a `DetectResult`, fields as
-    `box._result` fills them."""
+def _result(out, raw, kw, images):
     pos, amp, sig, se, cls, bmap, info = out
-    g = info.pop("gain")
-    sigma, band, slack = kw["sigma"], kw["band"], kw["slack"]
+    gain = info.pop("gain")
+    sigma = kw["sigma"]
     shift = kw["read_noise"] ** 2
-    H, W = bmap.shape
     focus = cls == 0
-    idx = np.arange(len(amp))
-    rejects = np.concatenate([
-        width_reject_records(idx[cls == c], pos[cls == c], amp[cls == c],
-                             sig[cls == c], sigma, reason)
-        for c, reason in _REASONS])
-    model = rs.box_render(pos, amp, sig, bmap) if images else None
-    return DetectResult(
-        positions=pos[focus], amplitudes=amp[focus], sigma=sigma,
-        lam=float(focus.sum()) / max(H * W, 1),
-        A_s=float(np.mean(amp[focus])) if focus.any() else 0.0, gain=g,
-        background=bmap - shift, n_outer_passes=1,
-        model_image=None if model is None else model - shift,
-        residual=None if model is None else (raw - kw["offset"]) / g + shift - model,
-        se=se[focus], history=[dict(info, N=int(len(amp)))],
-        width_rejects=rejects if len(rejects) else None,
-        width_filter=dict(band=band, slack=slack),
-        fit_sigma=sig[focus], sigma_ratio=sig[focus] / sigma)
+    out_band = ~focus
+    rejects = np.empty(int(out_band.sum()), dtype=REJECT_DTYPE)
+    rejects["y"], rejects["x"] = pos[out_band, 0], pos[out_band, 1]
+    rejects["flux"], rejects["sigma"] = amp[out_band], sig[out_band]
+    rejects["sigma_ratio"] = sig[out_band] / sigma
+    rejects["reason"] = np.asarray(_REASONS)[cls[out_band].astype(int) - 1]
+    model = residual = None
+    if images:
+        m = _rs.box_render(pos, amp, sig, bmap)
+        residual = (raw - kw["offset"]) / gain + shift - m
+        model = m - shift
+    return Localizations(
+        positions=pos[focus], amplitudes=amp[focus], se=se[focus],
+        fit_sigma=sig[focus], rejects=rejects, background=bmap - shift,
+        sigma=sigma, gain=gain, read_noise=kw["read_noise"], info=info,
+        model_image=model, residual=residual)
 
 
-def localize(data_img, sigma=1.2, offset=0.0, gain=None, read_noise=0.0,
-             roi=None, k_max=12, threshold=None, slack=core.SIGMA_SLACK,
-             band=core.FOCUS_BAND, sweeps=box.SWEEPS, polish=True):
-    """Localize one frame. Returns a `DetectResult`.
+def localize(frame, sigma, *, offset=0.0, gain=None, read_noise=0.0, roi=None,
+             k_max=K_MAX, threshold=None, slack=SLACK, band=BAND,
+             images=True):
+    """Localize one frame. Returns `Localizations`.
 
     `sigma` is the in-focus PSF width (px); `gain` (ADU per photoelectron),
-    `offset` (ADU) and `read_noise` (e- rms) come from the camera's
-    calibration, and `gain=None` estimates it from the frame. `slack` and
-    `band` are the widths a fit may take and the widths reported as
-    detections, as multiples of `sigma`; every fit outside `band` is returned
-    in `width_rejects`. `history[0]` holds the gain used and the work done.
+    `offset` (ADU) and `read_noise` (electrons rms) come from the camera's
+    calibration, and `gain=None` estimates it from the frame -- prefer a
+    measured one. `slack` and `band` are the widths a fit may take and the
+    widths reported as detections, as multiples of `sigma`; `band=None`
+    reports every fit. `threshold` overrides FIND's seed cut, which is
+    otherwise derived from the frame. `images=False` skips `model_image` and
+    `residual`.
     """
-    rs = _rs()
-    _check_constants(rs)
-    raw = np.ascontiguousarray(data_img, dtype=float)
+    raw = np.ascontiguousarray(frame, dtype=float)
+    if raw.ndim != 2:
+        raise ValueError(f"expected a 2-D frame, got shape {raw.shape}")
     kw = _kw(sigma, offset, gain, read_noise, roi, raw.shape, k_max,
-             threshold, slack, band, sweeps, polish)
-    return _result(rs.box_localize(raw, **kw), raw, kw, True, rs)
+             threshold, slack, band)
+    return _result(_rs.box_localize(raw, **kw), raw, kw, images)
 
 
-def localize_stack(stack, sigma=1.2, offset=0.0, gain=None, read_noise=0.0,
-                   roi=None, k_max=12, threshold=None, slack=core.SIGMA_SLACK,
-                   band=core.FOCUS_BAND, sweeps=box.SWEEPS, polish=True,
-                   n_threads=None, images=False):
+def localize_stack(stack, sigma, *, offset=0.0, gain=None, read_noise=0.0,
+                   roi=None, k_max=K_MAX, threshold=None, slack=SLACK,
+                   band=BAND, n_threads=None, images=False):
     """Localize every frame of a `(T, H, W)` stack, in parallel.
 
-    Returns one `DetectResult` per frame, in frame order, each what `localize`
-    returns for that frame. `gain=None` estimates it per frame. `n_threads`
-    defaults to the machine's cores. `images=False` leaves `model_image` and
-    `residual` as None: for a long timecourse they are two more copies of the
-    movie.
+    Returns one `Localizations` per frame, in frame order, each what
+    `localize` returns for that frame; `gain=None` estimates it per frame.
+    `n_threads` defaults to the machine's cores. `images` defaults to False
+    here: for a long timecourse the model and residual are two more copies of
+    the movie.
     """
-    rs = _rs()
-    _check_constants(rs)
     raw = np.ascontiguousarray(stack, dtype=float)
     if raw.ndim != 3:
         raise ValueError(f"expected a (T, H, W) stack, got shape {raw.shape}")
     kw = _kw(sigma, offset, gain, read_noise, roi, raw.shape[1:], k_max,
-             threshold, slack, band, sweeps, polish)
-    outs = rs.box_localize_stack(raw, **kw,
-                                 n_threads=int(n_threads or os.cpu_count() or 1))
-    return [_result(o, raw[t], kw, images, rs) for t, o in enumerate(outs)]
+             threshold, slack, band)
+    outs = _rs.box_localize_stack(
+        raw, **kw, n_threads=int(n_threads or os.cpu_count() or 1))
+    return [_result(o, raw[t], kw, images) for t, o in enumerate(outs)]

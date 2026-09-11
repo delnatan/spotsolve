@@ -49,12 +49,16 @@ def main(args):
                              k_max=args.k_max)
     dt = time.time() - t
 
-    d_e = (img.astype(float) - CAMERA_OFFSET) / res.gain
-    a = audit.audit_result(d_e, res.model_image, res.sigma)
-    nr = (d_e - res.model_image) / np.sqrt(np.maximum(res.model_image, 1e-6))
+    # The audit in the likelihood's own terms: shifted Poisson, so both the
+    # data and the model carry read_noise^2 and the variance is m + rn^2.
+    shift = res.read_noise ** 2
+    d_e = (img.astype(float) - CAMERA_OFFSET) / res.gain + shift
+    model = res.model_image + shift
+    a = audit.audit_result(d_e, model, res.sigma)
+    nr = (d_e - model) / np.sqrt(np.maximum(model, 1e-6))
 
     print(f"\nN={len(res.positions)}  gain={res.gain:.3f}  "
-          f"bg={np.median(res.background):.2f}  {dt:.3f}s  {res.history[0]}")
+          f"bg={np.median(res.background):.2f}  {dt:.3f}s  {res.info}")
     print(audit.format_report(a, label=args.image))
     if res.se is not None and len(res.se) and np.isfinite(res.se).any():
         sp = np.nanmedian(np.hypot(res.se[:, 1], res.se[:, 2]))
@@ -74,9 +78,7 @@ def main(args):
             print(f"{o['y']:8.2f} {o['x']:8.2f} {o['flux']:11.0f} "
                   f"{o['ratio']:9.1f} {o['n']:5d}")
 
-    rej = res.width_rejects
-    wide = (rej[rej["reason"] == "too_wide"] if rej is not None
-            else np.empty(0, dtype=spotsolve.WIDTH_REJECT_DTYPE))
+    wide = res.rejects[res.rejects["reason"] == "too_wide"]
     if len(wide):
         print(f"\nwide objects (modelled, not reported as detections): "
               f"{len(wide)}")
@@ -104,7 +106,7 @@ def main(args):
     ax[2].set_title(f"norm. residual  (med {np.median(nr):+.2f}, "
                     f"sd {0.5*(np.percentile(nr,84.1)-np.percentile(nr,15.9)):.2f})",
                     fontsize=9)
-    z = audit.score_map(d_e, res.model_image, res.sigma)
+    z = audit.score_map(d_e, model, res.sigma)
     ax[3].imshow(z, cmap="RdBu_r", vmin=-8, vmax=8)
     if len(a["positive"]):
         ax[3].scatter(a["positive"][:, 1], a["positive"][:, 0], s=110,

@@ -34,7 +34,7 @@ enforced -- which is what this optimizer did until it was added.
 import numpy as np
 from scipy.linalg import get_lapack_funcs
 
-from . import psf
+from .. import psf
 from .structs import FitResult
 
 __all__ = ["fit", "i_divergence"]

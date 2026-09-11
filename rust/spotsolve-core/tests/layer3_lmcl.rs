@@ -39,80 +39,6 @@ fn variable_sigma_objectives_do_not_regress_against_the_reference() {
     }
 }
 
-#[test]
-fn converged_objective_matches_the_fixture() {
-    let fx = load("02_lmga");
-    let mut ws = FitWorkspace::new();
-
-    for case in fx.cases() {
-        let k = usize_at(case, "K");
-        let (h, w) = (usize_at(case, "h"), usize_at(case, "w"));
-        let sigma = f64_at(case, "sigma");
-        let (_, _, d) = mat_at(case, "data");
-        let theta0 = vec_at(case, "theta0");
-        let bounds = Bounds::new(&vec_at(case, "lower"), &vec_at(case, "upper"));
-        let want_theta = vec_at(case, "theta");
-        let want_i = f64_at(case, "I");
-        let (n, _, want_f) = mat_at(case, "F");
-        let p = 3 * k + 1;
-        assert_eq!(n, p);
-
-        let info = lmcl::fit(
-            &mut ws,
-            &theta0,
-            h,
-            w,
-            sigma,
-            &d,
-            &bounds,
-            None,
-            FitOpts {
-                max_iter: 100,
-                ..Default::default()
-            },
-        );
-
-        // The objective, in nats. This is the assertion that matters: it is
-        // the scale a log Bayes factor is decided on.
-        assert_abs(info.i_div, want_i, 1e-8, &format!("K={k} converged I"));
-
-        // Positions to 1e-6 px, amplitudes to 1e-4 relative.
-        let got = ws.theta();
-        assert_abs(got[0], want_theta[0], 1e-6, &format!("K={k} background"));
-        for e in 0..k {
-            assert_rel(
-                psf::amp(got, e),
-                psf::amp(&want_theta, e),
-                1e-4,
-                &format!("K={k} A[{e}]"),
-            );
-            assert_abs(
-                psf::cy(got, e),
-                psf::cy(&want_theta, e),
-                1e-6,
-                &format!("K={k} y[{e}]"),
-            );
-            assert_abs(
-                psf::cx(got, e),
-                psf::cx(&want_theta, e),
-                1e-6,
-                &format!("K={k} x[{e}]"),
-            );
-        }
-
-        assert_all_rel(ws.fisher(p), &want_f, 1e-9, &format!("K={k} Fisher"));
-
-        // The fixture records the gradient infinity-norm at the Python's
-        // solution. Ours must be at least as good -- if it is not, this
-        // optimizer stopped somewhere the Python did not.
-        assert!(
-            info.converged || info.stalled,
-            "K={k}: fit neither converged nor stalled in {} iterations",
-            info.n_iter
-        );
-    }
-}
-
 /// The invariant [`Interior`] exists to enforce: no constructor, and no step,
 /// can produce a parameter resting on a bound. Coleman-Li divides by the
 /// distance to that bound, and one stuck coordinate collapses the step for
@@ -178,41 +104,6 @@ fn i_divergence_handles_non_positive_data() {
     // It is zero exactly when the model reproduces the data.
     let d2 = [1.0, 5.0, 12.5];
     assert_abs(lmcl::i_divergence(&d2, &d2), 0.0, 1e-13, "I(d,d) == 0");
-}
-
-/// A fit started at the truth on noiseless data must stay there and report
-/// convergence immediately -- the cheapest possible check that the gradient,
-/// the Jacobian and the objective agree with each other.
-#[test]
-fn noiseless_fit_from_truth_is_a_fixed_point() {
-    let (h, w, sigma) = (15usize, 15usize, 1.2);
-    let theta = psf::pack(4.0, &[1500.0], &[7.3], &[8.1]);
-    let (ay, ax) = (psf::local_axis(h), psf::local_axis(w));
-    let mut f = psf::Factors::new(h, w, 1);
-    let mut d = vec![0.0; h * w];
-    psf::model_ax(&theta, &ay, &ax, sigma, None, &mut f, &mut d);
-
-    let lo = vec![0.0, 1e-4, -0.5, -0.5];
-    let hi = vec![40.0, 9e4, h as f64 - 0.5, w as f64 - 0.5];
-    let b = Bounds::new(&lo, &hi);
-    let mut ws = FitWorkspace::new();
-    let info = lmcl::fit(
-        &mut ws,
-        &theta,
-        h,
-        w,
-        sigma,
-        &d,
-        &b,
-        None,
-        FitOpts::default(),
-    );
-
-    assert!(info.converged, "did not converge from the exact optimum");
-    assert_abs(info.i_div, 0.0, 1e-9, "I at the truth on noiseless data");
-    for q in 0..theta.len() {
-        assert_abs(ws.theta()[q], theta[q], 1e-6, &format!("theta[{q}] moved"));
-    }
 }
 
 #[test]
@@ -303,23 +194,13 @@ fn tiny_damped_width_steps_do_not_certify_convergence() {
 fn reported_fisher_is_exactly_symmetric() {
     let fx = load("02_lmga");
     let mut ws = FitWorkspace::new();
-    for case in fx.cases() {
+    for case in fx.root["var_sigma_cases"].as_array().unwrap() {
         let k = usize_at(case, "K");
         let (h, w) = (usize_at(case, "h"), usize_at(case, "w"));
         let (_, _, d) = mat_at(case, "data");
         let bounds = Bounds::new(&vec_at(case, "lower"), &vec_at(case, "upper"));
-        let p = 3 * k + 1;
-        lmcl::fit(
-            &mut ws,
-            &vec_at(case, "theta0"),
-            h,
-            w,
-            f64_at(case, "sigma"),
-            &d,
-            &bounds,
-            None,
-            FitOpts::default(),
-        );
+        let p = 4 * k + 1;
+        lmcl::fit_var_sigma(&mut ws, &vec_at(case, "theta0"), h, w, &d, &bounds, None, FitOpts::default());
         let f = ws.fisher(p);
         for i in 0..p {
             for j in 0..p {
@@ -359,30 +240,20 @@ fn one_workspace_survives_any_sequence_of_patch_shapes() {
         let a: Vec<f64> = (0..k).map(|i| 500.0 + 100.0 * i as f64).collect();
         let ys: Vec<f64> = (0..k).map(|i| 1.0 + (i % h.max(1)) as f64).collect();
         let xs: Vec<f64> = (0..k).map(|i| 1.0 + (i % w.max(1)) as f64).collect();
-        let theta = psf::pack(4.0, &a, &ys, &xs);
+        let theta = psf::pack_var(4.0, &a, &ys, &xs, &vec![sigma; k]);
 
         let mut f = psf::Factors::new(h, w, k);
         let mut d = vec![0.0; h * w];
-        psf::model_ax(&theta, &ay, &ax, sigma, None, &mut f, &mut d);
+        psf::model_var_sigma_ax(&theta, &ay, &ax, None, &mut f, &mut d);
 
         let mut lo = vec![0.0];
         let mut hi = vec![50.0];
         for _ in 0..k {
-            lo.extend_from_slice(&[1e-4, -0.5, -0.5]);
-            hi.extend_from_slice(&[9e4, h as f64 - 0.5, w as f64 - 0.5]);
+            lo.extend_from_slice(&[1e-4, -0.5, -0.5, 0.7 * sigma]);
+            hi.extend_from_slice(&[9e4, h as f64 - 0.5, w as f64 - 0.5, 2.2 * sigma]);
         }
         let b = Bounds::new(&lo, &hi);
-        let info = lmcl::fit(
-            &mut ws,
-            &theta,
-            h,
-            w,
-            sigma,
-            &d,
-            &b,
-            None,
-            FitOpts::default(),
-        );
+        let info = lmcl::fit_var_sigma(&mut ws, &theta, h, w, &d, &b, None, FitOpts::default());
         assert!(
             info.i_div.is_finite(),
             "{h}x{w} K={k}: fit produced a non-finite objective after a reused workspace"

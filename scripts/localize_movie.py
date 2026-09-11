@@ -18,7 +18,7 @@ representable, so the search fits it as one bright emitter and it stays
 identifiable; `spotsolve.flag_aggregates` flags it AFTER the search. On
 hyp7gem they fit sigma 1.01-1.14x the PSF while carrying 100-176x the median
 flux: no width signal at all. Objects genuinely wider than the reporting band
-come back in `width_rejects` as "too_wide".
+come back in `rejects` as "too_wide".
 
 The consequence to read, not to hide: on frame 0 of hyp7gem a large share of
 all detected flux sits in a handful of aggregates. That is a fact about the
@@ -86,7 +86,7 @@ def main(args):
             res, frame=frame, t=frame * args.interval,
             pixel_size=args.pixel_size, agg_ratio=args.agg_ratio,
             seconds=dt, loc_id0=loc_id)
-        width_rejects = loctable.width_reject_table(
+        width_rejects = loctable.reject_table(
             res, frame=frame, t=frame * args.interval,
             pixel_size=args.pixel_size)
         loc_id += locs.height
@@ -99,9 +99,8 @@ def main(args):
         print(f"  frame {frame:3d}  N={r['n_locs']:4d}  "
               f"median flux {r['median_flux']:7.0f} e-  "
               f"median SE(pos) {r['median_se_pos']:.3f} px  "
-              f"width pruned/reject "
-              f"{r['n_width_pruned']:3d}/"
-              f"{r['n_width_too_narrow'] + r['n_width_too_wide']:3d}  "
+              f"narrow/wide/edge "
+              f"{r['n_too_narrow']:3d}/{r['n_too_wide']:3d}/{r['n_edge']:2d}  "
               f"aggregates {r['n_aggregates']:2d} "
               f"({100 * r['agg_flux_fraction']:4.1f}% of flux)")
 
@@ -124,8 +123,7 @@ def main(args):
                            "flux_ratio").head(6))
         print("\nper-frame summary:")
         print(frames.select("frame", "n_locs", "median_flux", "median_se_pos",
-                            "n_width_pruned", "n_width_too_narrow",
-                            "n_width_too_wide",
+                            "n_too_narrow", "n_too_wide", "n_edge",
                             "n_aggregates", "agg_flux_fraction", "seconds"))
         print("\naggregates, brightest first:")
         print(aggregates.sort("flux", descending=True)
@@ -142,7 +140,7 @@ def main(args):
     locs.write_parquet(out / "localizations.parquet")
     frames.write_parquet(out / "frames.parquet")
     aggregates.write_parquet(out / "aggregates.parquet")
-    width_rejects.write_parquet(out / "width_rejects.parquet")
+    width_rejects.write_parquet(out / "rejects.parquet")
     # Pixel size, interval and gain are not in the parquet -- they are
     # properties of the acquisition, not of any row -- but every physical
     # quantity a tracker computes depends on them, so they travel alongside.
@@ -158,7 +156,7 @@ def main(args):
         "flux_units": "photoelectrons", "position_units": "px (y, x)",
     }, indent=2) + "\n")
     print(f"\nwrote {out}/localizations.parquet, frames.parquet, "
-          f"aggregates.parquet, width_rejects.parquet, meta.json")
+          f"aggregates.parquet, rejects.parquet, meta.json")
 
 
 if __name__ == "__main__":

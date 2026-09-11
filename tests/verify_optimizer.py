@@ -1,6 +1,7 @@
 """LAYER 2: objective, gradient, Fisher information, optimizer."""
 import numpy as np, sys
-from spotsolve import psf, lmga
+from spotsolve import psf
+from spotsolve.deprecated import lmga
 from scipy.optimize import minimize
 rng=np.random.default_rng(1); fail=0
 def chk(name, ok, detail=""):

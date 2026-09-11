@@ -179,24 +179,6 @@ fn convolve1d(
     }
 }
 
-/// Separable convolution using the same reflect/nearest conventions as the
-/// built-in filters. This supports the unnormalized Gaussian and box kernels
-/// used by the Aguet local regression.
-pub fn separable_filter(
-    img: &[f64],
-    h: usize,
-    w: usize,
-    kernel_y: &[f64],
-    kernel_x: &[f64],
-    mode: Mode,
-) -> Vec<f64> {
-    let mut intermediate = vec![0.0; h * w];
-    let mut output = vec![0.0; h * w];
-    convolve1d(img, &mut intermediate, h, w, kernel_y, 0, mode);
-    convolve1d(&intermediate, &mut output, h, w, kernel_x, 1, mode);
-    output
-}
-
 /// Sliding maximum along one axis over a window of `size` (odd).
 fn max1d(src: &[f64], dst: &mut [f64], h: usize, w: usize, size: usize, axis: usize, mode: Mode) {
     let r = (size / 2) as isize;

@@ -10,6 +10,10 @@ mod common;
 use common::*;
 use spotsolve_core::psf;
 
+/// The fit's variable-width model and Jacobian, with every width at the
+/// fixture's one sigma, against the fixture's fixed-width model: the model and
+/// the background, flux and position columns must agree. The width columns
+/// are checked by finite differences below.
 #[test]
 fn model_and_jacobian_match_the_fixture() {
     let fx = load("01_psf");
@@ -25,9 +29,9 @@ fn model_and_jacobian_match_the_fixture() {
         // The fixture stores the Jacobian as (h*w, 3K+1) row-major over
         // pixels; this crate lays it out parameter-major, so the comparison
         // transposes. See psf.rs's module docs for why the layouts differ.
-        let (n_pix, p, want_j_pixmajor) = mat_at(case, "jac_flat");
+        let (n_pix, p3, want_j) = mat_at(case, "jac_flat");
         assert_eq!(n_pix, h * w);
-        assert_eq!(p, 3 * k + 1);
+        assert_eq!(p3, 3 * k + 1);
 
         assert_rel(
             psf::peak_factor(sigma),
@@ -36,29 +40,29 @@ fn model_and_jacobian_match_the_fixture() {
             &format!("K={k} peak_factor"),
         );
 
-        let ay = psf::local_axis(h);
-        let ax = psf::local_axis(w);
-        let mut f = psf::Factors::new(h, w, k.max(1));
-        let mut m = vec![0.0; h * w];
-        let mut j = vec![0.0; p * h * w];
-
-        psf::model_and_jac_ax(&theta, &ay, &ax, sigma, None, &mut f, &mut m, &mut j);
-        assert_all_rel(&m, &want_m, TOL, &format!("K={k} model_and_jac_ax model"));
-
-        let mut want_j = vec![0.0; p * n_pix];
-        for i in 0..n_pix {
-            for q in 0..p {
-                want_j[q * n_pix + i] = want_j_pixmajor[i * p + q];
-            }
+        let mut theta_var = vec![theta[0]];
+        for e in 0..k {
+            theta_var.extend_from_slice(&[theta[1 + 3 * e], theta[2 + 3 * e], theta[3 + 3 * e], sigma]);
         }
-        assert_all_rel(&j, &want_j, TOL, &format!("K={k} jacobian"));
+        let p = theta_var.len();
+        let (ay, ax) = (psf::local_axis(h), psf::local_axis(w));
+        let mut f = psf::Factors::new(h, w, k.max(1));
+        let (mut m, mut j) = (vec![0.0; n_pix], vec![0.0; p * n_pix]);
+        psf::model_and_jac_var_sigma_ax(&theta_var, &ay, &ax, None, &mut f, &mut m, &mut j);
+        assert_all_rel(&m, &want_m, TOL, &format!("K={k} model"));
 
-        // `model_ax` is the cheaper entry point that skips the derivatives; it
-        // must agree with the model half of `model_and_jac_ax` exactly, since
-        // both are the same sum of the same products.
-        let mut m2 = vec![0.0; h * w];
+        // Column q3 of the fixed layout is column q of the free-width one.
+        let col = |q3: usize| if q3 == 0 { 0 } else { 1 + 4 * ((q3 - 1) / 3) + (q3 - 1) % 3 };
+        for q3 in 0..p3 {
+            let got: Vec<f64> = (0..n_pix).map(|i| j[col(q3) * n_pix + i]).collect();
+            let want: Vec<f64> = (0..n_pix).map(|i| want_j[i * p3 + q3]).collect();
+            assert_all_rel(&got, &want, TOL, &format!("K={k} jacobian column {q3}"));
+        }
+
+        // The render-only entry point is the same sum of the same products.
+        let mut m2 = vec![0.0; n_pix];
         psf::model_ax(&theta, &ay, &ax, sigma, None, &mut f, &mut m2);
-        assert_eq!(m, m2, "K={k}: model_ax disagrees with model_and_jac_ax");
+        assert_all_rel(&m2, &want_m, TOL, &format!("K={k} model_ax"));
     }
 }
 

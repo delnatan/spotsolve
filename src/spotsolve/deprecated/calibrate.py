@@ -28,7 +28,7 @@ it once and pass it in. `estimate_gain` is the fallback.
 import numpy as np
 import scipy.ndimage as ndi
 
-from . import psf
+from .. import psf
 
 __all__ = ["SEED_ALPHA", "seed_threshold", "robust_background",
            "emitter_free_mask", "GAIN_FRAC", "estimate_gain", "robust_spread",

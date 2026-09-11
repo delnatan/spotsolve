@@ -37,7 +37,7 @@ import numpy as np
 from scipy.sparse.csgraph import connected_components
 from scipy.spatial import cKDTree
 
-from . import psf
+from .. import psf
 from .structs import Patch
 
 __all__ = ["build_patches", "build_halo_image", "patch_grids"]

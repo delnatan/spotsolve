@@ -3,7 +3,7 @@
 import numpy as np
 import pytest
 
-from spotsolve.box import localize_boxes
+from spotsolve.deprecated.box import localize_boxes
 from spotsolve.simulate import simulate
 
 pytest.importorskip("spotsolve_rs")

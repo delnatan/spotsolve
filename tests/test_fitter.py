@@ -6,7 +6,8 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from spotsolve import backend, lmga, psf
+from spotsolve import psf
+from spotsolve.deprecated import backend, lmga
 
 rs = pytest.importorskip("spotsolve_rs")
 

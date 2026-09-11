@@ -107,7 +107,7 @@ fn give<'py>(py: Python<'py>, o: bs::Output, h: usize, w: usize) -> PyResult<Fra
 /// Localize one raw frame. `gain=None` estimates it from the frame; the
 /// background is returned in photoelectrons, `read_noise^2` included.
 #[pyfunction]
-#[pyo3(signature = (raw, sigma, offset=0.0, gain=None, *, read_noise=0.0, roi=None, k_max=12, threshold=None, slack=(0.7, 2.2), band=Some((0.8, 2.0)), sweeps=2, polish=true))]
+#[pyo3(signature = (raw, sigma, offset=0.0, gain=None, *, read_noise=0.0, roi=None, k_max=bs::K_MAX, threshold=None, slack=bs::SLACK, band=Some(bs::BAND), sweeps=bs::SWEEPS, polish=true))]
 #[allow(clippy::too_many_arguments)]
 fn box_localize<'py>(
     py: Python<'py>,
@@ -147,7 +147,7 @@ fn box_localize<'py>(
 /// each frame exactly as `box_localize` would. `gain=None` estimates one per
 /// frame. Returns one tuple per frame, in frame order.
 #[pyfunction]
-#[pyo3(signature = (raw, sigma, offset=0.0, gain=None, *, read_noise=0.0, roi=None, k_max=12, threshold=None, slack=(0.7, 2.2), band=Some((0.8, 2.0)), sweeps=2, polish=true, n_threads=1))]
+#[pyo3(signature = (raw, sigma, offset=0.0, gain=None, *, read_noise=0.0, roi=None, k_max=bs::K_MAX, threshold=None, slack=bs::SLACK, band=Some(bs::BAND), sweeps=bs::SWEEPS, polish=true, n_threads=1))]
 #[allow(clippy::too_many_arguments)]
 fn box_localize_stack<'py>(
     py: Python<'py>,
@@ -215,8 +215,13 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(box_localize, m)?)?;
     m.add_function(wrap_pyfunction!(box_localize_stack, m)?)?;
     m.add_function(wrap_pyfunction!(box_render, m)?)?;
-    // The constants `box.py` and `core.py` must agree with, so a drift shows
-    // up as a test failure rather than as an algorithmic difference.
+    // The detector's defaults, read by `spotsolve.native` so Python states
+    // no second copy of them.
+    m.add("BOX_SLACK", bs::SLACK)?;
+    m.add("BOX_BAND", bs::BAND)?;
+    m.add("BOX_K_MAX", bs::K_MAX)?;
+    // The constants the deprecated Python reference must agree with; the
+    // parity tests assert it, so a drift is a failure, not a difference.
     m.add("BOX_ADD_NATS", bs::ADD_NATS)?;
     m.add("BOX_OWN_RADIUS", bs::OWN_RADIUS)?;
     m.add("BOX_SWEEPS", bs::SWEEPS)?;
