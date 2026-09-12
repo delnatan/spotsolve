@@ -134,16 +134,18 @@ def test_the_roi_crop_is_invisible_to_the_roi():
                    amplitude_range=(900.0, 1900.0), sigma=SIGMA,
                    sigma_spread=0.2, seed=23)
     img = sim.image
-    # `threshold` is pinned: the caller otherwise derives it from the array's
-    # shape, which is the thing varying here.
+    # Both cuts are pinned: the caller otherwise derives them from the
+    # array's shape, which is the thing varying here.
     for y0, x0, side in ((80, 80, 32), (0, 0, 40), (144, 100, 48)):
         roi = np.zeros(img.shape, dtype=bool)
         roi[y0:y0 + side, x0:x0 + side] = True
-        full = L.localize(img, sigma=SIGMA, gain=1.0, roi=roi, threshold=4.0)
+        full = L.localize(img, sigma=SIGMA, gain=1.0, roi=roi,
+                          seed_threshold=4.0, birth_threshold=4.0)
         p = 41 + 20                       # the margin, with slack
         sy, sx = slice(max(0, y0 - p), y0 + side + p), slice(max(0, x0 - p), x0 + side + p)
         sub = L.localize(np.ascontiguousarray(img[sy, sx]), sigma=SIGMA, gain=1.0,
-                         roi=np.ascontiguousarray(roi[sy, sx]), threshold=4.0)
+                         roi=np.ascontiguousarray(roi[sy, sx]),
+                         seed_threshold=4.0, birth_threshold=4.0)
         assert len(full) == len(sub), f"N differs at ({y0}, {x0})"
         offset = np.array([sy.start, sx.start])
         np.testing.assert_allclose(full.positions, sub.positions + offset, atol=1e-9)

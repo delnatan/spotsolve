@@ -2,12 +2,13 @@
 //!
 //! Four calls in the pipeline sit on top of one scaffold: a 1-D pass along
 //! each axis, with a boundary rule. `find_candidates` needs
-//! `gaussian_laplace` and `maximum_filter`; `background_map` needs
-//! `uniform_filter` and `gaussian_filter`.
+//! `gaussian_laplace` and `maximum_filter`; `placement` needs
+//! `gaussian_laplace`; `background_map` needs `uniform_filter` and
+//! `gaussian_filter`.
 //!
 //! | call | site | kernel / reducer | mode |
 //! |---|---|---|---|
-//! | [`gaussian_laplace`] | FIND | Gaussian order 2, summed over axes | reflect |
+//! | [`gaussian_laplace`] | FIND, BIRTH | Gaussian order 2, summed over axes | reflect / nearest |
 //! | [`maximum_filter`] | FIND | sliding max | reflect |
 //! | [`uniform_filter`] | background | box | nearest |
 //! | [`gaussian_filter`] | background | Gaussian order 0 | nearest |

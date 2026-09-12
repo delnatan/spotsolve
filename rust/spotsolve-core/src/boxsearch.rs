@@ -16,7 +16,7 @@
 //!     fit the level alone (K = 0), BMAP's shape and the neighbours' current
 //!     emitters held fixed
 //!     FORWARD   place at the strongest owned residual peak that passes
-//!               FIND's z-threshold; keep it iff I falls by > ADD_NATS
+//!               the BIRTH cut; keep it iff I falls by > ADD_NATS
 //!     BACKWARD  (K >= 2) drop the cheapest emitter while it costs < ADD_NATS
 //! POLISH   block-Jacobi refits at fixed N until nothing moves
 //! ```
@@ -295,9 +295,13 @@ pub const BG_MIN_PIXELS: f64 = 25.0;
 ///
 /// It can be this loose because FIND IS A SEEDER, NOT A DECISION RULE: every
 /// candidate still has to lower its box's deviance by `ADD_NATS`, and every
-/// placement inside a box passes this same test, so a spurious seed costs
-/// runtime rather than a detection. An over-tight seed costs what cannot be
-/// recovered -- a box never forms around light FIND did not seed.
+/// placement inside a box passes [`Settings::birth`], so a spurious seed
+/// costs runtime rather than a detection. An over-tight seed costs what
+/// cannot be recovered -- a box never forms around light FIND did not seed.
+///
+/// This asymmetry is the whole reason `seed` and `birth` are separate
+/// fields. While they were one number, loosening the seed to buy recall
+/// silently loosened the gate that holds precision, so neither could move.
 ///
 /// Measured under the retired `detect`, whose ADD step played the same role:
 /// the historical cut at alpha ~ 2e-8 missed faint emitters that a looser
@@ -364,8 +368,24 @@ pub struct Settings {
     /// In-focus PSF width, px.
     pub sigma: f64,
     pub k_max: usize,
-    /// FIND's cut in sd of the LoG null; see [`seed_threshold`].
-    pub threshold: f64,
+    /// SEED: FIND's frame-wide cut, in sd of the LoG null. What decides
+    /// which light gets a box at all; see [`seed_threshold`].
+    pub seed: f64,
+    /// BIRTH: the same statistic inside a box, on the current fit's residual
+    /// -- the cut a candidate placement must clear before [`ADD_NATS`] is
+    /// even asked. See [`placement`].
+    ///
+    /// It is a separate number from `seed` because the two answer different
+    /// questions. A loose `seed` costs runtime and nothing else; a loose
+    /// `birth` costs precision directly, because a placement that clears it
+    /// goes on to be judged by `ADD_NATS` alone. Their defaults are equal --
+    /// [`seed_threshold`] over the frame -- which is what the pipeline did
+    /// when they were one field, so nothing moves until a caller moves one.
+    ///
+    /// That shared default is continuity, not calibration: `seed`'s
+    /// Bonferroni count is the frame's independent windows, and a box has
+    /// far fewer. `birth`'s own calibration is open.
+    pub birth: f64,
     /// Widths a fit may take, as multiples of `sigma`.
     pub slack: (f64, f64),
     pub sweeps: usize,
@@ -649,6 +669,66 @@ fn crop<T: Copy>(v: &[T], w: usize, bb: &patches::BBox) -> Vec<T> {
 /// as sigma^-3, so without it one number is a 1.8-sigma cut at sigma 0.8 and
 /// a 100-sigma cut at sigma 3.0. `threshold` is therefore a count of standard
 /// deviations.
+///
+/// # The LoG is a poor statistic, and the better one is worse here
+///
+/// Measured 2026-09-12, recorded so it is not re-attempted. The LoG is NOT
+/// the matched filter for a Gaussian spot: `gaussian_laplace(sigma)`
+/// correlates best with a spot of width `0.60 * sigma`, and against the
+/// pixel-integrated PSF at its own sigma it delivers 0.69 of the z a matched
+/// filter would on-pixel and 0.60 at the pixel corner -- at sigma 0.8 the
+/// corner case falls to 0.43, so a sharper PSF buys the LoG nothing. A
+/// difference of Gaussians, `g(sigma) - g(k*sigma)`, is that matched filter
+/// with the background projected out -- the exact GLRT for unknown amplitude
+/// on a smooth background, its null sd closed-form as `||K||_2` exactly like
+/// the LoG's -- and reaches 0.95. As a SEEDER in isolation it is worth 1.3x
+/// to 1.75x in flux: at a matched false-seed rate, recall at peak SNR 1.8
+/// went 0.217 -> 0.477, and at sigma 0.8 0.467 -> 0.927.
+///
+/// None of that survives into the pipeline. Swapped in behind `seed` with
+/// `birth` pinned, each kernel bisected onto 15 false seeds per empty
+/// 128x128 frame so the operating points match (see the alpha note below),
+/// six to twelve frames per cell, `band=None` so recall measures detection
+/// and not classification:
+///
+/// ```text
+/// ISOLATED (density 0.002, 22 px spacing), recall
+///   peak SNR   1.40   2.01   2.81   4.01   6.02
+///   LoG        .090   .317   .740   .940   .960
+///   DoG k=2    .090   .323   .737   .937   .957
+///
+/// CROWDED (flux 200-600, matched width), recall / candidates per frame
+///   density   0.002      0.005      0.010      0.015      0.025      0.040
+///   LoG     .975  35  .925  64  .875 108  .820 144  .727 195  .615 236
+///   DoG k=2 .975  33  .915  60  .856 100  .805 133  .684 165  .565 188
+///   DoG k=3 .975  32  .911  59  .837  96  .787 126  .657 151  .531 166
+/// ```
+///
+/// Two things are happening. Where emitters are ISOLATED the seeder is not
+/// what limits recall -- `ADD_NATS` is. The DoG seeds strictly more (28
+/// candidates against 22 at peak SNR 1.4) and every extra one fails to pay
+/// its 10 nats, so a better statistic buys exactly what a looser cut buys,
+/// which is nothing. Where emitters are CROWDED the DoG's broader core
+/// merges neighbours inside the max-filter window, and a box that never
+/// forms cannot be recovered.
+///
+/// So the LoG's 29% efficiency loss is the price of a narrow core, and the
+/// narrow core is worth more than the efficiency. A better FIND has to
+/// SEPARATE better, not detect better; sensitivity is `ADD_NATS`' problem.
+///
+/// # What `SEED_ALPHA` actually buys
+///
+/// [`seed_threshold`]'s cut is not the achieved rate. `level` is the 10th
+/// percentile, deliberately -- it is a background estimate under emitters --
+/// but it is also the variance normalizer here, and too low a normalizer
+/// inflates the z: on emitter-free Poisson frames the normalized residual
+/// has sd 1.19 at a background of 20 e- and 1.07 at 100 e-, not 1. The
+/// derived cut of 3.79 therefore passes 17.9 false seeds per empty 128x128
+/// frame, not the 0.05 `SEED_ALPHA` names. For a seeder that errs in the
+/// safe direction, which is why it has never mattered. It does mean a cut
+/// compared across two different statistics must be calibrated empirically:
+/// at one nominal z the DoG passes 10.8 seeds against the LoG's 17.9, and
+/// comparing them there compares the calibrations, not the filters.
 pub fn find_candidates(
     d: &[f64],
     h: usize,
@@ -911,11 +991,11 @@ fn fit_window(
 }
 
 /// `(y, x, A0)` of the strongest owned peak of the fit's normalized residual
-/// that passes FIND's own test, or `None`.
+/// that passes [`Settings::birth`], or `None`.
 ///
 /// The test is not optional. The deviance of the best of many placements is
 /// a maximum over positions, and `ADD_NATS` was measured only on placements
-/// FIND had already screened; without the screen every bright emitter
+/// that had already been screened; without the screen every bright emitter
 /// collected faint satellites on its wings (130 emitters for 107 true on
 /// seed 17, precision 0.74).
 ///
@@ -955,7 +1035,7 @@ fn placement(
         }
     }
     let (v, i) = best?;
-    if !(v > s.threshold) {
+    if !(v > s.birth) {
         return None;
     }
     let resid = win.sub[i] - ws.model[i];
@@ -1138,7 +1218,7 @@ pub fn localize(
 
     let level = masked_values(dc, rc);
     let b0 = percentile(level.as_deref().unwrap_or(dc), 10.0).max(BG_FLOOR);
-    let (cand_all, amp_all, str_all) = find_candidates(dc, ch, cw, b0, s.sigma, s.threshold);
+    let (cand_all, amp_all, str_all) = find_candidates(dc, ch, cw, b0, s.sigma, s.seed);
     let (bsub, fill) = background_map(dc, ch, cw, &cand_all, s.sigma, rc);
     // Back to the frame. Outside the crop nothing was estimated, so the map
     // carries the fallback level rather than a hole: no fit reads it -- every
@@ -1497,7 +1577,8 @@ mod tests {
         let s = Settings {
             sigma,
             k_max: 12,
-            threshold: seed_threshold(h, w, sigma, SEED_ALPHA),
+            seed: seed_threshold(h, w, sigma, SEED_ALPHA),
+            birth: seed_threshold(h, w, sigma, SEED_ALPHA),
             slack: (0.7, 2.2),
             sweeps: SWEEPS,
             polish: true,

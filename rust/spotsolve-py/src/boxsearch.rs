@@ -26,7 +26,8 @@ fn settings(
     w: usize,
     sigma: f64,
     k_max: usize,
-    threshold: Option<f64>,
+    seed: Option<f64>,
+    birth: Option<f64>,
     slack: (f64, f64),
     sweeps: usize,
     polish: bool,
@@ -41,14 +42,22 @@ fn settings(
     if k_max == 0 {
         return Err(PyValueError::new_err("`k_max` must be at least 1"));
     }
-    let threshold = threshold.unwrap_or_else(|| bs::seed_threshold(h, w, sigma, bs::SEED_ALPHA));
-    if !threshold.is_finite() {
-        return Err(PyValueError::new_err("`threshold` must be finite"));
+    // One derivation, two fields: an unset `birth` is the seed cut, which is
+    // what the pipeline used when they were a single number.
+    let default = bs::seed_threshold(h, w, sigma, bs::SEED_ALPHA);
+    let seed = seed.unwrap_or(default);
+    let birth = birth.unwrap_or(default);
+    if !seed.is_finite() {
+        return Err(PyValueError::new_err("`seed_threshold` must be finite"));
+    }
+    if !birth.is_finite() {
+        return Err(PyValueError::new_err("`birth_threshold` must be finite"));
     }
     Ok(bs::Settings {
         sigma,
         k_max,
-        threshold,
+        seed,
+        birth,
         slack,
         sweeps,
         polish,
@@ -107,7 +116,7 @@ fn give<'py>(py: Python<'py>, o: bs::Output, h: usize, w: usize) -> PyResult<Fra
 /// Localize one raw frame. `gain=None` estimates it from the frame; the
 /// background is returned in photoelectrons, `read_noise^2` included.
 #[pyfunction]
-#[pyo3(signature = (raw, sigma, offset=0.0, gain=None, *, read_noise=0.0, roi=None, k_max=bs::K_MAX, threshold=None, slack=bs::SLACK, band=Some(bs::BAND), sweeps=bs::SWEEPS, polish=true))]
+#[pyo3(signature = (raw, sigma, offset=0.0, gain=None, *, read_noise=0.0, roi=None, k_max=bs::K_MAX, seed_threshold=None, birth_threshold=None, slack=bs::SLACK, band=Some(bs::BAND), sweeps=bs::SWEEPS, polish=true))]
 #[allow(clippy::too_many_arguments)]
 fn box_localize<'py>(
     py: Python<'py>,
@@ -118,7 +127,8 @@ fn box_localize<'py>(
     read_noise: f64,
     roi: Option<PyReadonlyArray2<'_, bool>>,
     k_max: usize,
-    threshold: Option<f64>,
+    seed_threshold: Option<f64>,
+    birth_threshold: Option<f64>,
     slack: (f64, f64),
     band: Option<(f64, f64)>,
     sweeps: usize,
@@ -134,7 +144,7 @@ fn box_localize<'py>(
     }
     check_gain(gain, offset, read_noise)?;
     let roi = roi_slice(&roi, h, w)?.map(|m| m.to_vec());
-    let s = settings(h, w, sigma, k_max, threshold, slack, sweeps, polish, band)?;
+    let s = settings(h, w, sigma, k_max, seed_threshold, birth_threshold, slack, sweeps, polish, band)?;
     let o = py.detach(|| {
         let (mut ws, mut d) = (bs::Workspace::new(), Vec::new());
         let shift = read_noise * read_noise;
@@ -147,7 +157,7 @@ fn box_localize<'py>(
 /// each frame exactly as `box_localize` would. `gain=None` estimates one per
 /// frame. Returns one tuple per frame, in frame order.
 #[pyfunction]
-#[pyo3(signature = (raw, sigma, offset=0.0, gain=None, *, read_noise=0.0, roi=None, k_max=bs::K_MAX, threshold=None, slack=bs::SLACK, band=Some(bs::BAND), sweeps=bs::SWEEPS, polish=true, n_threads=1))]
+#[pyo3(signature = (raw, sigma, offset=0.0, gain=None, *, read_noise=0.0, roi=None, k_max=bs::K_MAX, seed_threshold=None, birth_threshold=None, slack=bs::SLACK, band=Some(bs::BAND), sweeps=bs::SWEEPS, polish=true, n_threads=1))]
 #[allow(clippy::too_many_arguments)]
 fn box_localize_stack<'py>(
     py: Python<'py>,
@@ -158,7 +168,8 @@ fn box_localize_stack<'py>(
     read_noise: f64,
     roi: Option<PyReadonlyArray2<'_, bool>>,
     k_max: usize,
-    threshold: Option<f64>,
+    seed_threshold: Option<f64>,
+    birth_threshold: Option<f64>,
     slack: (f64, f64),
     band: Option<(f64, f64)>,
     sweeps: usize,
@@ -175,7 +186,7 @@ fn box_localize_stack<'py>(
     }
     check_gain(gain, offset, read_noise)?;
     let roi = roi_slice(&roi, h, w)?.map(|m| m.to_vec());
-    let s = settings(h, w, sigma, k_max, threshold, slack, sweeps, polish, band)?;
+    let s = settings(h, w, sigma, k_max, seed_threshold, birth_threshold, slack, sweeps, polish, band)?;
     let r = r.to_vec();
     let outs = py.detach(|| {
         let shift = read_noise * read_noise;
@@ -211,15 +222,38 @@ fn box_render(
         .unbind())
 }
 
+/// The frame-derived default for both cuts: [`bs::seed_threshold`], in sd of
+/// the LoG null.
+///
+/// Exposed because the two cuts are now separate. Moving one and holding the
+/// other at its default requires knowing what that default is, and Python
+/// must not carry a second copy of the derivation.
+#[pyfunction]
+#[pyo3(signature = (h, w, sigma, alpha=bs::SEED_ALPHA))]
+fn box_seed_threshold(h: usize, w: usize, sigma: f64, alpha: f64) -> PyResult<f64> {
+    if h == 0 || w == 0 {
+        return Err(PyValueError::new_err("`h` and `w` must be positive"));
+    }
+    if !(sigma.is_finite() && sigma > 0.0) {
+        return Err(PyValueError::new_err("`sigma` must be positive"));
+    }
+    if !(alpha.is_finite() && alpha > 0.0 && alpha < 1.0) {
+        return Err(PyValueError::new_err("`alpha` must lie in (0, 1)"));
+    }
+    Ok(bs::seed_threshold(h, w, sigma, alpha))
+}
+
 pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(box_localize, m)?)?;
     m.add_function(wrap_pyfunction!(box_localize_stack, m)?)?;
     m.add_function(wrap_pyfunction!(box_render, m)?)?;
+    m.add_function(wrap_pyfunction!(box_seed_threshold, m)?)?;
     // The detector's defaults, read by `spotsolve.native` so Python states
     // no second copy of them.
     m.add("BOX_SLACK", bs::SLACK)?;
     m.add("BOX_BAND", bs::BAND)?;
     m.add("BOX_K_MAX", bs::K_MAX)?;
     m.add("BOX_ADD_NATS", bs::ADD_NATS)?;
+    m.add("BOX_SEED_ALPHA", bs::SEED_ALPHA)?;
     Ok(())
 }
