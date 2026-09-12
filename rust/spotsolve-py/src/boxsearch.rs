@@ -42,11 +42,10 @@ fn settings(
     if k_max == 0 {
         return Err(PyValueError::new_err("`k_max` must be at least 1"));
     }
-    // One derivation, two fields: an unset `birth` is the seed cut, which is
-    // what the pipeline used when they were a single number.
-    let default = bs::seed_threshold(h, w, sigma, bs::SEED_ALPHA);
-    let seed = seed.unwrap_or(default);
-    let birth = birth.unwrap_or(default);
+    // Two cuts, two derivations: `seed` counts the frame's windows, `birth`
+    // is a constant because a box does not grow with the frame.
+    let seed = seed.unwrap_or_else(|| bs::seed_threshold(h, w, sigma, bs::SEED_ALPHA));
+    let birth = birth.unwrap_or(bs::BIRTH_Z);
     if !seed.is_finite() {
         return Err(PyValueError::new_err("`seed_threshold` must be finite"));
     }
@@ -255,5 +254,6 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("BOX_K_MAX", bs::K_MAX)?;
     m.add("BOX_ADD_NATS", bs::ADD_NATS)?;
     m.add("BOX_SEED_ALPHA", bs::SEED_ALPHA)?;
+    m.add("BOX_BIRTH_Z", bs::BIRTH_Z)?;
     Ok(())
 }

@@ -290,6 +290,67 @@ pub const BG_FLOOR: f64 = 1e-3;
 pub const BG_MASK_RADIUS: f64 = 3.0;
 /// Unmasked pixels a window needs before its local mean is believed.
 pub const BG_MIN_PIXELS: f64 = 25.0;
+/// BIRTH's cut, in sd of the LoG null: how strong a residual peak must be
+/// before a placement is even tried. Not derived from the frame -- the test
+/// is inside a box, and a box does not get bigger when the frame does.
+///
+/// It used to share [`seed_threshold`]'s frame-wide value (3.8 to 4.1 on the
+/// sizes here), which is a Bonferroni over ~1820 independent windows. A box
+/// holds about four. That number was inherited, not derived, and it was
+/// costing recall that `ADD_NATS` would have rejected anyway.
+///
+/// Measured 2026-09-12 with `seed` pinned at its default, nine arms on
+/// `simulate` truth, twelve seeds each, `band=None` so recall measures
+/// detection and not width classification. F1, and below it the regret
+/// against each arm's own best:
+///
+/// ```text
+/// arm                          4.0     3.5     3.0     2.5     2.0     1.5
+/// bright sparse, matched      .983    .985    .986    .985    .983    .980
+/// bright mid, spread          .939    .940    .939    .935    .929    .924
+/// bright dense, spread        .883    .885    .884    .881    .876    .868
+/// bright v.dense, spread      .822    .827    .828    .818    .818    .813
+/// faint mid, matched          .892    .906    .919    .925    .928    .930
+/// faint mid, spread           .850    .870    .882    .889    .893    .895
+/// faint, bright bg            .807    .823    .834    .845    .851    .852
+/// sigma 0.8 faint, spread     .930    .943    .950    .953    .953    .951
+/// sigma 2.0 bright, spread    .838    .837    .832    .820    .798    .798
+///
+/// mean regret               .0180   .0102   .0057   .0061   .0087   .0106
+/// worst-arm regret          .0449   .0286   .0179   .0174   .0402   .0400
+/// ```
+///
+/// The two ends want opposite things and the reason is `ADD_NATS`. On FAINT
+/// fields the gate is pure loss: nothing faint enough to be a satellite can
+/// pay 10 nats, so precision holds above .98 all the way down to 1.0 while
+/// recall climbs 11 points. On BRIGHT fields it is load-bearing: a bright
+/// emitter whose width is mis-modelled leaves a residual big enough that a
+/// satellite on its wings CAN pay 10 nats, and only the gate stops the
+/// tiling (see [`placement`]). 3.0 and 2.5 are statistically tied, 4.0 is
+/// clearly wrong, and 2.0 falls off a cliff on the bright arms.
+///
+/// 3.0 over 2.5 is the runtime: a lower gate means more emitters per box,
+/// and a box's fits grow faster than its emitter count. On 20 GEM frames,
+/// single-threaded, against detections per frame:
+///
+/// ```text
+/// birth   4.12    3.00    2.50    2.00
+/// ms/fr    104     187     249     318
+/// N/fr   460.9   555.9   583.6   596.9
+/// ```
+///
+/// 3.0 takes 21 of the 27 points of N that 2.5 does, for 1.8x the time
+/// rather than 2.4x. Raise it toward 4 for speed, lower it toward 2.5 on
+/// faint sparse data where the extra fits are cheap.
+///
+/// Confirmed without ground truth on `hyp7gem_wt_crop`, 30 frames, linked
+/// with `tracking::link`: a real emitter is in the next frame and a spurious
+/// one is not, so the extra detections are real only if they link. They do
+/// -- N per frame 452.6 -> 545.7 -> 572.4 with the linked fraction HELD at
+/// 87.0% -> 87.3% -> 87.7% and tracks of 5+ frames 799 -> 946 -> 1000. At
+/// 2.0 both signals turn: the linked fraction drops back to 87.1% and mean
+/// track length falls, for 2% more detections.
+pub const BIRTH_Z: f64 = 3.0;
 /// FIND's family-wise false-seed rate per frame, and the only free number in
 /// [`seed_threshold`].
 ///
@@ -378,13 +439,8 @@ pub struct Settings {
     /// It is a separate number from `seed` because the two answer different
     /// questions. A loose `seed` costs runtime and nothing else; a loose
     /// `birth` costs precision directly, because a placement that clears it
-    /// goes on to be judged by `ADD_NATS` alone. Their defaults are equal --
-    /// [`seed_threshold`] over the frame -- which is what the pipeline did
-    /// when they were one field, so nothing moves until a caller moves one.
-    ///
-    /// That shared default is continuity, not calibration: `seed`'s
-    /// Bonferroni count is the frame's independent windows, and a box has
-    /// far fewer. `birth`'s own calibration is open.
+    /// goes on to be judged by `ADD_NATS` alone. It defaults to [`BIRTH_Z`],
+    /// which is calibrated for this test rather than derived from the frame.
     pub birth: f64,
     /// Widths a fit may take, as multiples of `sigma`.
     pub slack: (f64, f64),
@@ -1578,7 +1634,7 @@ mod tests {
             sigma,
             k_max: 12,
             seed: seed_threshold(h, w, sigma, SEED_ALPHA),
-            birth: seed_threshold(h, w, sigma, SEED_ALPHA),
+            birth: BIRTH_Z,
             slack: (0.7, 2.2),
             sweeps: SWEEPS,
             polish: true,

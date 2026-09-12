@@ -127,11 +127,15 @@ def localize(frame, sigma, *, offset=0.0, gain=None, read_noise=0.0, roi=None,
       never seeded can never be recovered.
     * `birth_threshold` -- the cut a new emitter's residual peak must clear
       inside a box. Loose is NOT cheap here: this one gates precision
-      directly.
+      directly, and it costs time, because a lower gate means more emitters
+      per box and a box's fits grow faster than its emitter count.
 
-    They default to the same derived number, so leaving both None is the
-    behaviour of every earlier version. `images=False` skips `model_image`
-    and `residual`.
+    `seed_threshold` is derived from the frame; `birth_threshold` defaults to
+    the calibrated constant `spotsolve_rs.BOX_BIRTH_Z`, because the test it
+    gates happens inside a box and a box does not grow with the frame. Raise
+    birth toward 4 for speed, lower it toward 2.5 on faint sparse data. The
+    measurements behind both sit beside the Rust constants.
+    `images=False` skips `model_image` and `residual`.
     """
     raw = np.ascontiguousarray(frame, dtype=float)
     if raw.ndim != 2:
