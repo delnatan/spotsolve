@@ -115,3 +115,45 @@ def test_gain_estimate_is_the_reference_estimator():
         assert got == pytest.approx(want, rel=1e-9)
     # A frame too narrow to high-pass falls back to unit gain.
     assert L.localize(np.full((8, 4), 120.0), sigma=SIGMA, offset=100.0).gain == 1.0
+
+
+def test_the_roi_crop_is_invisible_to_the_roi():
+    """`localize` runs FIND and the background on the ROI's bounding box plus
+    `crop_margin` (41 px, set by the background's 25 px kernel), not on the
+    frame. The margin's promise is that the answer inside the ROI does not
+    depend on how much frame surrounds it.
+
+    Checked here by handing the same ROI more context than the crop needs:
+    the whole 192^2 frame against a sub-array that still contains the crop.
+    Measured agreement on both: identical N, and positions to 1.3e-12 px --
+    filter summation order over a differently-shaped array, eleven orders
+    below the 5.7e-2 margin the candidate list carries (`filters`' module
+    note).
+    """
+    sim = simulate(shape=(192, 192), density=0.01,
+                   amplitude_range=(900.0, 1900.0), sigma=SIGMA,
+                   sigma_spread=0.2, seed=23)
+    img = sim.image
+    # `threshold` is pinned: the caller otherwise derives it from the array's
+    # shape, which is the thing varying here.
+    for y0, x0, side in ((80, 80, 32), (0, 0, 40), (144, 100, 48)):
+        roi = np.zeros(img.shape, dtype=bool)
+        roi[y0:y0 + side, x0:x0 + side] = True
+        full = L.localize(img, sigma=SIGMA, gain=1.0, roi=roi, threshold=4.0)
+        p = 41 + 20                       # the margin, with slack
+        sy, sx = slice(max(0, y0 - p), y0 + side + p), slice(max(0, x0 - p), x0 + side + p)
+        sub = L.localize(np.ascontiguousarray(img[sy, sx]), sigma=SIGMA, gain=1.0,
+                         roi=np.ascontiguousarray(roi[sy, sx]), threshold=4.0)
+        assert len(full) == len(sub), f"N differs at ({y0}, {x0})"
+        offset = np.array([sy.start, sx.start])
+        np.testing.assert_allclose(full.positions, sub.positions + offset, atol=1e-9)
+        np.testing.assert_allclose(full.amplitudes, sub.amplitudes, rtol=1e-9)
+
+
+def test_an_empty_roi_asks_for_nothing():
+    img = _sim(18).image
+    res = L.localize(img, sigma=SIGMA, gain=1.0,
+                     roi=np.zeros(img.shape, dtype=bool))
+    assert len(res) == 0
+    assert res.background.shape == img.shape
+    assert res.info["candidates"] == 0 and res.info["boxes"] == 0

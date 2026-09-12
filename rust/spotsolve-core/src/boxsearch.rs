@@ -550,6 +550,93 @@ fn median(v: &[f64]) -> f64 {
     }
 }
 
+/// The values `keep` selects, or `None` to mean "use the array itself".
+///
+/// `None` for no mask, and also for a mask that selects nothing: an empty
+/// selection is no statistic at all, and the whole array is a better answer
+/// than a panic.
+fn masked_values(v: &[f64], keep: Option<&[bool]>) -> Option<Vec<f64>> {
+    let m = keep?;
+    let sel: Vec<f64> = v.iter().zip(m).filter(|&(_, &k)| k).map(|(&x, _)| x).collect();
+    (!sel.is_empty()).then_some(sel)
+}
+
+/// Pixels of context a crop needs outside the ROI for the answer inside it to
+/// be the answer the whole frame would give.
+///
+/// Three supports reach in from the crop's edge, and the widest wins:
+///
+/// | stage | reach | at sigma 1.3 |
+/// |---|---|---|
+/// | [`find_candidates`] | `ceil(sigma)` (the max-filter window) + [`filters::kernel_radius`] | 7 |
+/// | boxes | `ceil(BBOX_PAD * sigma) + 1` ([`patches::build_patches`]) | 5 |
+/// | [`background_map`] | `2 * (BG_KERNEL / 2) + kernel_radius(BG_KERNEL / 6)` | 41 |
+///
+/// The background chain sets it, at 41 px, and unlike the other two it does
+/// not shrink with `sigma`: its kernel is a fixed 25 px. A candidate needs
+/// its LoG exact over its whole max-filter window, and each of those needs
+/// data out to the LoG's own radius, so FIND's two radii add rather than max.
+fn crop_margin(sigma: f64) -> usize {
+    let find = sigma.ceil() as usize + filters::kernel_radius(sigma);
+    let boxes = (patches::BBOX_PAD * sigma).ceil() as usize + 1;
+    let bg = 2 * (BG_KERNEL / 2) + filters::kernel_radius(BG_KERNEL as f64 / 6.0);
+    find.max(boxes).max(bg)
+}
+
+/// Widen `[lo, hi)` to at least `want` pixels without leaving `[0, n)`, and
+/// without ever giving up ground it already held.
+fn widen(lo: usize, hi: usize, want: usize, n: usize) -> (usize, usize) {
+    let want = want.min(n);
+    if hi - lo >= want {
+        return (lo, hi);
+    }
+    let mid = (lo + hi) / 2;
+    let start = mid.saturating_sub(want / 2).min(n - want);
+    (start.min(lo), (start + want).max(hi))
+}
+
+/// The sub-frame [`localize`] does its whole-frame work on: the ROI's
+/// bounding box plus [`crop_margin`], clamped to the frame. `None` when the
+/// ROI selects no pixel at all.
+///
+/// Also at least `3 * BG_KERNEL` px on a side where the frame allows, because
+/// [`background_map`] narrows its kernel on an array too small to hold it
+/// (`BG_KERNEL.min(3.max(min(h, w) / 3))`). Without the floor a thin ROI
+/// would silently get a different background kernel from the one the frame
+/// would have used, which is exactly the margin's promise broken. It costs
+/// nothing in the ordinary case: the margin alone already gives 83 px.
+fn roi_crop(roi: &[bool], h: usize, w: usize, sigma: f64) -> Option<patches::BBox> {
+    let (mut y0, mut y1) = (usize::MAX, 0usize);
+    let (mut x0, mut x1) = (usize::MAX, 0usize);
+    for r in 0..h {
+        for c in 0..w {
+            if roi[r * w + c] {
+                y0 = y0.min(r);
+                y1 = y1.max(r + 1);
+                x0 = x0.min(c);
+                x1 = x1.max(c + 1);
+            }
+        }
+    }
+    if y0 == usize::MAX {
+        return None;
+    }
+    let m = crop_margin(sigma);
+    let side = 3 * BG_KERNEL;
+    let (y0, y1) = widen(y0.saturating_sub(m), (y1 + m).min(h), side, h);
+    let (x0, x1) = widen(x0.saturating_sub(m), (x1 + m).min(w), side, w);
+    Some(patches::BBox { y0, x0, y1, x1 })
+}
+
+/// Copy `bb` out of an `h*w` array, row by row.
+fn crop<T: Copy>(v: &[T], w: usize, bb: &patches::BBox) -> Vec<T> {
+    let mut out = Vec::with_capacity(bb.n_pixels());
+    for r in bb.y0..bb.y1 {
+        out.extend_from_slice(&v[r * w + bb.x0..r * w + bb.x1]);
+    }
+    out
+}
+
 /// FIND against a flat `level`: LoG peaks of the variance-normalized
 /// residual above `threshold`, brightest first. Returns
 /// `(pos 2N, amp, strength)`.
@@ -616,21 +703,46 @@ pub fn find_candidates(
 /// background on a crowded field (99 ADU against a true 12-19 on
 /// beads_60x_still), and a low quantile is none on a sparse one (9.7 against
 /// a true 20 on an emitter-free frame).
-pub fn background_map(d: &[f64], h: usize, w: usize, cand: &[f64], sigma: f64) -> Vec<f64> {
+///
+/// `roi`, if given, is `h*w` and confines those two SCALARS -- and nothing
+/// else -- to the pixels it selects. The surface itself is estimated from
+/// every pixel, because a window straddling the ROI's edge is entitled to
+/// the real data on both sides of it. The scalar is the one number the whole
+/// crop can fall back to, so it has to describe the region asked about: on
+/// `hyp7gem_wt_crop` the frame's own 10th percentile is 11.1 e-, which is the
+/// dark field OUTSIDE the cell, against 18-20 inside it. Confining it also
+/// makes it independent of how much margin the crop carries, which a
+/// crop-wide statistic is not.
+///
+/// Returns the surface and the fallback level, which is what a caller
+/// scattering this back into a larger array should fill the rest with.
+pub fn background_map(
+    d: &[f64],
+    h: usize,
+    w: usize,
+    cand: &[f64],
+    sigma: f64,
+    roi: Option<&[bool]>,
+) -> (Vec<f64>, f64) {
     let n = cand.len() / 2;
     let mut k = BG_KERNEL.min(3usize.max(h.min(w) / 3));
     if k % 2 == 0 {
         k += 1;
     }
     let free = render::emitter_free_mask(cand, n, sigma, BG_MASK_RADIUS, h, w);
+    let inside = masked_values(d, roi);
+    let stat = inside.as_deref().unwrap_or(d);
     let fallback = if n == 0 {
-        median(d)
+        median(stat)
     } else {
-        let kept: Vec<f64> = (0..h * w).filter(|&i| free[i]).map(|i| d[i]).collect();
-        if kept.len() as f64 >= 16f64.max(0.02 * (h * w) as f64) {
+        let kept: Vec<f64> = (0..h * w)
+            .filter(|&i| free[i] && roi.is_none_or(|m| m[i]))
+            .map(|i| d[i])
+            .collect();
+        if kept.len() as f64 >= 16f64.max(0.02 * stat.len() as f64) {
             median(&kept)
         } else {
-            percentile(d, 10.0)
+            percentile(stat, 10.0)
         }
     };
     let local_mean = |mask: &[bool]| -> (Vec<f64>, Vec<f64>) {
@@ -654,7 +766,7 @@ pub fn background_map(d: &[f64], h: usize, w: usize, cand: &[f64], sigma: f64) -
     for v in out.iter_mut() {
         *v = v.max(BG_FLOOR);
     }
-    out
+    (out, fallback.max(BG_FLOOR))
 }
 
 /// An emitter: `[A, y, x, sigma]`.
@@ -943,6 +1055,49 @@ fn owned_mask(
 /// Localize one frame of `d_e`. `roi`, if given, is `H*W`: candidates
 /// outside it are dropped after the background map is built from all of
 /// them, and no box places outside it.
+///
+/// # The crop
+///
+/// An ROI confines the search, so the whole-frame preamble -- FIND, the
+/// background surface, and the level they are measured against -- runs on
+/// the ROI's bounding box plus [`crop_margin`] rather than on the frame.
+/// Nothing else moves: positions come back in global coordinates and the
+/// background is scattered into an `H*W` map, so boxes, the halo, the polish
+/// and the edge classification all still see the whole frame.
+///
+/// It is worth doing because that preamble is a third of the frame's work and
+/// none of it depends on N -- on a 256^2 frame, 5.1 ms of 15.3 ms
+/// (`percentile` 0.33, FIND 1.64, background 3.16); on 512^2, 23.0 ms of
+/// 67.4 ms. `background_map` is the larger half and does not shrink with
+/// `sigma`: its kernel is a fixed 25 px. Measured end to end on
+/// `hyp7gem_wt_crop`, a centred square ROI:
+///
+/// | frame | ROI | crop | before | after |
+/// |---|---|---|---|---|
+/// | 256^2 | none | -- | 50.1 ms | 50.5 ms |
+/// | 256^2 | 32^2 | 114^2 | 6.09 ms | 1.75 ms |
+/// | 256^2 | 64^2 | 146^2 | 8.27 ms | 4.67 ms |
+/// | 256^2 | 128^2 | 210^2 | 23.4 ms | 18.3 ms |
+/// | 512^2 | 32^2 | 114^2 | 25.4 ms | 3.43 ms |
+/// | 512^2 | 64^2 | 146^2 | 29.1 ms | 8.07 ms |
+/// | 512^2 | 128^2 | 210^2 | 38.1 ms | 18.7 ms |
+///
+/// The win is what the ROI throws away, so it grows with the frame and
+/// shrinks as the ROI approaches it; at `roi = None` the crop is the frame
+/// and nothing changes, bit for bit (asserted across three images and three
+/// sigmas, positions, amplitudes, widths and the whole background map). An
+/// ROI whose bounding box is the frame -- scattered cells, a diagonal band --
+/// buys nothing and costs nothing.
+///
+/// The margin makes the crop invisible to everything inside the ROI:
+/// measured, the same ROI given more surrounding frame than the crop needs
+/// returns the same N with positions agreeing to 1.3e-12 px, which is filter
+/// summation order over a differently-shaped array. What the ROI does change
+/// -- deliberately -- is `b0` and the background's fallback, now measured
+/// over the ROI's own pixels rather than the frame's; see [`background_map`].
+/// On `hyp7gem_wt_crop` that moved N by up to 5% on the larger ROIs (78 to
+/// 74 at 128^2), because the frame's 10th percentile is the dark field
+/// outside the cell.
 pub fn localize(
     d: &[f64],
     h: usize,
@@ -952,13 +1107,56 @@ pub fn localize(
     ws: &mut Workspace,
 ) -> Output {
     assert_eq!(d.len(), h * w);
-    let b0 = percentile(d, 10.0).max(BG_FLOOR);
-    let (cand_all, amp_all, str_all) = find_candidates(d, h, w, b0, s.sigma, s.threshold);
-    let bmap = background_map(d, h, w, &cand_all, s.sigma);
+    let bb = match roi {
+        None => patches::BBox { y0: 0, x0: 0, y1: h, x1: w },
+        Some(m) => match roi_crop(m, h, w, s.sigma) {
+            Some(bb) => bb,
+            // An ROI selecting nothing asks for nothing. `gain` is NaN as
+            // on every other path out of here; `localize_raw` fills it in.
+            None => {
+                return Output {
+                    background: vec![BG_FLOOR; h * w],
+                    gain: f64::NAN,
+                    ..Output::default()
+                }
+            }
+        },
+    };
+    let whole = bb.h() == h && bb.w() == w;
+    let (cw, ch) = (bb.w(), bb.h());
+    let dsub = if whole { Vec::new() } else { crop(d, w, &bb) };
+    let dc: &[f64] = if whole { d } else { &dsub };
+    let rsub = match roi {
+        Some(m) if !whole => Some(crop(m, w, &bb)),
+        _ => None,
+    };
+    let rc: Option<&[bool]> = match (roi, &rsub) {
+        (Some(m), None) => Some(m),
+        (_, Some(v)) => Some(v),
+        (None, None) => None,
+    };
+
+    let level = masked_values(dc, rc);
+    let b0 = percentile(level.as_deref().unwrap_or(dc), 10.0).max(BG_FLOOR);
+    let (cand_all, amp_all, str_all) = find_candidates(dc, ch, cw, b0, s.sigma, s.threshold);
+    let (bsub, fill) = background_map(dc, ch, cw, &cand_all, s.sigma, rc);
+    // Back to the frame. Outside the crop nothing was estimated, so the map
+    // carries the fallback level rather than a hole: no fit reads it -- every
+    // box lies inside the crop by `crop_margin` -- but callers render it.
+    let bmap = if whole {
+        bsub
+    } else {
+        let mut full = vec![fill; h * w];
+        for r in 0..ch {
+            full[(bb.y0 + r) * w + bb.x0..(bb.y0 + r) * w + bb.x1]
+                .copy_from_slice(&bsub[r * cw..(r + 1) * cw]);
+        }
+        full
+    };
 
     let (mut cand, mut camp, mut strength) = (Vec::new(), Vec::new(), Vec::new());
     for j in 0..amp_all.len() {
-        let (y, x) = (cand_all[2 * j], cand_all[2 * j + 1]);
+        let (y, x) = (cand_all[2 * j] + bb.y0 as f64, cand_all[2 * j + 1] + bb.x0 as f64);
         if roi.is_none_or(|m| m[y as usize * w + x as usize]) {
             cand.extend_from_slice(&[y, x]);
             camp.push(amp_all[j]);

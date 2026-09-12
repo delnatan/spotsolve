@@ -20,6 +20,21 @@ covering everything wanted, in one call. Tiling a frame into separate ROI
 calls double-reports sources at the seams (measured: about 1.6 per frame at
 one seam through a 64x64 frame) and loses recall there, because neither
 tile's boxes see the other's emitters. One call never double-reports.
+
+An `roi` also confines the WORK. FIND, the background surface and the level
+they are measured against run on the ROI's bounding box plus a 41 px margin,
+not on the frame, which is what a masked call used to waste: a 32x32 ROI on
+a 512x512 frame went from 25.4 ms to 3.4 ms. The margin is wide enough that
+nothing inside the ROI can tell, so this costs no accuracy; an ROI whose
+bounding box is the whole frame (scattered cells, a diagonal band) simply
+buys nothing.
+
+One thing it does change: the flat level FIND works against, and the
+background's fallback, are measured over the ROI's pixels rather than the
+frame's. Under a cell mask the frame's own 10th percentile is the dark field
+OUTSIDE the cell -- 11.1 e- against 18-20 inside it on `hyp7gem_wt_crop` --
+so this is the level the mask asked for. It moves N by up to 5% against
+earlier versions on masked calls. Unmasked calls are unchanged, bit for bit.
 """
 
 import os
