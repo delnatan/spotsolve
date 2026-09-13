@@ -61,6 +61,50 @@ background level the search works against is measured over the mask's own
 pixels, not the frame's -- under a cell mask, the frame's dimmest pixels are
 the dark field outside the cell, which is not the background inside it.
 
+## Two thresholds: what gets searched, and what gets tried
+
+The search runs one statistic twice. It is a Laplacian-of-Gaussian filter
+at `sigma`, in standard deviations of its noise, and each use has its own
+cut:
+
+| argument | default | decides |
+|---|---|---|
+| `seed_threshold` | derived from the frame size (4.1 on 256x256 at `sigma` 1.27) | which peaks in the frame get a box searched around them |
+| `birth_threshold` | 3.0 | how strong a leftover peak inside a box must be before a new spot is tried there |
+
+They fail in opposite directions, which is why they are separate:
+
+- **A loose `seed_threshold` costs only time.** A seed is not a detection;
+  every spot still has to pass the 10-nat test below. A seed that is too
+  strict costs recall that nothing recovers, because light that never gets
+  a box is never fitted.
+- **A loose `birth_threshold` costs precision.** A spot tried at a peak that
+  clears it is judged by the 10-nat test alone. Around a bright spot, the
+  leftover light from a slightly wrong fit can pass that test and become a
+  false neighbour. On faint fields the reverse holds: nothing that faint can
+  pay 10 nats, so a lower cut only adds recall.
+
+3.0 was chosen against simulation truth over nine field types, from bright
+and dense to faint, and at widths of 0.8, 1.3 and 2.0 px. It has the lowest
+mean and worst-case F1 loss of the cuts from 1.5 to 5.0. Lowering it also
+costs time: each box holds more spots, and a box's fits grow faster than its
+spot count. On the GEM movie, single-threaded:
+
+| `birth_threshold` | 4.1 | 3.0 | 2.5 | 2.0 |
+|---|---|---|---|---|
+| ms per frame | 104 | 187 | 249 | 318 |
+| detections per frame | 461 | 556 | 584 | 597 |
+
+The detections gained down to 2.5 are real: they link into tracks as often
+as the rest (87% linked at every setting). Raise the cut toward 4 for
+speed; lower it toward 2.5 on faint, sparse data, where the extra fits are
+cheap.
+
+Other arguments: `k_max` (the most spots fitted jointly in one box, default
+12), `images=` (`model_image` and `residual` on the result; on by default
+for `localize`, off for `localize_stack`), and `n_threads=` for
+`localize_stack` (default: all cores).
+
 ## Spot width: fitted per spot, and reported only inside a band
 
 Every spot's width is fitted, not held at `sigma`. `sigma` sets the scale of
@@ -244,14 +288,16 @@ Levenberg-Marquardt with Fisher scoring.
 **The search.**
 
 1. *Find candidates.* A Laplacian-of-Gaussian filter at `sigma` is applied to
-   the noise-normalized image; local maxima above a threshold become
-   candidates. The threshold allows about a 5% chance of one false candidate
-   per frame; candidates only seed the search, they are not detections.
+   the noise-normalized image; local maxima above `seed_threshold` become
+   candidates. The cut is set for a nominal 5% chance of one false candidate
+   per frame, and in practice it lets through more, which is deliberate.
+   Candidates only seed the search; they are not detections.
 2. *Group into boxes.* Candidates within 2.5 `sigma` of each other share a
    box (at most 12 per box), padded by 3 `sigma` of pixels.
 3. *Decide each box*, brightest box first. Start from the background alone.
-   Add one spot at a time, at the strongest remaining residual peak that
-   passes the same threshold, refitting all spots in the box together. **A
+   Add one spot at a time, at the strongest peak left in the box's residual
+   (the same filter, at `sigma`) that passes `birth_threshold`, refitting all
+   spots in the box together. **A
    spot is kept only if it lowers the box's `I` by more than 10 nats** -- a
    likelihood ratio above e^10 ≈ 22,000. Then, while the cheapest spot to
    remove costs less than 10 nats, remove it. Spots in neighbouring boxes are
