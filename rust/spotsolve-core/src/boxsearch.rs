@@ -301,24 +301,28 @@ pub const BG_MIN_PIXELS: f64 = 25.0;
 ///
 /// Measured 2026-09-12 with `seed` pinned at its default, nine arms on
 /// `simulate` truth, twelve seeds each, `band=None` so recall measures
-/// detection and not width classification. F1, and below it the regret
-/// against each arm's own best:
+/// detection and not width classification, and a detection matched within
+/// 1 px. F1, and below it the regret against each arm's own best:
 ///
 /// ```text
 /// arm                          4.0     3.5     3.0     2.5     2.0     1.5
 /// bright sparse, matched      .983    .985    .986    .985    .983    .980
-/// bright mid, spread          .939    .940    .939    .935    .929    .924
-/// bright dense, spread        .883    .885    .884    .881    .876    .868
-/// bright v.dense, spread      .822    .827    .828    .818    .818    .813
-/// faint mid, matched          .892    .906    .919    .925    .928    .930
-/// faint mid, spread           .850    .870    .882    .889    .893    .895
-/// faint, bright bg            .807    .823    .834    .845    .851    .852
-/// sigma 0.8 faint, spread     .930    .943    .950    .953    .953    .951
-/// sigma 2.0 bright, spread    .838    .837    .832    .820    .798    .798
+/// bright mid, spread          .912    .913    .908    .903    .890    .884
+/// bright dense, spread        .820    .816    .816    .809    .798    .794
+/// bright v.dense, spread      .736    .735    .732    .716    .709    .710
+/// faint mid, matched          .846    .870    .891    .899    .903    .905
+/// faint mid, spread           .802    .821    .834    .842    .848    .847
+/// faint, bright bg            .766    .780    .791    .800    .803    .804
+/// sigma 0.8 faint, spread     .924    .936    .942    .946    .945    .942
+/// sigma 2.0 bright, spread    .730    .724    .719    .704    .677    .680
 ///
-/// mean regret               .0180   .0102   .0057   .0061   .0087   .0106
-/// worst-arm regret          .0449   .0286   .0179   .0174   .0402   .0400
+/// mean regret               .0189   .0121   .0079   .0095   .0146   .0156
+/// worst-arm regret          .0593   .0352   .0149   .0261   .0523   .0496
 /// ```
+///
+/// Score at 1 px, not 2. At 2 px a displaced extra detection beside a real
+/// one still counts as a hit, which flatters the looser gates: scored that
+/// way, 2.5 tied 3.0 (worst-arm regret .0174 against .0179).
 ///
 /// The two ends want opposite things and the reason is `ADD_NATS`. On FAINT
 /// fields the gate is pure loss: nothing faint enough to be a satellite can
@@ -326,10 +330,10 @@ pub const BG_MIN_PIXELS: f64 = 25.0;
 /// recall climbs 11 points. On BRIGHT fields it is load-bearing: a bright
 /// emitter whose width is mis-modelled leaves a residual big enough that a
 /// satellite on its wings CAN pay 10 nats, and only the gate stops the
-/// tiling (see [`placement`]). 3.0 and 2.5 are statistically tied, 4.0 is
-/// clearly wrong, and 2.0 falls off a cliff on the bright arms.
+/// tiling (see [`placement`]). 3.0 wins on both mean and worst-arm regret,
+/// 4.0 is clearly wrong, and 2.0 falls off a cliff on the bright arms.
 ///
-/// 3.0 over 2.5 is the runtime: a lower gate means more emitters per box,
+/// 3.0 over 2.5 is also the runtime: a lower gate means more emitters per box,
 /// and a box's fits grow faster than its emitter count. On 20 GEM frames,
 /// single-threaded, against detections per frame:
 ///
@@ -1054,6 +1058,55 @@ fn fit_window(
 /// that had already been screened; without the screen every bright emitter
 /// collected faint satellites on its wings (130 emitters for 107 true on
 /// seed 17, precision 0.74).
+///
+/// # The LoG stays, though it is the wrong statistic on paper
+///
+/// Inside a box the argument FIND lost (see [`find_candidates`]) looks
+/// stronger. The level is one free constant, fitted, so the exact GLRT for
+/// one more emitter at a grid position is the pixel-integrated PSF matched
+/// filter with that constant projected out under the Poisson weights `1/m`.
+/// It lost anyway, and in BOTH of this function's jobs: deciding whether to
+/// place, and where.
+///
+/// Measured 2026-09-12 on the [`BIRTH_Z`] arms (same seeds, 1 px match,
+/// `band=None`), each statistic with `birth` swept 5.0-1.5 on its own scale
+/// and taken at its own minimax cut. Mean / worst-arm F1 regret is against
+/// each arm's best over every row and cut. Then the paired F1 change against
+/// the LoG at 3.0, per arm in the [`BIRTH_Z`] table's order:
+///
+/// ```text
+/// gate     position  birth   mean   worst   per-arm dF1 vs LoG
+/// LoG      LoG        3.0   .0083   .0149   (reference)
+/// MF       MF         3.5   .0362   .0765   -.006 -.025 -.030 -.028 -.062 -.030 -.028 -.009 -.033
+/// MF+proj  MF+proj    4.0   .0395   .0812   -.008 -.026 -.034 -.032 -.066 -.031 -.027 -.010 -.047
+/// MF+proj  LoG        3.0   .0225   .0374   -.006 -.019 -.020 -.015 -.020 -.010 -.007 -.007 -.024
+/// LoG      MF+proj    3.5   .0229   .0483   -.001 -.007 -.020 -.022 -.021 -.010 -.010 -.005 -.035
+/// ```
+///
+/// MF is the pixel-integrated Gaussian at `sigma`, truncated at the window
+/// and normalized by its weighted norm; "+proj" projects the level out.
+/// Projecting the level out did not help. No arm gains at any row's cut, and
+/// with a free cut per arm the best any matched-filter row does is tie. The
+/// two split rows show where the loss comes from:
+///
+/// * As a POSITION PICKER (LoG gate, MF peak) recall is unchanged and
+///   precision falls with the gate: .913 -> .879 at 3.0 on bright mid, .732
+///   -> .608 at sigma 2.0, the arms where widths are mis-modelled. That is
+///   consistent with the broad core peaking on the smooth residual a
+///   width-mismatched bright emitter leaves on its wings, where the start
+///   then pays `ADD_NATS` as a satellite; the LoG's negative surround
+///   rejects smooth residual. The satellites were not traced one by one.
+/// * As a GATE (MF z, LoG peak) precision is below the LoG's at EVERY cut on
+///   the bright arms, even at 5.0 (.916 against .957 on bright mid), so no
+///   constant recovers it. The bright arms want a statistic that ignores
+///   smooth residual, not a higher cut on one that sums it.
+///
+/// Even where the residual is closest to one emitter plus noise -- faint, or
+/// matched width -- the matched filter at best ties (.905 against .905 on
+/// faint matched, .982 against .986 on bright sparse). Its optimality holds
+/// for a residual the search never sees. The LoG's band pass is rejecting
+/// model mismatch, which the GLRT does not. The
+/// 0.60-0.69 efficiency the note at [`find_candidates`] measures is the price.
 ///
 /// The tests here and in [`search_box`] are written `!(a > b)` on purpose: a
 /// NaN must fail them.
