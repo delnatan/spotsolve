@@ -8,17 +8,20 @@
 //! as a whole are below.
 //!
 //! ```text
-//! d_e      (raw - offset) / gain + read_noise^2             shifted Poisson
-//! FIND     LoG peaks of d_e against a flat level            -> candidates
+//! d        raw - offset, in ADU; no gain, no read noise
+//! NOISE    local pixel sd (NOISE_WIN px, 4th-difference filter) and the local
+//!          dispersion phi = sd^2 / local median of d
+//! FIND     LoG peaks of d against a flat level, in units of NOISE -> candidates
 //! BMAP     smooth surface from the pixels no candidate reaches
 //! BOXES    candidates within LINK_FACTOR*sigma share a box, <= k_max each
 //! SWEEPS times, for each box, brightest first:
 //!     fit the level alone (K = 0), BMAP's shape and the neighbours' current
 //!     emitters held fixed
 //!     FORWARD   place at the strongest owned residual peak that passes
-//!               the BIRTH cut; keep it iff I falls by > ADD_NATS
-//!     BACKWARD  (K >= 2) drop the cheapest emitter while it costs < ADD_NATS
+//!               the BIRTH cut; keep it iff I falls by > ADD_NATS * phi
+//!     BACKWARD  (K >= 2) drop the cheapest emitter while it costs less
 //! POLISH   block-Jacobi refits at fixed N until nothing moves
+//! CLASSIFY by fitted width, out of band only when significantly so
 //! ```
 //!
 //! Each emitter is decided in the box that owns it, by one comparison rule.
@@ -27,51 +30,44 @@
 //! redundant emitter explains almost no deviance, so it cannot pay
 //! `ADD_NATS` on the way in and costs almost nothing on the way out.
 //!
-//! # The gain is a dispersion parameter, not a scale
+//! # No camera calibration: every decision is scale-free
 //!
-//! Everything here works in photoelectrons, `d_e = (adu - offset) / g`; the
-//! Poisson weighting `W = 1/m` is only valid there. Three exact identities
-//! (verified numerically to machine precision):
+//! The detector used to take `gain` and `read_noise` and work in
+//! photoelectrons. It now takes neither, and the frame stays in ADU above the
+//! offset. Three facts make that possible.
 //!
-//! * the I-divergence is homogeneous, `I(d/g, m/g) = I(d, m) / g`;
-//! * so the FIT does not depend on `g`: positions are invariant and
-//!   amplitudes scale as `1/g`. Measured over g = 1..50, positions agreed
-//!   to 7e-7 px and amplitudes to 7e-7 relative;
-//! * `log|F| = (1 - K) log g + log|F_ADU|`.
+//! * The FIT never needed the gain. The I-divergence is homogeneous,
+//!   `I(d/g, m/g) = I(d, m) / g`, so positions and widths are invariant and
+//!   amplitudes scale as `1/g` (measured over g = 1..50: positions to 7e-7 px).
+//! * The DECISION `dI > c` does, but only through a scale: in ADU,
+//!   `dI_ADU = g * dI_e`. Here `c` is multiplied by the box's own dispersion
+//!   `phi`, the pixel variance per unit of signal, measured from the frame
+//!   ([`noise_map`]), so `dI_ADU / phi` is in the units the old test was in.
+//! * The two LoG cuts, FIND's and BIRTH's, are divided by the local pixel sd
+//!   instead of `sqrt(model)`. The sd includes read noise, and haze, without
+//!   being told either.
 //!
-//! The whole gain dependence of the decision -- keep an emitter iff `I`
-//! falls by more than `ADD_NATS` -- is the `1/g` on the data term:
-//! `dI_ADU / g > ADD_NATS`. The gain moves that threshold and nothing else.
-//! It is a property of the CAMERA, not of the field: measure it once and
-//! pass it in. [`estimate_gain`] is the fallback.
+//! Scaling a frame by 0.5-7.3x leaves the seeds identical and N within 4 of
+//! 290 (the absolute fitter tolerances and floors). Read noise needs no
+//! model: on EMPTY 64x64 frames at 1-20 e- background and 1.6-2.5 e- read
+//! noise it gives 0-0.7 fits per frame (the shifted Poisson it replaced:
+//! 0.0; plain Poisson: 1.2-13.3).
 //!
-//! # Read noise: the shifted-Poisson approximation
-//!
-//! A pixel's variance is `m + sigma_r^2`, not `m`. Adding `s = sigma_r^2`
-//! (e-^2) to both data and model gives a Poisson likelihood with exactly
-//! that variance and mean `m + s`. Here it is a shift of `d_e` alone
-//! ([`localize_raw`]): every box carries a free constant background, which
-//! absorbs `s`, and FIND's `sqrt(model)` normalization then divides by the
-//! right standard deviation. The caller takes `s` back off the reported
-//! background and model.
-//!
-//! Without it, at low background a read-noise spike reads as a significant
-//! single-pixel source. Measured 2026-09-10 on 64x64 `simulate` frames with
-//! Gaussian read noise added: false detections per frame on EMPTY frames (six
-//! seeds), then recall / precision at density 0.015, flux U(150, 500) e-
-//! (three seeds):
+//! Measured 2026-09-14 against the calibrated detector on `simulate` truth
+//! (128x128, flux U(200, 1500) e-, bg 20 e-, sigma 1.4 with log spread 0.2,
+//! gain 2.4, read noise 1.6; six frames, 1 px match), recall / precision:
 //!
 //! ```text
-//! bg e-  sigma_r   empty: Poisson  shifted    Poisson        shifted
-//!  1.0     1.6             1.2       0.0     .837 .937      .830 .983
-//!  1.0     2.5            13.3       0.0     .823 .811      .823 .983
-//!  3.0     2.5             5.7       0.0     .837 .922      .816 .975
-//! 10.0     2.5             0.5       0.0     .773 .965      .730 .963
+//! density   calibrated    gain estimated   gain-free
+//!  0.01     .850 .981      .847 .978       .855 .963
+//!  0.03     .682 .917      .677 .918       .683 .913
+//!  0.06     .511 .842      .496 .848       .510 .839
 //! ```
 //!
-//! With no read noise the two are the same pipeline. The recall the shifted
-//! model gives up where `sigma_r^2` rivals the background is not yet traced
-//! to individual emitters.
+//! On the real GEM movie (`hyp7gem_wt_01_crop_128x128`), with emitters spiked
+//! into its frames, gain-free recall of 150-300 e- emitters is 2-6 points
+//! under the calibrated detector's at the same false-positive rate. That is
+//! close to the spike-in noise (12 tracks per class).
 //!
 //! # Background: a smooth map, not a plane
 //!
@@ -192,6 +188,28 @@ pub const K_MAX: usize = crate::patches::K_MAX;
 /// c = 10 matched the Bayes factor within seed noise in all six cells; c = 14
 /// trades 2-3 recall points for about half the tiles. The Bayes factor's
 /// priors, log-determinants and empirical-Bayes rates were an operating point.
+///
+/// Since 2026-09-14 the frame is in ADU and the test is `dI > ADD_NATS * phi`,
+/// with `phi` the box's median dispersion ([`noise_map`]); that is these nats
+/// in photoelectron units. Re-measured there, on the GEM spike-in referee
+/// (false positives per frame from two matched simulations, then recall of
+/// 150 and 300 e- spike-ins at D = 0, 0.43 and 2 px^2/frame), seed and birth
+/// at their old defaults:
+///
+/// ```text
+///   c     FP    150 e-           300 e-
+///   5     33    .48 .36 .29      .80 .75 .64
+///   7     28    .47 .36 .27      .76 .74 .61
+///  10     24    .44 .34 .27      .72 .69 .58
+///  14     20    .41 .29 .22      .64 .64 .54
+/// ```
+///
+/// Kept at 10. Lowering it buys recall at 300 e-; at 150 e- recall stops near
+/// .48 however low `c` goes, because those emitters are lost at the seed and
+/// birth cuts first (see [`SEED_Z`]). Aguet et al.'s local-noise floor (keep
+/// an emitter iff its peak exceeds k residual sds) was measured in its place
+/// on the same referee and lies on the same curve (k = 2: FP 35, .50 .38 .31;
+/// k = 3: FP 19, .36 .24 .15), with shorter tracks and more fits.
 pub const ADD_NATS: f64 = 10.0;
 /// sigma. A box places only on pixels this near one of its own candidates,
 /// and nearer to its own than to any other box's. The nearest-candidate rule
@@ -284,7 +302,7 @@ pub const POLISH_TOL_OBJ: f64 = 1e-6;
 pub const POLISH_MOVE_TOL: f64 = 1e-3;
 /// Side, px, of the window [`background_map`] averages over.
 pub const BG_KERNEL: usize = 25;
-/// e-. `W = 1/m` is singular at `m = 0`; this is far below one photoelectron.
+/// ADU. `W = 1/m` is singular at `m = 0`; this is far below one count.
 pub const BG_FLOOR: f64 = 1e-3;
 /// sigma. Emitter support excluded from the background estimate.
 pub const BG_MASK_RADIUS: f64 = 3.0;
@@ -294,7 +312,7 @@ pub const BG_MIN_PIXELS: f64 = 25.0;
 /// before a placement is even tried. Not derived from the frame -- the test
 /// is inside a box, and a box does not get bigger when the frame does.
 ///
-/// It used to share [`seed_threshold`]'s frame-wide value (3.8 to 4.1 on the
+/// It used to share FIND's frame-wide Bonferroni value (3.8 to 4.1 on the
 /// sizes here), which is a Bonferroni over ~1820 independent windows. A box
 /// holds about four. That number was inherited, not derived, and it was
 /// costing recall that `ADD_NATS` would have rejected anyway.
@@ -354,29 +372,48 @@ pub const BG_MIN_PIXELS: f64 = 25.0;
 /// 87.0% -> 87.3% -> 87.7% and tracks of 5+ frames 799 -> 946 -> 1000. At
 /// 2.0 both signals turn: the linked fraction drops back to 87.1% and mean
 /// track length falls, for 2% more detections.
-pub const BIRTH_Z: f64 = 3.0;
-/// FIND's family-wise false-seed rate per frame, and the only free number in
-/// [`seed_threshold`].
 ///
-/// It can be this loose because FIND IS A SEEDER, NOT A DECISION RULE: every
-/// candidate still has to lower its box's deviance by `ADD_NATS`, and every
-/// placement inside a box passes [`Settings::birth`], so a spurious seed
-/// costs runtime rather than a detection. An over-tight seed costs what
-/// cannot be recovered -- a box never forms around light FIND did not seed.
+/// # 2.5 since the gain-free search (2026-09-14)
 ///
-/// This asymmetry is the whole reason `seed` and `birth` are separate
-/// fields. While they were one number, loosening the seed to buy recall
-/// silently loosened the gate that holds precision, so neither could move.
+/// Everything above was measured with the Poisson normalization, under which
+/// the null z had sd 1.07-1.19 rather than 1 (see [`find_candidates`]). With
+/// the local sd it is calibrated, so the old number does not carry over.
+/// Re-measured with [`SEED_Z`] on the GEM spike-in referee (see [`ADD_NATS`]
+/// for the columns, plus the real movie's N and single-process time for the
+/// Python prototype):
 ///
-/// Measured under the retired `detect`, whose ADD step played the same role:
-/// the historical cut at alpha ~ 2e-8 missed faint emitters that a looser
-/// seed found (peak SNR 1.1: recall 23.1% against 65.8% at a 10x lower
-/// threshold), while at alpha = 0.05 the decision rule, not the seed, did the
-/// rejecting. The derived cut is a LOWER bound on the seeder's conservatism:
-/// the LoG response is standard normal only where the model is right, and on
-/// frames with model mismatch the effective test count is larger than the
-/// pixel geometry says.
-pub const SEED_ALPHA: f64 = 0.05;
+/// ```text
+/// seed / birth    FP    150 e-          300 e-          N     ms
+/// 3.79 / 3.0      24    .44 .34 .27     .72 .69 .58     222   476
+/// 3.5  / 3.0      27    .45 .35 .29     .73 .68 .59     228   471
+/// 3.0  / 3.0      30    .48 .38 .29     .75 .69 .60     241   506
+/// 3.0  / 2.5      31    .49 .40 .29     .76 .72 .60     249   558
+/// 2.5  / 2.5      36    .53 .41 .34     .78 .73 .61     263   572
+/// 2.0  / 2.0      45    .57 .43 .36     .78 .74 .64     282   631
+/// ```
+///
+/// 3.0 / 2.5 was chosen for the dim, fast population the GEM data is
+/// collected for: +5 and +4 recall points at 150 and 300 e- over the old
+/// defaults, for 7 more false positives per 128x128 frame and 17% more time.
+pub const BIRTH_Z: f64 = 2.5;
+/// FIND's cut, in sd of the LoG null: which light gets a box at all.
+///
+/// A constant, not derived from the frame. It used to be a Bonferroni cut at
+/// a family-wise rate of 0.05 false seeds per frame (3.79 on 128^2, 4.43 on
+/// 512^2 at sigma 1.45), on the argument that FIND IS A SEEDER, NOT A
+/// DECISION RULE -- a spurious seed still has to pay `ADD_NATS`, so it should
+/// cost only runtime. Measured on the gain-free search (the table at
+/// [`BIRTH_Z`]), that is not true: each 0.5 off the cut costs 4-5 false
+/// positives per 128x128 frame. A seed is placed at the strongest peak in its
+/// box, a maximum over positions, and among enough noise peaks some pay 10
+/// nats. So the cut is an operating point like the others, and a per-area
+/// constant describes it better than a per-frame family-wise rate: the frame
+/// size says nothing about how bright a real emitter is.
+///
+/// An over-tight seed still costs what cannot be recovered -- a box never
+/// forms around light FIND did not seed -- which is why it sits above
+/// [`BIRTH_Z`] by only 0.5.
+pub const SEED_Z: f64 = 3.0;
 /// The amplitude floor of a fit: `max(A_MIN, A_MIN_REL * A_max)`, with
 /// `A_max` the window's own amplitude bound. `A_MIN` is only a backstop for a
 /// window whose `A_max` is itself tiny.
@@ -409,8 +446,69 @@ pub const A_MIN_REL: f64 = 1e-6;
 /// 1.0 px) the fits the border cut off sat 0-0.5 px from it; the two narrow
 /// interior fits sat 1.9 px and further in.
 pub const EDGE_MARGIN: f64 = 1.0;
-/// [`estimate_gain`]'s share of dimmest pixels; see its note.
-pub const GAIN_FRAC: f64 = 0.2;
+/// px. The window of [`noise_map`]'s two local medians, tied to the
+/// background's: both describe the frame at the scale haze varies on.
+pub const NOISE_WIN: usize = BG_KERNEL;
+/// px. [`local_median`] is exact on a grid this far apart and bilinear
+/// between. A per-pixel median is too slow here and no better: a 25 px window
+/// holds about 25 independent samples of the filter output, so the full map
+/// is itself noisy (moving the window one pixel changes it by 3% at the
+/// median and 18% at the 99th percentile). On the GEM spike-in referee at
+/// seed 3.0 / birth 2.5, full / stride 5 / stride 12 gave FP 31.4 / 31.5 /
+/// 31.3, 150 e- recall .49 .40 .29 / .53 .39 .32 / .51 .39 .30, and N 249 /
+/// 249 / 248. Half the window.
+pub const NOISE_STRIDE: usize = 12;
+/// ADU^2. Integer-valued camera data can not be less variable than its own
+/// quantization, `1/12`. Only a noise-free or constant image reaches it.
+pub const NOISE_VAR_FLOOR: f64 = 1.0 / 12.0;
+/// SEs. An out-of-band width is a width flag only if it is out of the band by
+/// more than this many of its own standard errors; otherwise it is a
+/// detection.
+///
+/// A hard band dropped dim emitters whose widths are noisy rather than wrong.
+/// On `hyp7gem_wt_01_crop_128x128`, 9.3 per frame of the emitters present
+/// within 1.5 px at t-1 and t+1 were missing at t; at 39% of those the fit
+/// was there and too narrow, at 31% too wide. Measured there (estimated
+/// gain), per frame, with linking's continuation probability:
+///
+/// ```text
+/// rule             N     one-frame gaps    p_cont
+/// hard band       180        8.8           .733
+/// z = 1           217        9.0           .772
+/// z = 2           235        7.3           .826
+/// z = 3           238        6.8           .835
+/// no band         240        6.3           .840
+/// ```
+///
+/// The added narrow fits above 150 e- persist into the neighbouring frames at
+/// .91 against a chance rate of .28: real. The wide ones persist at .64, which
+/// static haze pieces also would.
+///
+/// # Except at the upper slack bound
+///
+/// A width at `SLACK.1` is not a measurement: the fit wanted to be wider than
+/// the model space allows. It is `Wide` whatever its SE says. It has to be,
+/// because the SE cannot say it: `SLACK.1` is only 0.2 sigma above
+/// `BAND.1`, and the joint Fisher matrix, with the level free, gives a wide
+/// emitter a width SE of ~0.6 px (0.19 from a single-emitter Fisher). On GEM
+/// frame 0, 28 of the 34 fits above the band sat on the bound, at z < 1.
+/// Measured on the GEM referee (see [`ADD_NATS`]), on the port's own fits:
+///
+/// ```text
+/// rule                           FP    150 e-          300 e-          N
+/// significance only              32    .51 .40 .31     .75 .71 .63     253
+/// + upper bound is wide          20    .50 .38 .29     .74 .71 .60     226
+/// + lower bound is narrow too    17    .47 .36 .28     .71 .68 .59     210
+/// hard band                      15    .43 .33 .26     .67 .65 .56     187
+/// ```
+///
+/// The upper bound buys 12 false positives per frame for 1-3 recall points.
+/// The lower one is not treated the same way: a dim emitter's width is noisy
+/// enough to reach `SLACK.0` while the emitter is real, and flagging it costs
+/// 3-4 points of exactly the recall this band exists for.
+pub const BAND_Z: f64 = 2.0;
+/// Relative. A width within this fraction of `SLACK.1 * sigma` is on the bound.
+pub const BOUND_TOL: f64 = 1e-3;
 
 /// What a fitted emitter is reported as, by [`classify`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -434,17 +532,16 @@ pub struct Settings {
     pub sigma: f64,
     pub k_max: usize,
     /// SEED: FIND's frame-wide cut, in sd of the LoG null. What decides
-    /// which light gets a box at all; see [`seed_threshold`].
+    /// which light gets a box at all; defaults to [`SEED_Z`].
     pub seed: f64,
     /// BIRTH: the same statistic inside a box, on the current fit's residual
     /// -- the cut a candidate placement must clear before [`ADD_NATS`] is
     /// even asked. See [`placement`].
     ///
     /// It is a separate number from `seed` because the two answer different
-    /// questions. A loose `seed` costs runtime and nothing else; a loose
-    /// `birth` costs precision directly, because a placement that clears it
-    /// goes on to be judged by `ADD_NATS` alone. It defaults to [`BIRTH_Z`],
-    /// which is calibrated for this test rather than derived from the frame.
+    /// questions: `seed` decides where to look, `birth` how strong leftover
+    /// light inside a box must be before one more emitter is tried there.
+    /// Defaults to [`BIRTH_Z`].
     pub birth: f64,
     /// Widths a fit may take, as multiples of `sigma`.
     pub slack: (f64, f64),
@@ -463,13 +560,18 @@ pub struct Output {
     pub pos: Vec<f64>,
     pub amp: Vec<f64>,
     pub sig: Vec<f64>,
-    /// `3N`: SE of `(A, y, x)` from the polish's Fisher matrix; NaN without.
+    /// `3N`: SE of `(A, y, x)` from the polish's Fisher matrix, scaled by the
+    /// local dispersion; NaN without.
     pub se: Vec<f64>,
+    /// `N`: SE of each fitted width, likewise.
+    pub se_sig: Vec<f64>,
     /// `N`: each emitter's [`Class`].
     pub class: Vec<Class>,
-    /// ADU per photoelectron: the caller's, or [`estimate_gain`]'s.
-    pub gain: f64,
-    /// `H*W`, in the units of `d_e` (shifted by `read_noise^2`).
+    /// The median of [`noise_map`]'s dispersion over the searched pixels:
+    /// pixel variance per unit of signal, ADU. For a camera it is about the
+    /// gain plus `gain^2 * read_noise^2 / background`.
+    pub dispersion: f64,
+    /// `H*W`, ADU above the offset.
     pub background: Vec<f64>,
     pub n_candidates: usize,
     pub n_boxes: usize,
@@ -504,20 +606,6 @@ impl Default for Workspace {
     }
 }
 
-/// FIND's seed cut in sd of the LoG null, derived rather than carried: the
-/// Bonferroni cut `Phi^-1(1 - alpha/n)` at a family-wise rate `alpha` over the
-/// frame's `n` independent LoG maxima, one per `(2*ceil(sigma)+1)^2` pixels
-/// (the local-maximum window of [`find_candidates`]).
-///
-/// So it scales with the frame and the PSF, which a constant cannot: 3.70 on
-/// 64^2 at sigma 0.818, 4.43 on 512^2 at sigma 1.45.
-pub fn seed_threshold(h: usize, w: usize, sigma: f64, alpha: f64) -> f64 {
-    let win = (2 * sigma.ceil() as usize + 1) as f64;
-    let n = (h as f64 * w as f64 / (win * win)).max(1.0);
-    let p = alpha.clamp(1e-12, 0.999) / n;
-    -statistics::normal_quantile(p)
-}
-
 /// `np.quantile(v, q)`, linear interpolation, `q` in `[0, 1]`.
 pub fn quantile(v: &[f64], q: f64) -> f64 {
     let mut s = v.to_vec();
@@ -533,74 +621,167 @@ pub fn percentile(v: &[f64], q: f64) -> f64 {
     quantile(v, q / 100.0)
 }
 
-/// Photon-transfer gain from the dimmest pixels, ADU per photoelectron. Needs
-/// no emitter model and no camera calibration. Prefer a measured gain.
+/// The median of `a` (`h*w`) over the `win`-px square centred on each pixel,
+/// the array's edge clamped outward.
 ///
-/// On emitter-free pixels `Var = gain * (mean - offset)`, so a high-pass
-/// variance over the mean is the gain. Background is chosen on a 3x3-smoothed
-/// copy, because choosing the dimmest RAW pixels selects on their own noise,
-/// biasing the mean down and the gain up. `GAIN_FRAC` is small: across
-/// synthetic fields the dimmest 20% gives 1.00, 2.03, 4.69, 10.02 against a
-/// true 1, 2, 4.7, 10, while 0.4 and 0.6 drift high as density rises because
-/// PSF tails leak into the selection.
-///
-/// KNOWN LIMIT -- it fails at high density. The same leak reaches 0.2
-/// eventually: on a bead-matched field at 0.055 emitters/px^2 this returns
-/// 12.5 against a true 4.23, because even the dimmest fifth of the image sits
-/// on PSF tails. Everything downstream inherits it, and a residual-based
-/// correction cannot rescue it: the bias is baked into the units the residual
-/// is measured in.
-///
-/// SECOND KNOWN LIMIT -- it does not transfer between fields. On the two
-/// real bead frames it returns 4.23 and 2.94, though both were taken on the
-/// same camera. The fitted bead amplitudes agree across the two at 4.23
-/// (median 939 vs 933 e-), which they could not if the gain were off by 1.4x
-/// on one of them.
-///
-/// It runs BEFORE any search: a gain read off the fitted residual arrives
-/// after the search has already run with the wrong data term.
-pub fn estimate_gain(raw: &[f64], h: usize, w: usize, offset: f64) -> f64 {
-    if w < 5 {
-        return 1.0;
-    }
-    let wi = w - 2;
-    let mut hp = Vec::with_capacity(h * wi);
-    let mut mid = Vec::with_capacity(h * wi);
-    for r in 0..h {
-        let row = &raw[r * w..(r + 1) * w];
-        for c in 1..w - 1 {
-            hp.push((row[c - 1] - 2.0 * row[c] + row[c + 1]) / 6f64.sqrt());
-            mid.push(row[c]);
+/// Exact at the nodes of a grid [`NOISE_STRIDE`] apart and bilinear between
+/// them (see its note for why that is enough). The nodes are the rows and
+/// columns whose GLOBAL index `oy + r`, `ox + c` is a multiple of the stride,
+/// plus the array's own first and last: an ROI crop of the frame then shares
+/// every interior node with the whole frame, and only pixels within a stride
+/// of the crop's edge -- inside [`crop_margin`] -- can tell the difference.
+pub fn local_median(a: &[f64], h: usize, w: usize, win: usize, oy: usize, ox: usize) -> Vec<f64> {
+    let nodes = |n: usize, o: usize| -> Vec<usize> {
+        let mut v: Vec<usize> = (0..n).filter(|&i| i == 0 || i == n - 1 || (o + i) % NOISE_STRIDE == 0).collect();
+        v.dedup();
+        v
+    };
+    let (ny, nx) = (nodes(h, oy), nodes(w, ox));
+    let r = (win / 2) as isize;
+    let mut buf = Vec::with_capacity(win * win);
+    let mut g = vec![0.0; ny.len() * nx.len()];
+    for (iy, &y) in ny.iter().enumerate() {
+        for (ix, &x) in nx.iter().enumerate() {
+            buf.clear();
+            for dy in -r..=r {
+                let yy = (y as isize + dy).clamp(0, h as isize - 1) as usize;
+                for dx in -r..=r {
+                    let xx = (x as isize + dx).clamp(0, w as isize - 1) as usize;
+                    buf.push(a[yy * w + xx]);
+                }
+            }
+            let mid = buf.len() / 2;
+            let (_, m, _) = buf.select_nth_unstable_by(mid, f64::total_cmp);
+            g[iy * nx.len() + ix] = *m;
         }
     }
-    let smooth = filters::uniform_filter(&mid, h, wi, 3, Mode::Reflect);
-    let cut = quantile(&smooth, GAIN_FRAC);
-    let sel: Vec<usize> = (0..h * wi).filter(|&i| smooth[i] <= cut).collect();
-    if sel.len() < 32 {
-        return 1.0;
+    // For each row (column): the node interval it falls in and its weight.
+    let interp = |n: usize, nodes: &[usize]| -> Vec<(usize, f64)> {
+        (0..n)
+            .map(|i| {
+                if nodes.len() == 1 {
+                    return (0, 0.0);
+                }
+                let k = nodes.partition_point(|&v| v <= i).clamp(1, nodes.len() - 1) - 1;
+                let (a0, a1) = (nodes[k] as f64, nodes[k + 1] as f64);
+                (k, ((i as f64 - a0) / (a1 - a0)).clamp(0.0, 1.0))
+            })
+            .collect()
+    };
+    let (wy, wx) = (interp(h, &ny), interp(w, &nx));
+    let nxl = nx.len();
+    let at = |iy: usize, ix: usize| g[iy.min(ny.len() - 1) * nxl + ix.min(nxl - 1)];
+    let mut out = vec![0.0; h * w];
+    for (r_, &(ky, fy)) in wy.iter().enumerate() {
+        for (c, &(kx, fx)) in wx.iter().enumerate() {
+            let top = (1.0 - fx) * at(ky, kx) + fx * at(ky, kx + 1);
+            let bot = (1.0 - fx) * at(ky + 1, kx) + fx * at(ky + 1, kx + 1);
+            out[r_ * w + c] = (1.0 - fy) * top + fy * bot;
+        }
     }
-    let n = sel.len() as f64;
-    let m = sel.iter().map(|&i| mid[i] - offset).sum::<f64>() / n;
-    if m <= 1e-6 {
-        return 1.0;
-    }
-    let hm = sel.iter().map(|&i| hp[i]).sum::<f64>() / n;
-    let var = sel.iter().map(|&i| (hp[i] - hm).powi(2)).sum::<f64>() / n;
-    (var / m).clamp(0.05, 200.0)
+    out
 }
 
-/// Each emitter's [`Class`]: in the band it is a detection; out of it, near
-/// the border it is `Edge`, else `Narrow` or `Wide` by which side of the band
-/// it fell. A source the border cuts is not an interior width measurement,
-/// so a width flag always means an interior fit.
-pub fn classify(pos: &[f64], sig: &[f64], h: usize, w: usize, sigma: f64, band: Option<(f64, f64)>) -> Vec<Class> {
+/// The frame's own noise: `(sd, phi)`, both `h*w`. `sd` is each pixel's
+/// standard deviation, ADU; `phi = sd^2 / local median of d`, the variance
+/// per unit of signal. `(oy, ox)` is the array's origin in the frame.
+///
+/// `sd` comes from the separable 4th-difference product
+/// `k (x) k`, `k = [1, -4, 6, -4, 1]`: on white noise its output is
+/// `N(0, sd^2 * 70^2)`, and it nulls everything up to cubic along each axis,
+/// so a PSF's curvature barely reaches it. The local median of its square
+/// over `0.4549 * 70^2` (the median of chi-squared with one degree of
+/// freedom) is the variance. It is taken on the VALID region only and the
+/// last two rows and columns copied outward: any padding mode fakes
+/// structure the filter reads as quiet, and measured on a sparse simulation
+/// that put 23 of 61 false positives within 3 px of the border.
+///
+/// Measured 2026-09-14, `phi` against what the camera calibration implies at
+/// the background (`gain + gain^2 read_noise^2 / background`):
+///
+/// ```text
+///                                       expected   this    3-tap 2nd diff
+/// pure noise, bg 1 / 5 / 20 e-          (exact)    +-1%        -16%
+/// simulate, density .01 / .03 / .06       2.71    2.95 2.97 2.73
+/// hyp7gem crops (4)                  2.55-2.85    2.42-2.61
+/// beads_80pct-glycerol                    2.23    2.41
+/// beads_60x_still / _02 (39, 62 px)  2.15 2.34    1.90 3.01     19x 14x
+/// ```
+///
+/// The 3-tap second difference (the high-pass the retired gain estimator
+/// used) is biased on pure noise, because the two axes share their centre
+/// pixel, and reads bead frames an order of magnitude high: crowded PSF
+/// curvature. The denominator matters as much. Over the masked background
+/// map instead of the local median of the data, `phi` climbed 3.24 -> 4.49
+/// across the three densities, because the masked map reads low when little
+/// is left unmasked.
+pub fn noise_map(d: &[f64], h: usize, w: usize, oy: usize, ox: usize) -> (Vec<f64>, Vec<f64>) {
+    let med = local_median(d, h, w, NOISE_WIN, oy, ox);
+    let var = if h < 5 || w < 5 {
+        // Too small to filter: Poisson in ADU, `sd^2 = median`, is the most
+        // that can be said.
+        med.iter().map(|m| m.max(NOISE_VAR_FLOOR)).collect::<Vec<f64>>()
+    } else {
+        const K: [f64; 5] = [1.0, -4.0, 6.0, -4.0, 1.0];
+        let (vh, vw) = (h - 4, w - 4);
+        let mut tmp = vec![0.0; h * vw];
+        for r in 0..h {
+            for c in 0..vw {
+                tmp[r * vw + c] = (0..5).map(|j| K[j] * d[r * w + c + j]).sum();
+            }
+        }
+        let mut sq = vec![0.0; vh * vw];
+        for r in 0..vh {
+            for c in 0..vw {
+                let v: f64 = (0..5).map(|i| K[i] * tmp[(r + i) * vw + c]).sum();
+                sq[r * vw + c] = v * v;
+            }
+        }
+        let norm = statistics::CHI2_1_MEDIAN * 70.0 * 70.0;
+        let m = local_median(&sq, vh, vw, NOISE_WIN, oy + 2, ox + 2);
+        let mut var = vec![0.0; h * w];
+        for r in 0..h {
+            let rr = r.clamp(2, h - 3) - 2;
+            for c in 0..w {
+                let cc = c.clamp(2, w - 3) - 2;
+                var[r * w + c] = (m[rr * vw + cc] / norm).max(NOISE_VAR_FLOOR);
+            }
+        }
+        var
+    };
+    let sd = var.iter().map(|v| v.sqrt()).collect();
+    let phi = var.iter().zip(&med).map(|(v, m)| v / m.max(1e-6)).collect();
+    (sd, phi)
+}
+
+/// Each emitter's [`Class`]. In the band it is a detection, and so is a
+/// width out of it by no more than [`BAND_Z`] of its own SE `se_sig` (a NaN
+/// SE never flags), unless it sits on the upper `slack` bound. Otherwise,
+/// near the border it is `Edge`, else `Narrow` or `Wide` by which side it
+/// fell: a source the border cuts is not an interior width measurement, so a
+/// width flag always means an interior fit.
+#[allow(clippy::too_many_arguments)]
+pub fn classify(
+    pos: &[f64],
+    sig: &[f64],
+    se_sig: &[f64],
+    h: usize,
+    w: usize,
+    sigma: f64,
+    slack: (f64, f64),
+    band: Option<(f64, f64)>,
+) -> Vec<Class> {
     (0..sig.len())
         .map(|k| {
             let Some((lo, hi)) = band else {
                 return Class::Focus;
             };
-            let s = sig[k];
-            if s >= lo * sigma && s <= hi * sigma {
+            let (s, e) = (sig[k], se_sig.get(k).copied().unwrap_or(f64::NAN));
+            let margin = if e.is_finite() { BAND_Z * e } else { f64::INFINITY };
+            let narrow = lo * sigma - s > margin;
+            let pinned = s >= slack.1 * sigma * (1.0 - BOUND_TOL);
+            let wide = s > hi * sigma && (s - hi * sigma > margin || pinned);
+            if !narrow && !wide {
                 return Class::Focus;
             }
             let (y, x) = (pos[2 * k], pos[2 * k + 1]);
@@ -610,7 +791,7 @@ pub fn classify(pos: &[f64], sig: &[f64], h: usize, w: usize, sigma: f64, band: 
                 .min(w as f64 - 0.5 - x);
             if border <= EDGE_MARGIN * sigma {
                 Class::Edge
-            } else if s < lo * sigma {
+            } else if narrow {
                 Class::Narrow
             } else {
                 Class::Wide
@@ -651,6 +832,7 @@ fn masked_values(v: &[f64], keep: Option<&[bool]>) -> Option<Vec<f64>> {
 /// | [`find_candidates`] | `ceil(sigma)` (the max-filter window) + [`filters::kernel_radius`] | 7 |
 /// | boxes | `ceil(BBOX_PAD * sigma) + 1` ([`patches::build_patches`]) | 5 |
 /// | [`background_map`] | `2 * (BG_KERNEL / 2) + kernel_radius(BG_KERNEL / 6)` | 41 |
+/// | [`noise_map`] | `2 + NOISE_WIN / 2 + NOISE_STRIDE` (filter, median, grid) | 26 |
 ///
 /// The background chain sets it, at 41 px, and unlike the other two it does
 /// not shrink with `sigma`: its kernel is a fixed 25 px. A candidate needs
@@ -660,7 +842,8 @@ fn crop_margin(sigma: f64) -> usize {
     let find = sigma.ceil() as usize + filters::kernel_radius(sigma);
     let boxes = (patches::BBOX_PAD * sigma).ceil() as usize + 1;
     let bg = 2 * (BG_KERNEL / 2) + filters::kernel_radius(BG_KERNEL as f64 / 6.0);
-    find.max(boxes).max(bg)
+    let noise = 2 + NOISE_WIN / 2 + NOISE_STRIDE;
+    find.max(boxes).max(bg).max(noise)
 }
 
 /// Widen `[lo, hi)` to at least `want` pixels without leaving `[0, n)`, and
@@ -717,18 +900,19 @@ fn crop<T: Copy>(v: &[T], w: usize, bb: &patches::BBox) -> Vec<T> {
     out
 }
 
-/// FIND against a flat `level`: LoG peaks of the variance-normalized
-/// residual above `threshold`, brightest first. Returns
-/// `(pos 2N, amp, strength)`.
+/// FIND against a flat `level`: LoG peaks of the residual above `threshold`
+/// sds, brightest first. Returns `(pos 2N, amp, strength)`.
 ///
-/// Two normalizations, doing different jobs. Dividing by `sqrt(level)`
-/// before the filter makes one threshold valid across the FRAME: under
-/// Poisson noise the residual's scale is the square root of the mean.
-/// Dividing by [`filters::log_kernel_l2`] after it makes one threshold valid
-/// across SIGMA: the filter's null sd is its kernel's L2 norm, which scales
-/// as sigma^-3, so without it one number is a 1.8-sigma cut at sigma 0.8 and
-/// a 100-sigma cut at sigma 3.0. `threshold` is therefore a count of standard
-/// deviations.
+/// Two normalizations, doing different jobs. Dividing by the local pixel sd
+/// `sd` ([`noise_map`]) makes one threshold valid across the FRAME, and
+/// across cameras. Dividing by [`filters::log_kernel_l2`] makes one threshold
+/// valid across SIGMA: the filter's null sd is its kernel's L2 norm, which
+/// scales as sigma^-3, so without it one number is a 1.8-sigma cut at sigma
+/// 0.8 and a 100-sigma cut at sigma 3.0. `threshold` is therefore a count of
+/// standard deviations.
+///
+/// The measurements below were made when the first normalization was
+/// `sqrt(level)` in photoelectrons, before 2026-09-14.
 ///
 /// # The LoG is a poor statistic, and the better one is worse here
 ///
@@ -776,33 +960,34 @@ fn crop<T: Copy>(v: &[T], w: usize, bb: &patches::BBox) -> Vec<T> {
 /// narrow core is worth more than the efficiency. A better FIND has to
 /// SEPARATE better, not detect better; sensitivity is `ADD_NATS`' problem.
 ///
-/// # What `SEED_ALPHA` actually buys
+/// # What the old Bonferroni cut actually bought
 ///
-/// [`seed_threshold`]'s cut is not the achieved rate. `level` is the 10th
-/// percentile, deliberately -- it is a background estimate under emitters --
-/// but it is also the variance normalizer here, and too low a normalizer
-/// inflates the z: on emitter-free Poisson frames the normalized residual
-/// has sd 1.19 at a background of 20 e- and 1.07 at 100 e-, not 1. The
-/// derived cut of 3.79 therefore passes 17.9 false seeds per empty 128x128
-/// frame, not the 0.05 `SEED_ALPHA` names. For a seeder that errs in the
-/// safe direction, which is why it has never mattered. It does mean a cut
-/// compared across two different statistics must be calibrated empirically:
-/// at one nominal z the DoG passes 10.8 seeds against the LoG's 17.9, and
-/// comparing them there compares the calibrations, not the filters.
+/// Under the Poisson normalization the cut was not the achieved rate. `level`
+/// is the 10th percentile, deliberately -- a background estimate under
+/// emitters -- but it was also the variance normalizer, and too low a
+/// normalizer inflates the z: on emitter-free Poisson frames the normalized
+/// residual had sd 1.19 at a background of 20 e- and 1.07 at 100 e-, not 1.
+/// The derived cut of 3.79 therefore passed 17.9 false seeds per empty
+/// 128x128 frame, not the 0.05 per frame it named. The local sd does not
+/// share that bias, which is one reason [`SEED_Z`] and [`BIRTH_Z`] were
+/// re-measured rather than carried over. A cut compared across two different
+/// statistics must be calibrated empirically: at one nominal z the DoG passed
+/// 10.8 seeds against the LoG's 17.9, and comparing them there compares the
+/// calibrations, not the filters.
 pub fn find_candidates(
     d: &[f64],
     h: usize,
     w: usize,
     level: f64,
     sigma: f64,
+    sd: &[f64],
     threshold: f64,
 ) -> (Vec<f64>, Vec<f64>, Vec<f64>) {
-    let norm = level.max(1e-6).sqrt();
-    let nr: Vec<f64> = d.iter().map(|&v| (v - level) / norm).collect();
+    let resid: Vec<f64> = d.iter().map(|&v| v - level).collect();
     let l2 = filters::log_kernel_l2(sigma);
-    let mut log_f = filters::gaussian_laplace(&nr, h, w, sigma, Mode::Reflect);
-    for v in log_f.iter_mut() {
-        *v = -*v / l2;
+    let mut log_f = filters::gaussian_laplace(&resid, h, w, sigma, Mode::Reflect);
+    for (v, e) in log_f.iter_mut().zip(sd) {
+        *v = -*v / (l2 * e);
     }
     let win = 2 * sigma.ceil() as usize + 1;
     let mx = filters::maximum_filter(&log_f, h, w, win, Mode::Reflect);
@@ -824,9 +1009,9 @@ pub fn find_candidates(
     (pos, amp, strength)
 }
 
-/// The smooth background surface, in photoelectrons: a local mean over the
-/// pixels no candidate reaches, taken twice with a one-sided clip between,
-/// then smoothed.
+/// The smooth background surface, ADU: a local mean over the pixels no
+/// candidate reaches, taken twice with a one-sided clip at 3 local sds
+/// between, then smoothed.
 ///
 /// Estimated from masked DATA, never from the PSF-subtracted residual: that
 /// route is a feedback loop, because emitters that have absorbed background
@@ -862,6 +1047,7 @@ pub fn background_map(
     w: usize,
     cand: &[f64],
     sigma: f64,
+    sd: &[f64],
     roi: Option<&[bool]>,
 ) -> (Vec<f64>, f64) {
     let n = cand.len() / 2;
@@ -896,7 +1082,7 @@ pub fn background_map(
     };
     let (b1, _) = local_mean(&free);
     let keep: Vec<bool> = (0..h * w)
-        .map(|i| free[i] && d[i] <= b1[i] + 3.0 * b1[i].max(BG_FLOOR).sqrt())
+        .map(|i| free[i] && d[i] <= b1[i] + 3.0 * sd[i])
         .collect();
     let (b2, cnt) = local_mean(&keep);
     let b3: Vec<f64> = (0..h * w)
@@ -911,6 +1097,12 @@ pub fn background_map(
 
 /// An emitter: `[A, y, x, sigma]`.
 type Em = [f64; 4];
+
+/// [`noise_map`]'s two maps over the whole frame.
+struct Noise {
+    sd: Vec<f64>,
+    phi: Vec<f64>,
+}
 
 /// A window's pixels and the parameter-free part of its model.
 ///
@@ -932,16 +1124,25 @@ struct Window {
     level: f64,
     /// Background map's shape, `bmap - level`.
     shape: Vec<f64>,
+    /// The local pixel sd, ADU.
+    sd: Vec<f64>,
+    /// The median dispersion over the window: the scale of its nats.
+    phi: f64,
 }
 
 impl Window {
-    fn new(d: &[f64], fw: usize, bmap: &[f64], bb: &patches::BBox) -> Self {
+    fn new(d: &[f64], fw: usize, bmap: &[f64], noise: &Noise, bb: &patches::BBox) -> Self {
         let (h, w) = (bb.h(), bb.w());
         let mut sub = Vec::with_capacity(h * w);
         let mut bg = Vec::with_capacity(h * w);
+        let mut sd = Vec::with_capacity(h * w);
+        let mut phi = Vec::with_capacity(h * w);
         for r in bb.y0..bb.y1 {
-            sub.extend_from_slice(&d[r * fw + bb.x0..r * fw + bb.x1]);
-            bg.extend_from_slice(&bmap[r * fw + bb.x0..r * fw + bb.x1]);
+            let row = r * fw + bb.x0..r * fw + bb.x1;
+            sub.extend_from_slice(&d[row.clone()]);
+            bg.extend_from_slice(&bmap[row.clone()]);
+            sd.extend_from_slice(&noise.sd[row.clone()]);
+            phi.extend_from_slice(&noise.phi[row]);
         }
         let level = median(&bg);
         let shape: Vec<f64> = bg.iter().map(|v| v - level).collect();
@@ -954,6 +1155,8 @@ impl Window {
             halo: shape.clone(),
             level,
             shape,
+            sd,
+            phi: median(&phi),
         }
     }
 
@@ -1050,8 +1253,8 @@ fn fit_window(
     }
 }
 
-/// `(y, x, A0)` of the strongest owned peak of the fit's normalized residual
-/// that passes [`Settings::birth`], or `None`.
+/// `(y, x, A0)` of the strongest owned LoG peak of the fit's residual, in
+/// local sds, that passes [`Settings::birth`], or `None`.
 ///
 /// The test is not optional. The deviance of the best of many placements is
 /// a maximum over positions, and `ADD_NATS` was measured only on placements
@@ -1130,14 +1333,12 @@ fn placement(
     ws.model.clear();
     ws.model.resize(n, 0.0);
     psf::model_var_sigma_ax(&theta, &ay, &ax, Some(&win.halo), &mut ws.f, &mut ws.model);
-    let nr: Vec<f64> = (0..n)
-        .map(|i| (win.sub[i] - ws.model[i]) / ws.model[i].max(1e-6).sqrt())
-        .collect();
-    let log_f = filters::gaussian_laplace(&nr, win.h, win.w, s.sigma, Mode::Nearest);
+    let resid: Vec<f64> = (0..n).map(|i| win.sub[i] - ws.model[i]).collect();
+    let log_f = filters::gaussian_laplace(&resid, win.h, win.w, s.sigma, Mode::Nearest);
     let mut best: Option<(f64, usize)> = None;
     for i in 0..n {
         if owned[i] {
-            let v = -log_f[i] / l2;
+            let v = -log_f[i] / (l2 * win.sd[i]);
             if best.is_none_or(|(b, _)| v > b) {
                 best = Some((v, i));
             }
@@ -1151,9 +1352,9 @@ fn placement(
     Some(((i / win.w) as f64, (i % win.w) as f64, resid.max(1e-2) / psf::peak_factor(s.sigma)))
 }
 
-/// One box decided from K = 0: FORWARD placements while each pays ADD_NATS,
-/// then BACKWARD removals while one costs less. Returns the box's emitters
-/// (local) and the fits spent.
+/// One box decided from K = 0: FORWARD placements while each pays
+/// `ADD_NATS * phi`, then BACKWARD removals while one costs less. Returns the
+/// box's emitters (local) and the fits spent.
 #[allow(clippy::neg_cmp_op_on_partial_ord)]
 fn search_box(
     ws: &mut Workspace,
@@ -1163,6 +1364,7 @@ fn search_box(
     l2: f64,
 ) -> (Vec<Em>, usize) {
     let mut fits = 1usize;
+    let cost = ADD_NATS * win.phi;
     let mut state = fit_window(ws, win, win.level, &[], s, FIT_MAX_ITER, FIT_TOL_OBJ);
     while state.em.len() < s.k_max {
         let Some((y, x, a0)) = placement(ws, win, owned, &state, s, l2) else {
@@ -1172,7 +1374,7 @@ fn search_box(
         em.push([a0, y, x, s.sigma]);
         let trial = fit_window(ws, win, state.b, &em, s, FIT_MAX_ITER, FIT_TOL_OBJ);
         fits += 1;
-        if !(state.i_div - trial.i_div > ADD_NATS) {
+        if !(state.i_div - trial.i_div > cost) {
             break;
         }
         state = trial;
@@ -1193,7 +1395,7 @@ fn search_box(
             }
         }
         let best = best.expect("K >= 2 has removals");
-        if !(best.i_div - state.i_div < ADD_NATS) {
+        if !(best.i_div - state.i_div < cost) {
             break;
         }
         state = best;
@@ -1300,12 +1502,11 @@ pub fn localize(
         None => patches::BBox { y0: 0, x0: 0, y1: h, x1: w },
         Some(m) => match roi_crop(m, h, w, s.sigma) {
             Some(bb) => bb,
-            // An ROI selecting nothing asks for nothing. `gain` is NaN as
-            // on every other path out of here; `localize_raw` fills it in.
+            // An ROI selecting nothing asks for nothing.
             None => {
                 return Output {
                     background: vec![BG_FLOOR; h * w],
-                    gain: f64::NAN,
+                    dispersion: f64::NAN,
                     ..Output::default()
                 }
             }
@@ -1327,21 +1528,27 @@ pub fn localize(
 
     let level = masked_values(dc, rc);
     let b0 = percentile(level.as_deref().unwrap_or(dc), 10.0).max(BG_FLOOR);
-    let (cand_all, amp_all, str_all) = find_candidates(dc, ch, cw, b0, s.sigma, s.seed);
-    let (bsub, fill) = background_map(dc, ch, cw, &cand_all, s.sigma, rc);
-    // Back to the frame. Outside the crop nothing was estimated, so the map
-    // carries the fallback level rather than a hole: no fit reads it -- every
-    // box lies inside the crop by `crop_margin` -- but callers render it.
-    let bmap = if whole {
-        bsub
-    } else {
+    let (sd_c, phi_c) = noise_map(dc, ch, cw, bb.y0, bb.x0);
+    let dispersion = median(masked_values(&phi_c, rc).as_deref().unwrap_or(&phi_c));
+    let (cand_all, amp_all, str_all) = find_candidates(dc, ch, cw, b0, s.sigma, &sd_c, s.seed);
+    let (bsub, fill) = background_map(dc, ch, cw, &cand_all, s.sigma, &sd_c, rc);
+    // Back to the frame. Outside the crop nothing was estimated, so each map
+    // carries a fill rather than a hole: no fit reads it -- every box lies
+    // inside the crop by `crop_margin` -- but callers render the background.
+    let to_frame = |sub: Vec<f64>, fill: f64| -> Vec<f64> {
+        if whole {
+            return sub;
+        }
         let mut full = vec![fill; h * w];
         for r in 0..ch {
             full[(bb.y0 + r) * w + bb.x0..(bb.y0 + r) * w + bb.x1]
-                .copy_from_slice(&bsub[r * cw..(r + 1) * cw]);
+                .copy_from_slice(&sub[r * cw..(r + 1) * cw]);
         }
         full
     };
+    let bmap = to_frame(bsub, fill);
+    let sd_fill = median(&sd_c);
+    let noise = Noise { sd: to_frame(sd_c, sd_fill), phi: to_frame(phi_c, dispersion) };
 
     let (mut cand, mut camp, mut strength) = (Vec::new(), Vec::new(), Vec::new());
     for j in 0..amp_all.len() {
@@ -1376,7 +1583,7 @@ pub fn localize(
     let mut wins: Vec<Window> = Vec::with_capacity(nb);
     let mut owned: Vec<Vec<bool>> = Vec::with_capacity(nb);
     for p in &boxes {
-        wins.push(Window::new(d, w, &bmap, &p.bbox));
+        wins.push(Window::new(d, w, &bmap, &noise, &p.bbox));
         owned.push(owned_mask(&p.bbox, &p.indices, &cand, &grid, roi, w, s.sigma, &mut near));
     }
     let reach = HALO_FACTOR * s.slack.1.max(1.0) * s.sigma;
@@ -1452,20 +1659,33 @@ pub fn localize(
     let mut pos: Vec<f64> = all.iter().flat_map(|e| [e[1], e[2]]).collect();
     let mut amp: Vec<f64> = all.iter().map(|e| e[0]).collect();
     let mut sig: Vec<f64> = all.iter().map(|e| e[3]).collect();
-    let mut se = vec![f64::NAN; 3 * n];
+    let mut se4 = vec![f64::NAN; 4 * n];
     let polish_fits = if s.polish && n > 0 {
-        polish(d, h, w, &bmap, &mut pos, &mut amp, &mut sig, &mut se, s, ws)
+        polish(d, h, w, &bmap, &noise, &mut pos, &mut amp, &mut sig, &mut se4, s, ws)
     } else {
         0
     };
-    let class = classify(&pos, &sig, h, w, s.sigma, s.band);
+    // The Fisher matrix treated the ADU as Poisson counts, whose variance is
+    // the mean; the pixel's is `phi` times that. So every variance is `phi`
+    // times too small, read at the emitter.
+    let mut se = Vec::with_capacity(3 * n);
+    let mut se_sig = Vec::with_capacity(n);
+    for k in 0..n {
+        let py = (pos[2 * k].round().max(0.0) as usize).min(h - 1);
+        let px = (pos[2 * k + 1].round().max(0.0) as usize).min(w - 1);
+        let scale = noise.phi[py * w + px].sqrt();
+        se.extend((0..3).map(|c| se4[4 * k + c] * scale));
+        se_sig.push(se4[4 * k + 3] * scale);
+    }
+    let class = classify(&pos, &sig, &se_sig, h, w, s.sigma, s.slack, s.band);
     Output {
         pos,
         amp,
         sig,
         se,
+        se_sig,
         class,
-        gain: f64::NAN,
+        dispersion,
         background: bmap,
         n_candidates: nc,
         n_boxes: nb,
@@ -1501,6 +1721,7 @@ fn polish(
     h: usize,
     w: usize,
     bmap: &[f64],
+    noise: &Noise,
     pos: &mut Vec<f64>,
     amp: &mut Vec<f64>,
     sig: &mut Vec<f64>,
@@ -1524,7 +1745,7 @@ fn polish(
                 continue;
             }
             n_fitted += 1;
-            let mut win = Window::new(d, w, bmap, &p.bbox);
+            let mut win = Window::new(d, w, bmap, noise, &p.bbox);
             ems.clear();
             ems.extend(p.frozen.iter().map(|&i| {
                 let i = i as usize;
@@ -1560,9 +1781,9 @@ fn polish(
                 var.resize(pdim, 0.0);
                 ws.chol.inv_diag(&mut var, &mut ws.scratch);
                 for (j, &i) in p.indices.iter().enumerate() {
-                    for c in 0..3 {
+                    for c in 0..4 {
                         let v = var[1 + 4 * j + c];
-                        se[3 * i as usize + c] = if v > 0.0 { v.sqrt() } else { f64::NAN };
+                        se[4 * i as usize + c] = if v > 0.0 { v.sqrt() } else { f64::NAN };
                     }
                 }
             }
@@ -1578,36 +1799,29 @@ fn polish(
     fits
 }
 
-/// Localize one raw frame: `d_e = (raw - offset) / gain + shift`, with the
-/// gain estimated from the frame when `gain` is `None`. `shift` is
-/// `read_noise^2` (e-^2), the shifted-Poisson term.
 #[allow(clippy::too_many_arguments)]
+/// Localize one raw frame, `d = raw - offset` in ADU. No gain and no read
+/// noise: [`noise_map`] measures what they would have said.
 pub fn localize_raw(
     raw: &[f64],
     h: usize,
     w: usize,
     offset: f64,
-    gain: Option<f64>,
-    shift: f64,
     roi: Option<&[bool]>,
     s: &Settings,
     ws: &mut Workspace,
     d: &mut Vec<f64>,
 ) -> Output {
-    let g = gain.unwrap_or_else(|| estimate_gain(raw, h, w, offset));
     d.clear();
-    d.extend(raw.iter().map(|&r| (r - offset) / g + shift));
-    let mut o = localize(d, h, w, roi, s, ws);
-    o.gain = g;
-    o
+    d.extend(raw.iter().map(|&r| r - offset));
+    localize(d, h, w, roi, s, ws)
 }
 
 /// Localize every frame of a stack on `n_threads` workers. Frames are
 /// independent, so each worker takes the next undone frame and keeps its own
 /// [`Workspace`]; the output is in frame order whatever the scheduling.
 ///
-/// `raw` is `n*H*W`; each frame goes through [`localize_raw`], with one
-/// `gain` for the whole stack or, if `None`, one estimated per frame.
+/// `raw` is `n*H*W`; each frame goes through [`localize_raw`].
 #[allow(clippy::too_many_arguments)]
 pub fn localize_stack(
     raw: &[f64],
@@ -1615,8 +1829,6 @@ pub fn localize_stack(
     h: usize,
     w: usize,
     offset: f64,
-    gain: Option<f64>,
-    shift: f64,
     roi: Option<&[bool]>,
     s: &Settings,
     n_threads: usize,
@@ -1638,7 +1850,7 @@ pub fn localize_stack(
                         break;
                     }
                     let frame = &raw[t * h * w..(t + 1) * h * w];
-                    let o = localize_raw(frame, h, w, offset, gain, shift, roi, s, &mut ws, &mut d);
+                    let o = localize_raw(frame, h, w, offset, roi, s, &mut ws, &mut d);
                     out.lock().expect("no worker panics while holding it")[t] = Some(o);
                 }
             });
@@ -1655,12 +1867,15 @@ pub fn localize_stack(
 mod tests {
     use super::*;
 
-    #[test]
-    fn seed_threshold_matches_the_documented_values() {
-        // [`seed_threshold`]'s note: 3.70 on 64^2 at sigma 0.818, 4.43 on
-        // 512^2 at sigma 1.45.
-        assert!((seed_threshold(64, 64, 0.818, SEED_ALPHA) - 3.70).abs() < 5e-3);
-        assert!((seed_threshold(512, 512, 1.45, SEED_ALPHA) - 4.43).abs() < 5e-3);
+    /// Deterministic standard normals: an LCG through Box-Muller.
+    fn normals(n: usize, mut state: u64) -> Vec<f64> {
+        let mut uni = move || {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            ((state >> 11) as f64 + 0.5) / (1u64 << 53) as f64
+        };
+        (0..n)
+            .map(|_| (-2.0 * uni().ln()).sqrt() * (2.0 * std::f64::consts::PI * uni()).cos())
+            .collect()
     }
 
     #[test]
@@ -1673,6 +1888,48 @@ mod tests {
     }
 
     #[test]
+    fn the_noise_map_reads_white_noise_and_scales_with_the_image() {
+        let (h, w) = (96, 80);
+        let z = normals(h * w, 7);
+        // Mean 50, sd 3: phi = 9 / 50.
+        let d: Vec<f64> = z.iter().map(|v| 50.0 + 3.0 * v).collect();
+        let (sd, phi) = noise_map(&d, h, w, 0, 0);
+        let msd = median(&sd);
+        assert!((msd - 3.0).abs() < 0.1, "sd {msd}");
+        assert!((median(&phi) - 9.0 / 50.0).abs() < 0.015);
+        // Every decision divides by this map, so it must scale with the data.
+        let d7: Vec<f64> = d.iter().map(|v| 7.0 * v).collect();
+        let (sd7, phi7) = noise_map(&d7, h, w, 0, 0);
+        for i in 0..h * w {
+            assert!((sd7[i] - 7.0 * sd[i]).abs() < 1e-9 * sd7[i]);
+            assert!((phi7[i] - 7.0 * phi[i]).abs() < 1e-9 * phi7[i]);
+        }
+    }
+
+    #[test]
+    fn local_median_is_exact_on_its_nodes_and_anchored_to_the_frame() {
+        let (h, w) = (40, 50);
+        let a = normals(h * w, 3);
+        let m = local_median(&a, h, w, 5, 0, 0);
+        let r = 2isize;
+        for &(y, x) in &[(0usize, 0usize), (12, 24), (24, 36), (39, 49)] {
+            let mut v = Vec::new();
+            for dy in -r..=r {
+                for dx in -r..=r {
+                    let yy = (y as isize + dy).clamp(0, h as isize - 1) as usize;
+                    let xx = (x as isize + dx).clamp(0, w as isize - 1) as usize;
+                    v.push(a[yy * w + xx]);
+                }
+            }
+            assert!((m[y * w + x] - median(&v)).abs() < 1e-12, "node ({y}, {x})");
+        }
+        // A crop whose origin is (12, 12) shares the frame's interior nodes.
+        let sub: Vec<f64> = (12..40).flat_map(|r| a[r * w + 12..r * w + 50].to_vec()).collect();
+        let ms = local_median(&sub, 28, 38, 5, 12, 12);
+        assert!((ms[12 * 38 + 12] - m[24 * w + 24]).abs() < 1e-12);
+    }
+
+    #[test]
     fn an_isolated_emitter_is_found_once_where_it_is() {
         let (h, w, sigma) = (31, 33, 1.2);
         let theta = [0.0, 1500.0, 14.3, 17.6, 1.3];
@@ -1680,13 +1937,17 @@ mod tests {
         let mut f = psf::Factors::new(h, w, 1);
         let mut d = vec![0.0; h * w];
         psf::model_var_sigma_ax(&theta, &ay, &ax, None, &mut f, &mut d);
-        for v in d.iter_mut() {
+        // Gaussian noise at the Poisson variance on a background of 10. The
+        // detector measures its noise from the frame, so a noise-free frame
+        // is not a meaningful input any more.
+        for (v, z) in d.iter_mut().zip(normals(h * w, 11)) {
             *v += 10.0;
+            *v += v.sqrt() * z;
         }
         let s = Settings {
             sigma,
             k_max: 12,
-            seed: seed_threshold(h, w, sigma, SEED_ALPHA),
+            seed: SEED_Z,
             birth: BIRTH_Z,
             slack: (0.7, 2.2),
             sweeps: SWEEPS,
@@ -1694,16 +1955,14 @@ mod tests {
             band: Some((0.8, 2.0)),
         };
         let o = localize(&d, h, w, None, &s, &mut Workspace::new());
-        assert_eq!(o.class, vec![Class::Focus]);
         assert_eq!(o.amp.len(), 1, "found {:?}", o.pos);
-        assert!(o.se.iter().all(|v| v.is_finite() && *v > 0.0));
-        // Noise-free, so what is left is the background map's own bias: the
-        // mask sits on the integer candidate, and the wing beyond it leaks
-        // into the 25 px mean. Measured: 0.05 SE in position, 0.2 in flux.
+        assert_eq!(o.class, vec![Class::Focus]);
+        assert!(o.se.iter().chain(&o.se_sig).all(|v| v.is_finite() && *v > 0.0));
+        assert!((o.dispersion - 1.0).abs() < 0.3, "dispersion {}", o.dispersion);
         let (se_a, se_y, se_x) = (o.se[0], o.se[1], o.se[2]);
-        assert!((o.pos[0] - 14.3).abs() < 0.1 * se_y, "y {}", o.pos[0]);
-        assert!((o.pos[1] - 17.6).abs() < 0.1 * se_x, "x {}", o.pos[1]);
-        assert!((o.amp[0] - 1500.0).abs() < 0.5 * se_a, "A {}", o.amp[0]);
-        assert!((o.sig[0] - 1.3).abs() < 0.01, "sigma {}", o.sig[0]);
+        assert!((o.pos[0] - 14.3).abs() < 3.0 * se_y, "y {}", o.pos[0]);
+        assert!((o.pos[1] - 17.6).abs() < 3.0 * se_x, "x {}", o.pos[1]);
+        assert!((o.amp[0] - 1500.0).abs() < 3.0 * se_a, "A {}", o.amp[0]);
+        assert!((o.sig[0] - 1.3).abs() < 3.0 * o.se_sig[0], "sigma {}", o.sig[0]);
     }
 }

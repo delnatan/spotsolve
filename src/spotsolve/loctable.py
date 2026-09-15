@@ -19,9 +19,10 @@ Units
 -----
 Pixels and frames are CANONICAL; micrometres and seconds are derived columns,
 present only because the linker's motion model lives in physical units and
-converting in two places invites two conventions. `flux` is in
-photoelectrons, as everywhere downstream of `localize` --
-never ADU, and never a peak height.
+converting in two places invites two conventions. `flux` is in ADU above
+the camera offset, as everywhere downstream of `localize` -- the detector
+takes no gain -- and never a peak height. Divide by the gain for
+photoelectrons.
 
 What the linker actually needs from this table
 ----------------------------------------------
@@ -68,10 +69,10 @@ LOCALIZATION_SCHEMA = {
     "se_pos": pl.Float64,     # px, hypot(se_y, se_x); one number for reports
     "se_y_um": pl.Float64,
     "se_x_um": pl.Float64,
-    "flux": pl.Float64,       # photoelectrons, total, background-free
+    "flux": pl.Float64,       # ADU above offset, total, background-free
     "se_flux": pl.Float64,
     "flux_snr": pl.Float64,   # flux / se_flux
-    "bg": pl.Float64,         # photoelectrons/px, background surface here
+    "bg": pl.Float64,         # ADU/px above offset, background surface here
     "sigma": pl.Float64,      # px, the in-focus PSF sigma the search ran at
     "fit_sigma": pl.Float64,  # px, this emitter's own fitted width
     "sigma_ratio": pl.Float64,  # fit_sigma / sigma; a per-emitter defocus readout
@@ -92,8 +93,7 @@ FRAME_SCHEMA = {
     "agg_flux_fraction": pl.Float64,  # share of detected flux in aggregates
     "median_se_pos": pl.Float64,
     "background": pl.Float64,         # median of the background surface
-    "gain": pl.Float64,
-    "read_noise": pl.Float64,
+    "dispersion": pl.Float64,         # measured variance per unit signal, ADU
     "seconds": pl.Float64,            # wall clock for this frame's search
 }
 
@@ -203,8 +203,7 @@ def frame_tables(result, frame, t=0.0, pixel_size=1.0, agg_ratio=None,
             "median_se_pos": [float(np.nanmedian(np.hypot(se[:, 1], se[:, 2])))
                               if n else float("nan")],
             "background": [float(np.median(result.background))],
-            "gain": [float(result.gain)],
-            "read_noise": [float(result.read_noise)],
+            "dispersion": [float(result.dispersion)],
             "seconds": [float(seconds)],
         },
         schema=FRAME_SCHEMA,

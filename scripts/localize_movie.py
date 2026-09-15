@@ -38,13 +38,12 @@ import spotsolve
 from spotsolve import loctable
 
 # The hyp7gem crop, and the acquisition it was cut from. Pixel size and frame
-# interval come from the source .nd2 (65 nm, 20.005 ms); sigma and gain are
-# the values calibrated for this dataset in sections 10b and 13 of
+# interval come from the source .nd2 (65 nm, 20.005 ms); sigma is the value
+# calibrated for this dataset in section 10b of
 # docs/archive/ALGORITHM_HISTORY.md. The crop is not tracked (see .gitignore).
 DEFAULT_IMAGE = str(Path(__file__).resolve().parent.parent
                     / "data" / "hyp7gem_wt_crop.tif")
 DEFAULT_SIGMA = 1.45      # px
-DEFAULT_GAIN = 2.401      # ADU per photoelectron
 DEFAULT_PIXEL_SIZE = 0.065   # um
 DEFAULT_INTERVAL = 0.020005  # s
 CAMERA_OFFSET = 100.0     # ADU
@@ -66,14 +65,12 @@ def load_stack(path, first, last):
 def main(args):
     stack, first = load_stack(args.image, *args.frames)
     print(f"{args.image}: frames {first}..{first + len(stack) - 1}, "
-          f"{stack.shape[1]}x{stack.shape[2]} px, sigma={args.sigma}, "
-          f"gain={args.gain}, read noise={args.read_noise} e-")
+          f"{stack.shape[1]}x{stack.shape[2]} px, sigma={args.sigma}")
 
     # One native call for the whole range: frames run in parallel threads.
     t0 = time.time()
     results = spotsolve.localize_stack(stack, sigma=args.sigma,
-                                       offset=CAMERA_OFFSET, gain=args.gain,
-                                       read_noise=args.read_noise,
+                                       offset=CAMERA_OFFSET,
                                        k_max=args.k_max)
     dt = (time.time() - t0) / len(stack)
     print(f"  {len(stack)} frames in {dt * len(stack):.2f} s "
@@ -99,7 +96,7 @@ def main(args):
 
         r = row.row(0, named=True)
         print(f"  frame {frame:3d}  N={r['n_locs']:4d}  "
-              f"median flux {r['median_flux']:7.0f} e-  "
+              f"median flux {r['median_flux']:7.0f} ADU  "
               f"median SE(pos) {r['median_se_pos']:.3f} px  "
               f"narrow/wide/edge "
               f"{r['n_too_narrow']:3d}/{r['n_too_wide']:3d}/{r['n_edge']:2d}  "
@@ -143,19 +140,19 @@ def main(args):
     frames.write_parquet(out / "frames.parquet")
     aggregates.write_parquet(out / "aggregates.parquet")
     width_rejects.write_parquet(out / "rejects.parquet")
-    # Pixel size, interval and gain are not in the parquet -- they are
+    # Pixel size and interval are not in the parquet -- they are
     # properties of the acquisition, not of any row -- but every physical
     # quantity a tracker computes depends on them, so they travel alongside.
     (out / "meta.json").write_text(json.dumps({
         "image": str(Path(args.image).resolve()),
         "frames": [first, first + len(stack)],
-        "sigma_px": args.sigma, "gain": args.gain,
+        "sigma_px": args.sigma,
         "camera_offset_adu": CAMERA_OFFSET,
         "pixel_size_um": args.pixel_size, "frame_interval_s": args.interval,
-        "k_max": args.k_max, "read_noise_e": args.read_noise,
+        "k_max": args.k_max,
         "agg_ratio": args.agg_ratio if args.agg_ratio is not None
         else spotsolve.AGG_AMP_RATIO,
-        "flux_units": "photoelectrons", "position_units": "px (y, x)",
+        "flux_units": "ADU above offset", "position_units": "px (y, x)",
     }, indent=2) + "\n")
     print(f"\nwrote {out}/localizations.parquet, frames.parquet, "
           f"aggregates.parquet, rejects.parquet, meta.json")
@@ -170,16 +167,11 @@ if __name__ == "__main__":
                     metavar=("FIRST", "LAST"),
                     help="half-open frame range (default: 0 10)")
     ap.add_argument("--sigma", type=float, default=DEFAULT_SIGMA)
-    ap.add_argument("--gain", type=float, default=DEFAULT_GAIN,
-                    help="ADU per photoelectron; the fit is invariant to it, "
-                         "the acceptance threshold is not")
     ap.add_argument("--pixel-size", type=float, default=DEFAULT_PIXEL_SIZE,
                     help="um per px, for the derived physical columns")
     ap.add_argument("--interval", type=float, default=DEFAULT_INTERVAL,
                     help="seconds per frame")
     ap.add_argument("--k-max", type=int, default=spotsolve.K_MAX)
-    ap.add_argument("--read-noise", type=float, default=0.0,
-                    help="camera read noise, e- rms")
     ap.add_argument("--agg-ratio", type=float, default=None,
                     help=f"over-bright cut, flux / the frame's median "
                          f"detection (default {spotsolve.AGG_AMP_RATIO:.0f})")

@@ -4,7 +4,7 @@ The acceptance test is the audit panel (yellow = missed, cyan = over-modelled),
 not N and not the residual spread. Everything shown comes from the model
 `spotsolve` itself accepted; nothing here re-fits or culls afterwards.
 
-    python run.py --image beads_60x_still_02.tif --gain 4.23 --read-noise 1.6
+    python run.py --image beads_60x_still_02.tif --sigma 1.0
 """
 
 import argparse
@@ -41,23 +41,21 @@ def main(args):
     if args.crop:
         y0, y1, x0, x1 = args.crop
         img = img[y0:y1, x0:x1]
-    print(f"{args.image}  {img.shape}  gain={args.gain}")
+    print(f"{args.image}  {img.shape}")
 
     t = time.time()
     res = spotsolve.localize(img, sigma=args.sigma, offset=CAMERA_OFFSET,
-                             gain=args.gain, read_noise=args.read_noise,
                              k_max=args.k_max)
     dt = time.time() - t
 
-    # The audit in the likelihood's own terms: shifted Poisson, so both the
-    # data and the model carry read_noise^2 and the variance is m + rn^2.
-    shift = res.read_noise ** 2
-    d_e = (img.astype(float) - CAMERA_OFFSET) / res.gain + shift
-    model = res.model_image + shift
+    # The audit in the likelihood's own terms: dividing ADU by the measured
+    # dispersion puts a pixel's variance back at its mean.
+    d_e = (img.astype(float) - CAMERA_OFFSET) / res.dispersion
+    model = res.model_image / res.dispersion
     a = audit.audit_result(d_e, model, res.sigma)
     nr = (d_e - model) / np.sqrt(np.maximum(model, 1e-6))
 
-    print(f"\nN={len(res.positions)}  gain={res.gain:.3f}  "
+    print(f"\nN={len(res.positions)}  dispersion={res.dispersion:.3f}  "
           f"bg={np.median(res.background):.2f}  {dt:.3f}s  {res.info}")
     print(audit.format_report(a, label=args.image))
     if res.se is not None and len(res.se) and np.isfinite(res.se).any():
@@ -65,15 +63,15 @@ def main(args):
         print(f"median position CRLB: {sp:.3f} px")
     if len(res.amplitudes):
         q = np.percentile(res.amplitudes, [5, 50, 95])
-        print(f"amplitude e- (5/50/95): {q[0]:.0f} / {q[1]:.0f} / {q[2]:.0f}")
+        print(f"amplitude ADU (5/50/95): {q[0]:.0f} / {q[1]:.0f} / {q[2]:.0f}")
     rep = spotsolve.aggregate_report(res, ratio=args.agg_ratio)
     if rep["n_aggregates"]:
         print(f"\naggregates (post-hoc, flux > {args.agg_ratio:.0f}x the "
-              f"median detection of {rep['median_flux']:.0f} e-): "
+              f"median detection of {rep['median_flux']:.0f} ADU): "
               f"{rep['n_aggregates']} objects from "
               f"{rep['n_detections_flagged']} detections, "
               f"{100*rep['flux_fraction']:.1f}% of all detected flux")
-        print(f"{'y':>8} {'x':>8} {'flux e-':>11} {'x median':>9} {'ndet':>5}")
+        print(f"{'y':>8} {'x':>8} {'flux ADU':>11} {'x median':>9} {'ndet':>5}")
         for o in rep["objects"]:
             print(f"{o['y']:8.2f} {o['x']:8.2f} {o['flux']:11.0f} "
                   f"{o['ratio']:9.1f} {o['n']:5d}")
@@ -82,7 +80,7 @@ def main(args):
     if len(wide):
         print(f"\nwide objects (modelled, not reported as detections): "
               f"{len(wide)}")
-        print(f"{'y':>8} {'x':>8} {'sigma':>7} {'flux e-':>10}")
+        print(f"{'y':>8} {'x':>8} {'sigma':>7} {'flux ADU':>10}")
         for g in np.sort(wide, order="flux")[::-1]:
             print(f"{g['y']:8.2f} {g['x']:8.2f} {g['sigma']:7.2f} "
                   f"{g['flux']:10.0f}")
@@ -135,10 +133,6 @@ if __name__ == "__main__":
     ap.add_argument("--frame", type=int, default=0,
                     help="which frame, if the file is a stack")
     ap.add_argument("--sigma", type=float, default=1.2)
-    ap.add_argument("--gain", type=float, default=4.23,
-                    help="ADU per photoelectron")
-    ap.add_argument("--read-noise", type=float, default=0.0,
-                    help="camera read noise, e- rms")
     ap.add_argument("--k-max", type=int, default=12)
     ap.add_argument("--agg-ratio", type=float, default=spotsolve.AGG_AMP_RATIO,
                     help="post-hoc aggregate flag: flux as a multiple of the "

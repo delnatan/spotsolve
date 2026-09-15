@@ -37,8 +37,9 @@ MAX_ROUNDS = 8
 #   widths genuinely vary; it was measured and not chosen.
 #
 # What the median does NOT do is separate populations: any wider
-# sub-population pulls it up. On the 80% glycerol bead frames 0-4 (gain 1.93,
-# read noise 2.41 e-) it reads 1.309 px [1.298, 1.326], where the mode of the
+# sub-population pulls it up. On the 80% glycerol bead frames 0-4 (measured
+# with the camera's gain 1.93 and read noise 2.41 e-, before the detector
+# stopped taking them) it read 1.309 px [1.298, 1.326], where the mode of the
 # same widths is 1.184 -- the difference is the out-of-focus beads. For a
 # sample like that, `SigmaCalibration.widths` holds every fitted width.
 
@@ -60,16 +61,16 @@ class SigmaCalibration:
     """Every fitted width of the final round, px."""
 
 
-def calibrate_sigma(frames, sigma_guess, *, offset=0.0, gain=None,
-                    read_noise=0.0, roi=None, tol=TOL, max_rounds=MAX_ROUNDS,
+def calibrate_sigma(frames, sigma_guess, *, offset=0.0, roi=None, tol=TOL,
+                    max_rounds=MAX_ROUNDS,
                     n_boot=2000, seed=0, n_threads=None):
     """Measure the in-focus PSF width from one frame or a `(T, H, W)` stack.
 
     Localizes every frame at the current guess with the reporting band off,
     takes the median of all fitted widths, and repeats at that value until it
     moves by less than `tol` (relative). The guess only needs to be within
-    ~25% of the truth. `offset`, `gain` and `read_noise` are as in
-    `localize`; the more spots, the tighter `ci`.
+    ~25% of the truth. `offset` and `roi` are as in `localize`; the more
+    spots, the tighter `ci`.
     """
     stack = np.asarray(frames, dtype=float)
     if stack.ndim == 2:
@@ -80,8 +81,8 @@ def calibrate_sigma(frames, sigma_guess, *, offset=0.0, gain=None,
     guesses, converged, widths = [], False, np.empty(0)
     for _ in range(int(max_rounds)):
         guesses.append(guess)
-        results = localize_stack(stack, guess, offset=offset, gain=gain,
-                                 read_noise=read_noise, roi=roi, band=None,
+        results = localize_stack(stack, guess, offset=offset, roi=roi,
+                                 band=None,
                                  n_threads=n_threads)
         widths = np.concatenate([r.fit_sigma for r in results])
         if len(widths) == 0:

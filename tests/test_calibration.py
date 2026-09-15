@@ -17,7 +17,7 @@ def _stack(sigma, density=0.005, seeds=(17, 18, 19)):
 
 @pytest.mark.parametrize("guess", [1.04, 1.3, 1.625])      # 0.8x, 1x, 1.25x
 def test_converges_to_the_true_width_from_either_side(guess):
-    c = spotsolve.calibrate_sigma(_stack(1.3), guess, gain=1.0)
+    c = spotsolve.calibrate_sigma(_stack(1.3), guess)
     assert c.converged and len(c.guesses) <= 6
     # Measured at 1.010x on this field; the median's own bias, not noise.
     assert c.sigma == pytest.approx(1.3, rel=0.02)
@@ -27,18 +27,22 @@ def test_converges_to_the_true_width_from_either_side(guess):
 
 def test_a_single_frame_is_accepted_and_empty_frames_refused():
     frame = _stack(1.0, seeds=(17,))[0]
-    assert spotsolve.calibrate_sigma(frame, 1.0, gain=1.0).sigma == pytest.approx(1.0, rel=0.02)
+    assert spotsolve.calibrate_sigma(frame, 1.0).sigma == pytest.approx(1.0, rel=0.02)
     with pytest.raises(ValueError):
-        spotsolve.calibrate_sigma(np.full((40, 40), 20.0), 1.2, gain=1.0)
+        spotsolve.calibrate_sigma(np.full((40, 40), 20.0), 1.2)
 
 
 def test_localizations_report_every_fit_once():
     img = _stack(1.3, density=0.02, seeds=(18,))[0]
-    locs = spotsolve.localize(img, 1.3, gain=1.0)
-    every = spotsolve.localize(img, 1.3, gain=1.0, band=None)
+    locs = spotsolve.localize(img, 1.3)
+    every = spotsolve.localize(img, 1.3, band=None)
     # band=None reports every fit as a detection; the default splits the
     # same fits between detections and rejects.
     assert len(locs) + len(locs.rejects) == len(every)
     assert set(locs.rejects["reason"]) <= {"too_narrow", "too_wide", "edge"}
-    assert np.all((locs.sigma_ratio >= spotsolve.BAND[0]) & (locs.sigma_ratio <= spotsolve.BAND[1]))
-    assert locs.info["search_fits"] > 0 and locs.read_noise == 0.0
+    # A width outside the band is still a detection when it is within BAND_Z
+    # of its own SE of it; one that is significantly outside never is.
+    lo, hi = spotsolve.BAND
+    margin = spotsolve.BAND_Z * locs.sigma_se / locs.sigma
+    assert np.all((locs.sigma_ratio >= lo - margin) & (locs.sigma_ratio <= hi + margin))
+    assert locs.info["search_fits"] > 0 and locs.dispersion > 0

@@ -23,30 +23,35 @@ maturin develop --release -m rust/spotsolve-py/Cargo.toml
 import spotsolve
 
 # frame: a 2D array in camera units (ADU).
-locs = spotsolve.localize(frame, sigma=1.27, offset=100.0, gain=1.93,
-                          read_noise=2.41)
+locs = spotsolve.localize(frame, sigma=1.27, offset=100.0)
 
 locs.positions      # (N, 2): y, x in pixels; pixel centres are integers
-locs.amplitudes     # (N,): total flux of each spot, photoelectrons
+locs.amplitudes     # (N,): total flux of each spot, ADU above the offset
 locs.se             # (N, 3): standard errors of flux, y, x
 locs.fit_sigma      # (N,): each spot's own fitted width, pixels
+locs.sigma_se       # (N,): standard error of that width
 locs.sigma_ratio    # (N,): fit_sigma / sigma
 locs.rejects        # fitted objects that are not reported as spots, with a reason
-locs.background     # (H, W): background, photoelectrons per pixel
+locs.background     # (H, W): background, ADU above the offset
+locs.dispersion     # the frame's measured noise: variance per unit of signal
 
 # A (T, H, W) movie, frames on all cores:
-movie = spotsolve.localize_stack(stack, sigma=1.27, offset=100.0, gain=1.93,
-                                 read_noise=2.41)
+movie = spotsolve.localize_stack(stack, sigma=1.27, offset=100.0)
 ```
 
-The four calibration inputs:
+The two calibration inputs:
 
 | argument | meaning |
 |---|---|
 | `sigma` | the in-focus PSF width, pixels -- see [Calibrate sigma](#calibrate-sigma) |
 | `offset` | camera offset, ADU |
-| `gain` | ADU per photoelectron; `None` estimates it from the frame, but a measured value is better |
-| `read_noise` | camera read noise, electrons rms (0 if unknown) |
+
+**No gain or read noise.** The noise every decision is scaled by is measured
+from the frame itself, locally, so it already includes the camera's gain, its
+read noise and any haze. `locs.dispersion` reports what was measured -- for a
+camera, about `gain + gain^2 * read_noise^2 / background` -- and dividing a
+flux by your gain converts it to photoelectrons. See
+[No camera calibration](#no-camera-calibration).
 
 `roi=` (a boolean mask) restricts where spots are searched for. Pass one mask
 covering everything you want in a single call; do not tile a frame into
@@ -64,41 +69,37 @@ the dark field outside the cell, which is not the background inside it.
 ## Two thresholds: what gets searched, and what gets tried
 
 The search runs one statistic twice. It is a Laplacian-of-Gaussian filter
-at `sigma`, in standard deviations of its noise, and each use has its own
-cut:
+at `sigma`, in standard deviations of the frame's own local noise, and each
+use has its own cut:
 
 | argument | default | decides |
 |---|---|---|
-| `seed_threshold` | derived from the frame size (4.1 on 256x256 at `sigma` 1.27) | which peaks in the frame get a box searched around them |
-| `birth_threshold` | 3.0 | how strong a leftover peak inside a box must be before a new spot is tried there |
+| `seed_threshold` | 3.0 (`spotsolve.SEED_Z`) | which peaks in the frame get a box searched around them |
+| `birth_threshold` | 2.5 (`spotsolve.BIRTH_Z`) | how strong a leftover peak inside a box must be before a new spot is tried there |
 
-They fail in opposite directions, which is why they are separate:
+A spot tried at either kind of peak still has to pass the 10-nat test below,
+but neither cut is free. A seed or birth too strict costs recall that
+nothing recovers, because light that never gets a box is never fitted. Too
+loose costs false spots as well as time: a spot is tried at the strongest
+peak in its box, and among enough noise peaks some pass.
 
-- **A loose `seed_threshold` costs only time.** A seed is not a detection;
-  every spot still has to pass the 10-nat test below. A seed that is too
-  strict costs recall that nothing recovers, because light that never gets
-  a box is never fitted.
-- **A loose `birth_threshold` costs precision.** A spot tried at a peak that
-  clears it is judged by the 10-nat test alone. Around a bright spot, the
-  leftover light from a slightly wrong fit can pass that test and become a
-  false neighbour. On faint fields the reverse holds: nothing that faint can
-  pay 10 nats, so a lower cut only adds recall.
+The defaults were chosen for dim, fast-moving particles. Measured on a GEM
+movie (128x128, 49 frames) with emitters of known brightness and diffusion
+added to its real frames, and false spots counted on two simulations matched
+to it; recall is at D = 0 / 0.43 / 2 px^2 per frame:
 
-3.0 was chosen against simulation truth over nine field types, from bright
-and dense to faint, and at widths of 0.8, 1.3 and 2.0 px. It has the lowest
-mean and worst-case F1 loss of the cuts from 1.5 to 5.0. Lowering it also
-costs time: each box holds more spots, and a box's fits grow faster than its
-spot count. On the GEM movie, single-threaded:
-
-| `birth_threshold` | 4.1 | 3.0 | 2.5 | 2.0 |
+| seed / birth | false spots per frame | recall, 150 e- | recall, 300 e- | spots per frame |
 |---|---|---|---|---|
-| ms per frame | 104 | 187 | 249 | 318 |
-| detections per frame | 461 | 556 | 584 | 597 |
+| 3.8 / 3.0 | 24 | .44 .34 .27 | .72 .69 .58 | 222 |
+| 3.0 / 3.0 | 30 | .48 .38 .29 | .75 .69 .60 | 241 |
+| **3.0 / 2.5** | **31** | **.49 .40 .29** | **.76 .72 .60** | **249** |
+| 2.5 / 2.5 | 36 | .53 .41 .34 | .78 .73 .61 | 263 |
+| 2.0 / 2.0 | 45 | .57 .43 .36 | .78 .74 .64 | 282 |
 
-The detections gained down to 2.5 are real: they link into tracks as often
-as the rest (87% linked at every setting). Raise the cut toward 4 for
-speed; lower it toward 2.5 on faint, sparse data, where the extra fits are
-cheap.
+(Before the width band's upper-bound rule below, which removes about 12 of
+those false spots per frame.) Raise both cuts toward 3.5 / 3.0 for fewer false
+spots and speed: on 256x256 GEM frames, single-threaded, the defaults take
+395 ms per frame and 3.5 / 3.0 takes 304 ms.
 
 Other arguments: `k_max` (the most spots fitted jointly in one box, default
 12), `images=` (`model_image` and `residual` on the result; on by default
@@ -109,16 +110,22 @@ for `localize`, off for `localize_stack`), and `n_threads=` for
 
 Every spot's width is fitted, not held at `sigma`. `sigma` sets the scale of
 the search and defines "in focus"; each spot's own width may range over
-0.7-2.2 x `sigma` (`spotsolve.SLACK`), and only spots whose fitted width lies
-in **0.8-2.0 x `sigma`** (`spotsolve.BAND`) are reported as detections.
-Everything else is still fitted -- its light is part of the model -- and is
-returned in `locs.rejects` with one of three reasons:
+0.7-2.2 x `sigma` (`spotsolve.SLACK`), and spots whose fitted width lies in
+**0.8-2.0 x `sigma`** (`spotsolve.BAND`) are reported as detections. So are
+spots outside that band by no more than 2 of their own width standard errors
+(`spotsolve.BAND_Z`): a dim spot's width is noisy, and a hard cut dropped
+real dim spots -- on the GEM movie, most of the spots present in the frames
+before and after but missing in between had been fitted and cut as too
+narrow or too wide. Everything else is still fitted -- its light is part of
+the model -- and is returned in `locs.rejects` with one of three reasons:
 
-- **too narrow** -- fitted width below 0.8 x `sigma`. Nothing the microscope
-  images is narrower than its PSF, so this is not a real spot: usually a
-  noise spike, or a fit squeezed by its neighbours.
-- **too wide** -- fitted width above 2.0 x `sigma`, away from the frame edge:
-  an out-of-focus emitter, an extended object, or a patch of haze.
+- **too narrow** -- fitted width significantly below 0.8 x `sigma`. Nothing
+  the microscope images is narrower than its PSF, so this is not a real spot:
+  usually a noise spike, or a fit squeezed by its neighbours.
+- **too wide** -- fitted width significantly above 2.0 x `sigma`, or at the
+  2.2 x `sigma` limit (a width there is not a measurement: the fit wanted to
+  be wider), away from the frame edge: an out-of-focus emitter, an extended
+  object, or a patch of haze.
 - **edge** -- outside the band and within 1 `sigma` of the frame border, where
   the border cuts the spot off and its width cannot be measured.
 
@@ -136,8 +143,7 @@ search calls too wide. It only helps when every emitter truly has one width.
 ## Calibrate sigma
 
 ```python
-cal = spotsolve.calibrate_sigma(stack, sigma_guess=1.2, offset=100.0,
-                                gain=1.93, read_noise=2.41)
+cal = spotsolve.calibrate_sigma(stack, sigma_guess=1.2, offset=100.0)
 cal.sigma, cal.ci   # median fitted width, pixels, and its 95% bootstrap interval
 ```
 
@@ -252,12 +258,14 @@ and measured losing to this, so it was left out rather than ported.
 
 ## How it works
 
-**Units and noise.** The frame is converted to photoelectrons,
-`d = (frame - offset) / gain`. Each pixel is treated as Poisson with mean
-equal to the model. Camera read noise adds Gaussian variance on top; it is
-included by the standard shifted-Poisson approximation, which adds
-`read_noise^2` to both the data and the model, so that a pixel's variance is
-`model + read_noise^2`.
+**Units and noise.** The frame stays in ADU, `d = frame - offset`. Two maps
+of the frame's own noise are measured before anything else, over 25-pixel
+windows: each pixel's standard deviation, from the local median of a
+4th-difference filter that PSF-sized structure barely reaches, and the local
+dispersion `phi`, that variance divided by the local median of the data.
+Scale the frame by any factor and both maps scale with it, so nothing below
+depends on the camera's gain; the read noise and haze are in the maps
+already.
 
 **The image model.** Each spot is a symmetric 2D Gaussian integrated over the
 pixel area, with four parameters: total flux `A`, position `(y, x)` and width
@@ -270,7 +278,7 @@ E(i; c, s) = 1/2 * [ erf((i - c + 1/2) / (s*sqrt(2))) - erf((i - c - 1/2) / (s*s
 ```
 
 `E` is the fraction of a 1D Gaussian that falls inside pixel `i`, so `A` is
-the spot's total photon count, not its peak height. The background is a
+the spot's total flux, not its peak height. The background is a
 smooth surface -- a local mean, over 25-pixel windows, of the pixels away
 from every candidate spot -- whose overall level is refitted in every region.
 
@@ -281,33 +289,34 @@ I(d, m) = sum over pixels [ d * log(d / m) - (d - m) ]
 ```
 
 which is the negative Poisson log-likelihood up to a term that depends only
-on the data. So the difference in `I` between two models of the same pixels
-is exactly their log-likelihood ratio, in nats. Fits are bounded
+on the data. In photoelectrons, the difference in `I` between two models of
+the same pixels is exactly their log-likelihood ratio, in nats. In ADU it is
+`phi` times that, so every comparison below divides by `phi`. The fitted
+positions and widths do not depend on the scale at all. Fits are bounded
 Levenberg-Marquardt with Fisher scoring.
 
 **The search.**
 
 1. *Find candidates.* A Laplacian-of-Gaussian filter at `sigma` is applied to
-   the noise-normalized image; local maxima above `seed_threshold` become
-   candidates. The cut is set for a nominal 5% chance of one false candidate
-   per frame, and in practice it lets through more, which is deliberate.
-   Candidates only seed the search; they are not detections.
+   the image and divided by the local noise; local maxima above
+   `seed_threshold` become candidates. Candidates only seed the search; they
+   are not detections.
 2. *Group into boxes.* Candidates within 2.5 `sigma` of each other share a
    box (at most 12 per box), padded by 3 `sigma` of pixels.
 3. *Decide each box*, brightest box first. Start from the background alone.
    Add one spot at a time, at the strongest peak left in the box's residual
    (the same filter, at `sigma`) that passes `birth_threshold`, refitting all
    spots in the box together. **A
-   spot is kept only if it lowers the box's `I` by more than 10 nats** -- a
-   likelihood ratio above e^10 ≈ 22,000. Then, while the cheapest spot to
-   remove costs less than 10 nats, remove it. Spots in neighbouring boxes are
+   spot is kept only if it lowers the box's `I` by more than 10 nats** (times
+   the box's `phi`) -- a likelihood ratio above e^10 ≈ 22,000. Then, while the
+   cheapest spot to remove costs less than 10 nats, remove it. Spots in neighbouring boxes are
    held fixed in the model, so a neighbour's light is not claimed again. All
    boxes are decided twice, the second time against settled neighbours.
 4. *Polish.* Groups of nearby spots are refitted together, holding the number
    of spots fixed, for up to four passes, stopping once no position moves by
    more than 0.001 pixel. The reported values and standard errors come from
    these final fits; the standard errors are the Cramér-Rao bounds from their
-   Fisher information.
+   Fisher information, scaled by the local `phi`.
 5. *Classify* each spot by its fitted width, as above.
 
 **What it does not model.** Haze and out-of-focus light beyond the smooth
@@ -317,6 +326,41 @@ the real PSF: on the glycerol bead data the residual is slightly positive in
 a ring 2-4 pixels around beads (+0.3 standard deviations). Two spots closer than
 about one `sigma` cannot be told apart from one brighter spot, and are
 reported as one.
+
+## No camera calibration
+
+The detector used to take a gain and a read noise. It no longer does, and on
+every test it was put through the change cost nothing that could be measured
+beyond noise:
+
+- **Truth.** On simulated 128x128 frames at three densities (gain 2.4, read
+  noise 1.6 e-), recall and precision with the camera's true values were
+  .850/.981, .682/.917 and .511/.842; measuring the noise instead gave
+  .855/.963, .683/.913 and .510/.839.
+- **Read noise.** Empty frames at 1-20 e- background and 1.6-2.5 e- read noise
+  give 0-0.7 fitted spots per frame without being told the read noise; plain
+  Poisson gave up to 13.
+- **Real data.** The measured dispersion reads 2.42-2.61 on four GEM crops
+  whose calibration implies 2.55-2.85, and 2.41 on glycerol beads against
+  2.23. It is least reliable on tiny, crowded bead frames (39x39 px: 1.90
+  against 2.15).
+- **The gain.** Multiply a frame by any factor and the same spots come back,
+  with fluxes multiplied by it. Exactly the same except inside crowded
+  clusters, whose decomposition is sensitive to rounding; the count stays
+  within 2.
+
+One caveat: the noise maps are computed exactly on a 12-pixel grid and
+interpolated between, so shifting an image by a non-multiple of 12 pixels
+samples its noise at different points. Measured on 10 crowded 256x256 GEM
+frames, comparing the interior of an image with the same image shifted:
+shifted by 12 pixels (the grid lines up) the count moves by 2.4% and 84% of
+spots come back within 0.5 px; by 5 pixels, 2.1% and 76%. Most of that
+sensitivity is the crowded search itself, not the grid.
+
+Compared with the detector it replaced, on the GEM movie at its defaults:
+false spots per frame 13 -> 20, recall of 150 e- spots .39/.27/.24 -> .50/
+.38/.29, of 300 e- spots .67/.63/.53 -> .74/.71/.60, and about twice the
+time.
 
 ## Development
 

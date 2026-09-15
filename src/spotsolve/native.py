@@ -1,14 +1,18 @@
 """The detector: one frame, or a whole timecourse in parallel.
 
 `localize` and `localize_stack` run the box search in Rust
-(`spotsolve_core::boxsearch`) with the GIL released: the photon conversion
-and gain estimate, FIND, the background surface, the search in each box, the
-polish and the classification of every fit. This module only arranges the
+(`spotsolve_core::boxsearch`) with the GIL released: the noise map, FIND, the
+background surface, the search in each box, the polish and the
+classification of every fit.
+
+There is no camera calibration to pass. The frame stays in ADU above
+`offset`, and the noise every decision is scaled by -- gain, read noise and
+haze alike -- is measured from the frame itself (`boxsearch::noise_map`). This module only arranges the
 arrays into `Localizations`. Its defaults are the Rust constants, read from
 the extension, so there is no second copy of them here.
 
 In each box an emitter exists iff it lowers the box's Poisson deviance by
-`spotsolve_rs.BOX_ADD_NATS` nats. The reasoning and measurement behind every
+`spotsolve_rs.BOX_ADD_NATS` nats, in units of the box's own dispersion. The reasoning and measurement behind every
 constant sit beside it in `rust/spotsolve-core/src/boxsearch.rs`.
 
 Frames of a timecourse are independent, so `localize_stack` hands them to a
@@ -50,14 +54,21 @@ except ImportError as error:          # pragma: no cover - build problem
         "spotsolve needs its Rust extension; build it with `maturin develop "
         "--release -m rust/spotsolve-py/Cargo.toml`") from error
 
-__all__ = ["localize", "localize_stack", "SLACK", "BAND", "K_MAX"]
+__all__ = ["localize", "localize_stack", "SLACK", "BAND", "BAND_Z", "K_MAX",
+           "SEED_Z", "BIRTH_Z"]
 
 SLACK = tuple(_rs.BOX_SLACK)
 """Widths a fit may take, as multiples of `sigma`: the model space."""
 BAND = tuple(_rs.BOX_BAND)
 """Widths reported as detections, as multiples of `sigma`."""
+BAND_Z = float(_rs.BOX_BAND_Z)
+"""A width outside `BAND` by no more than this many SEs is still reported."""
 K_MAX = int(_rs.BOX_K_MAX)
 """Most emitters one box fits jointly."""
+SEED_Z = float(_rs.BOX_SEED_Z)
+"""FIND's default cut, in sd of the LoG null."""
+BIRTH_Z = float(_rs.BOX_BIRTH_Z)
+"""The default cut a placement inside a box must clear, same units."""
 
 _REASONS = ("too_narrow", "too_wide", "edge")    # classes 1, 2, 3
 
@@ -71,11 +82,9 @@ def _roi(roi, shape):
     return roi
 
 
-def _kw(sigma, offset, gain, read_noise, roi, shape, k_max, seed_threshold,
-        birth_threshold, slack, band):
-    return dict(sigma=float(sigma), offset=float(offset),
-                gain=None if gain is None else float(gain),
-                read_noise=float(read_noise), roi=_roi(roi, shape),
+def _kw(sigma, offset, roi, shape, k_max, seed_threshold, birth_threshold,
+        slack, band):
+    return dict(sigma=float(sigma), offset=float(offset), roi=_roi(roi, shape),
                 k_max=int(k_max), seed_threshold=seed_threshold,
                 birth_threshold=birth_threshold,
                 slack=tuple(map(float, slack)),
@@ -83,10 +92,9 @@ def _kw(sigma, offset, gain, read_noise, roi, shape, k_max, seed_threshold,
 
 
 def _result(out, raw, kw, images):
-    pos, amp, sig, se, cls, bmap, info = out
-    gain = info.pop("gain")
+    pos, amp, sig, se, sig_se, cls, bmap, info = out
+    dispersion = info.pop("dispersion")
     sigma = kw["sigma"]
-    shift = kw["read_noise"] ** 2
     focus = cls == 0
     out_band = ~focus
     rejects = np.empty(int(out_band.sum()), dtype=REJECT_DTYPE)
@@ -96,63 +104,54 @@ def _result(out, raw, kw, images):
     rejects["reason"] = np.asarray(_REASONS)[cls[out_band].astype(int) - 1]
     model = residual = None
     if images:
-        m = _rs.box_render(pos, amp, sig, bmap)
-        residual = (raw - kw["offset"]) / gain + shift - m
-        model = m - shift
+        model = _rs.box_render(pos, amp, sig, bmap)
+        residual = raw - kw["offset"] - model
     return Localizations(
         positions=pos[focus], amplitudes=amp[focus], se=se[focus],
-        fit_sigma=sig[focus], rejects=rejects, background=bmap - shift,
-        sigma=sigma, gain=gain, read_noise=kw["read_noise"], info=info,
+        fit_sigma=sig[focus], sigma_se=sig_se[focus], rejects=rejects,
+        background=bmap, sigma=sigma, dispersion=dispersion, info=info,
         model_image=model, residual=residual)
 
 
-def localize(frame, sigma, *, offset=0.0, gain=None, read_noise=0.0, roi=None,
-             k_max=K_MAX, seed_threshold=None, birth_threshold=None,
-             slack=SLACK, band=BAND, images=True):
+def localize(frame, sigma, *, offset=0.0, roi=None, k_max=K_MAX,
+             seed_threshold=None, birth_threshold=None, slack=SLACK, band=BAND,
+             images=True):
     """Localize one frame. Returns `Localizations`.
 
-    `sigma` is the in-focus PSF width (px); `gain` (ADU per photoelectron),
-    `offset` (ADU) and `read_noise` (electrons rms) come from the camera's
-    calibration, and `gain=None` estimates it from the frame -- prefer a
-    measured one. `slack` and `band` are the widths a fit may take and the
-    widths reported as detections, as multiples of `sigma`; `band=None`
-    reports every fit.
+    `frame` is in camera units (ADU) and `offset` is the camera's offset,
+    ADU. Nothing else about the camera is needed: the noise is measured from
+    the frame, and fluxes and the background come back in ADU above `offset`.
+    `sigma` is the in-focus PSF width (px). `slack` and `band` are the widths
+    a fit may take and the widths reported as detections, as multiples of
+    `sigma`; a width outside `band` by no more than `BAND_Z` of its own SE is
+    still a detection, and `band=None` reports every fit.
 
-    Two cuts on the same LoG z-statistic, both derived from the frame when
-    left as None, and both in sd of that statistic's null:
+    Two cuts on the same LoG statistic, both in sd of its null:
 
-    * `seed_threshold` -- FIND's frame-wide cut, which decides what gets a
-      box. Loose is cheap here: a spurious seed costs runtime, because it
-      still has to pay `ADD_NATS` to become a detection, while light that is
-      never seeded can never be recovered.
-    * `birth_threshold` -- the cut a new emitter's residual peak must clear
-      inside a box. Loose is NOT cheap here: this one gates precision
-      directly, and it costs time, because a lower gate means more emitters
-      per box and a box's fits grow faster than its emitter count.
+    * `seed_threshold` (default `SEED_Z`) -- FIND's frame-wide cut, which
+      decides what gets a box. Too tight costs recall nothing recovers; too
+      loose costs false positives as well as time.
+    * `birth_threshold` (default `BIRTH_Z`) -- the cut a new emitter's
+      residual peak must clear inside a box.
 
-    `seed_threshold` is derived from the frame; `birth_threshold` defaults to
-    the calibrated constant `spotsolve_rs.BOX_BIRTH_Z`, because the test it
-    gates happens inside a box and a box does not grow with the frame. Raise
-    birth toward 4 for speed, lower it toward 2.5 on faint sparse data. The
-    measurements behind both sit beside the Rust constants.
-    `images=False` skips `model_image` and `residual`.
+    Lower both for dim, sparse data; the measured trade sits beside the Rust
+    constants. `images=False` skips `model_image` and `residual`.
     """
     raw = np.ascontiguousarray(frame, dtype=float)
     if raw.ndim != 2:
         raise ValueError(f"expected a 2-D frame, got shape {raw.shape}")
-    kw = _kw(sigma, offset, gain, read_noise, roi, raw.shape, k_max,
-             seed_threshold, birth_threshold, slack, band)
+    kw = _kw(sigma, offset, roi, raw.shape, k_max, seed_threshold,
+             birth_threshold, slack, band)
     return _result(_rs.box_localize(raw, **kw), raw, kw, images)
 
 
-def localize_stack(stack, sigma, *, offset=0.0, gain=None, read_noise=0.0,
-                   roi=None, k_max=K_MAX, seed_threshold=None,
-                   birth_threshold=None, slack=SLACK, band=BAND,
-                   n_threads=None, images=False):
+def localize_stack(stack, sigma, *, offset=0.0, roi=None, k_max=K_MAX,
+                   seed_threshold=None, birth_threshold=None, slack=SLACK,
+                   band=BAND, n_threads=None, images=False):
     """Localize every frame of a `(T, H, W)` stack, in parallel.
 
     Returns one `Localizations` per frame, in frame order, each what
-    `localize` returns for that frame; `gain=None` estimates it per frame.
+    `localize` returns for that frame; each frame's noise is its own.
     `n_threads` defaults to the machine's cores. `images` defaults to False
     here: for a long timecourse the model and residual are two more copies of
     the movie.
@@ -160,8 +159,8 @@ def localize_stack(stack, sigma, *, offset=0.0, gain=None, read_noise=0.0,
     raw = np.ascontiguousarray(stack, dtype=float)
     if raw.ndim != 3:
         raise ValueError(f"expected a (T, H, W) stack, got shape {raw.shape}")
-    kw = _kw(sigma, offset, gain, read_noise, roi, raw.shape[1:], k_max,
-             seed_threshold, birth_threshold, slack, band)
+    kw = _kw(sigma, offset, roi, raw.shape[1:], k_max, seed_threshold,
+             birth_threshold, slack, band)
     outs = _rs.box_localize_stack(
         raw, **kw, n_threads=int(n_threads or os.cpu_count() or 1))
     return [_result(o, raw[t], kw, images) for t, o in enumerate(outs)]
