@@ -55,7 +55,7 @@ except ImportError as error:          # pragma: no cover - build problem
         "--release -m rust/spotsolve-py/Cargo.toml`") from error
 
 __all__ = ["localize", "localize_stack", "SLACK", "BAND", "BAND_Z", "K_MAX",
-           "SEED_Z", "BIRTH_Z"]
+           "PEAK_Z"]
 
 SLACK = tuple(_rs.BOX_SLACK)
 """Widths a fit may take, as multiples of `sigma`: the model space."""
@@ -65,10 +65,9 @@ BAND_Z = float(_rs.BOX_BAND_Z)
 """A width outside `BAND` by no more than this many SEs is still reported."""
 K_MAX = int(_rs.BOX_K_MAX)
 """Most emitters one box fits jointly."""
-SEED_Z = float(_rs.BOX_SEED_Z)
-"""FIND's default cut, in sd of the LoG null."""
-BIRTH_Z = float(_rs.BOX_BIRTH_Z)
-"""The default cut a placement inside a box must clear, same units."""
+PEAK_Z = float(_rs.BOX_PEAK_Z)
+"""The default LoG cut, in sds of the local noise, for candidates and
+placements alike."""
 
 _REASONS = ("too_narrow", "too_wide", "edge")    # classes 1, 2, 3
 
@@ -82,11 +81,9 @@ def _roi(roi, shape):
     return roi
 
 
-def _kw(sigma, offset, roi, shape, k_max, seed_threshold, birth_threshold,
-        slack, band):
+def _kw(sigma, offset, roi, shape, k_max, threshold, slack, band):
     return dict(sigma=float(sigma), offset=float(offset), roi=_roi(roi, shape),
-                k_max=int(k_max), seed_threshold=seed_threshold,
-                birth_threshold=birth_threshold,
+                k_max=int(k_max), threshold=threshold,
                 slack=tuple(map(float, slack)),
                 band=None if band is None else tuple(map(float, band)))
 
@@ -114,8 +111,7 @@ def _result(out, raw, kw, images):
 
 
 def localize(frame, sigma, *, offset=0.0, roi=None, k_max=K_MAX,
-             seed_threshold=None, birth_threshold=None, slack=SLACK, band=BAND,
-             images=True):
+             threshold=None, slack=SLACK, band=BAND, images=True):
     """Localize one frame. Returns `Localizations`.
 
     `frame` is in camera units (ADU) and `offset` is the camera's offset,
@@ -126,28 +122,24 @@ def localize(frame, sigma, *, offset=0.0, roi=None, k_max=K_MAX,
     `sigma`; a width outside `band` by no more than `BAND_Z` of its own SE is
     still a detection, and `band=None` reports every fit.
 
-    Two cuts on the same LoG statistic, both in sd of its null:
-
-    * `seed_threshold` (default `SEED_Z`) -- FIND's frame-wide cut, which
-      decides what gets a box. Too tight costs recall nothing recovers; too
-      loose costs false positives as well as time.
-    * `birth_threshold` (default `BIRTH_Z`) -- the cut a new emitter's
-      residual peak must clear inside a box.
-
-    Lower both for dim, sparse data; the measured trade sits beside the Rust
-    constants. `images=False` skips `model_image` and `residual`.
+    `threshold` (default `PEAK_Z`) is the one cut on the LoG statistic, in
+    sds of the local noise: a peak must clear it to get a box, and a residual
+    peak inside a box must clear it before one more emitter is tried there.
+    Every emitter tried still has to pay `ADD_NATS`. Lower it for dim data,
+    raise it for fewer false positives and speed; the measured trade sits
+    beside the Rust constant. `images=False` skips `model_image` and
+    `residual`.
     """
     raw = np.ascontiguousarray(frame, dtype=float)
     if raw.ndim != 2:
         raise ValueError(f"expected a 2-D frame, got shape {raw.shape}")
-    kw = _kw(sigma, offset, roi, raw.shape, k_max, seed_threshold,
-             birth_threshold, slack, band)
+    kw = _kw(sigma, offset, roi, raw.shape, k_max, threshold, slack, band)
     return _result(_rs.box_localize(raw, **kw), raw, kw, images)
 
 
 def localize_stack(stack, sigma, *, offset=0.0, roi=None, k_max=K_MAX,
-                   seed_threshold=None, birth_threshold=None, slack=SLACK,
-                   band=BAND, n_threads=None, images=False):
+                   threshold=None, slack=SLACK, band=BAND, n_threads=None,
+                   images=False):
     """Localize every frame of a `(T, H, W)` stack, in parallel.
 
     Returns one `Localizations` per frame, in frame order, each what
@@ -159,8 +151,8 @@ def localize_stack(stack, sigma, *, offset=0.0, roi=None, k_max=K_MAX,
     raw = np.ascontiguousarray(stack, dtype=float)
     if raw.ndim != 3:
         raise ValueError(f"expected a (T, H, W) stack, got shape {raw.shape}")
-    kw = _kw(sigma, offset, roi, raw.shape[1:], k_max, seed_threshold,
-             birth_threshold, slack, band)
+    kw = _kw(sigma, offset, roi, raw.shape[1:], k_max, threshold, slack,
+             band)
     outs = _rs.box_localize_stack(
         raw, **kw, n_threads=int(n_threads or os.cpu_count() or 1))
     return [_result(o, raw[t], kw, images) for t, o in enumerate(outs)]

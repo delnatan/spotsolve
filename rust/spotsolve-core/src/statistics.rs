@@ -1,7 +1,7 @@
 //! The one distributional constant the detector needs.
 //!
 //! It used to be the standard-normal quantile, for FIND's Bonferroni seed cut;
-//! that cut is a constant now ([`crate::boxsearch::SEED_Z`]).
+//! that cut is a constant now ([`crate::boxsearch::PEAK_Z`]).
 
 /// The median of chi-squared with one degree of freedom, `Phi^-1(0.75)^2`:
 /// what the local median of a squared unit-variance Gaussian filter output

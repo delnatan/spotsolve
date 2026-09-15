@@ -11,14 +11,14 @@
 //! d        raw - offset, in ADU; no gain, no read noise
 //! NOISE    local pixel sd (NOISE_WIN px, 4th-difference filter) and the local
 //!          dispersion phi = sd^2 / local median of d
-//! FIND     LoG peaks of d against a flat level, in units of NOISE -> candidates
+//! FIND     LoG peaks of d above PEAK_Z local sds                 -> candidates
 //! BMAP     smooth surface from the pixels no candidate reaches
 //! BOXES    candidates within LINK_FACTOR*sigma share a box, <= k_max each
 //! SWEEPS times, for each box, brightest first:
 //!     fit the level alone (K = 0), BMAP's shape and the neighbours' current
 //!     emitters held fixed
-//!     FORWARD   place at the strongest owned residual peak that passes
-//!               the BIRTH cut; keep it iff I falls by > ADD_NATS * phi
+//!     FORWARD   place at the strongest owned residual LoG peak above
+//!               PEAK_Z; keep it iff I falls by > ADD_NATS * phi
 //!     BACKWARD  (K >= 2) drop the cheapest emitter while it costs less
 //! POLISH   block-Jacobi refits at fixed N until nothing moves
 //! CLASSIFY by fitted width, out of band only when significantly so
@@ -43,7 +43,7 @@
 //!   `dI_ADU = g * dI_e`. Here `c` is multiplied by the box's own dispersion
 //!   `phi`, the pixel variance per unit of signal, measured from the frame
 //!   ([`noise_map`]), so `dI_ADU / phi` is in the units the old test was in.
-//! * The two LoG cuts, FIND's and BIRTH's, are divided by the local pixel sd
+//! * The LoG cut, in FIND and in every placement, is divided by the local pixel sd
 //!   instead of `sqrt(model)`. The sd includes read noise, and haze, without
 //!   being told either.
 //!
@@ -193,8 +193,8 @@ pub const K_MAX: usize = crate::patches::K_MAX;
 /// with `phi` the box's median dispersion ([`noise_map`]); that is these nats
 /// in photoelectron units. Re-measured there, on the GEM spike-in referee
 /// (false positives per frame from two matched simulations, then recall of
-/// 150 and 300 e- spike-ins at D = 0, 0.43 and 2 px^2/frame), seed and birth
-/// at their old defaults:
+/// 150 and 300 e- spike-ins at D = 0, 0.43 and 2 px^2/frame), with FIND and
+/// placement cuts of 3.79 and 3.0:
 ///
 /// ```text
 ///   c     FP    150 e-           300 e-
@@ -205,8 +205,8 @@ pub const K_MAX: usize = crate::patches::K_MAX;
 /// ```
 ///
 /// Kept at 10. Lowering it buys recall at 300 e-; at 150 e- recall stops near
-/// .48 however low `c` goes, because those emitters are lost at the seed and
-/// birth cuts first (see [`SEED_Z`]). Aguet et al.'s local-noise floor (keep
+/// .48 however low `c` goes, because those emitters are lost at the LoG cut
+/// first (see [`PEAK_Z`]). Aguet et al.'s local-noise floor (keep
 /// an emitter iff its peak exceeds k residual sds) was measured in its place
 /// on the same referee and lies on the same curve (k = 2: FP 35, .50 .38 .31;
 /// k = 3: FP 19, .36 .24 .15), with shorter tracks and more fits.
@@ -308,112 +308,57 @@ pub const BG_FLOOR: f64 = 1e-3;
 pub const BG_MASK_RADIUS: f64 = 3.0;
 /// Unmasked pixels a window needs before its local mean is believed.
 pub const BG_MIN_PIXELS: f64 = 25.0;
-/// BIRTH's cut, in sd of the LoG null: how strong a residual peak must be
-/// before a placement is even tried. Not derived from the frame -- the test
-/// is inside a box, and a box does not get bigger when the frame does.
+/// The one cut on the LoG statistic, in sd of its null (the local noise).
+/// FIND uses it on the frame to decide which light gets a box; each box uses
+/// it on its fit's residual to decide whether one more emitter is tried.
+/// Either way a peak that clears it still has to pay `ADD_NATS`.
 ///
-/// It used to share FIND's frame-wide Bonferroni value (3.8 to 4.1 on the
-/// sizes here), which is a Bonferroni over ~1820 independent windows. A box
-/// holds about four. That number was inherited, not derived, and it was
-/// costing recall that `ADD_NATS` would have rejected anyway.
+/// Neither use is free, and neither is the side a loose cut can safely err
+/// on. Too tight costs recall that nothing recovers -- light that never gets
+/// a box, or a placement, is never fitted. Too loose costs false positives as
+/// well as time: a placement is the strongest peak in its box, a maximum over
+/// positions, and among enough noise peaks some pay 10 nats.
 ///
-/// Measured 2026-09-12 with `seed` pinned at its default, nine arms on
-/// `simulate` truth, twelve seeds each, `band=None` so recall measures
-/// detection and not width classification, and a detection matched within
-/// 1 px. F1, and below it the regret against each arm's own best:
+/// # History: two cuts, then one
 ///
-/// ```text
-/// arm                          4.0     3.5     3.0     2.5     2.0     1.5
-/// bright sparse, matched      .983    .985    .986    .985    .983    .980
-/// bright mid, spread          .912    .913    .908    .903    .890    .884
-/// bright dense, spread        .820    .816    .816    .809    .798    .794
-/// bright v.dense, spread      .736    .735    .732    .716    .709    .710
-/// faint mid, matched          .846    .870    .891    .899    .903    .905
-/// faint mid, spread           .802    .821    .834    .842    .848    .847
-/// faint, bright bg            .766    .780    .791    .800    .803    .804
-/// sigma 0.8 faint, spread     .924    .936    .942    .946    .945    .942
-/// sigma 2.0 bright, spread    .730    .724    .719    .704    .677    .680
-///
-/// mean regret               .0189   .0121   .0079   .0095   .0146   .0156
-/// worst-arm regret          .0593   .0352   .0149   .0261   .0523   .0496
-/// ```
-///
-/// Score at 1 px, not 2. At 2 px a displaced extra detection beside a real
-/// one still counts as a hit, which flatters the looser gates: scored that
-/// way, 2.5 tied 3.0 (worst-arm regret .0174 against .0179).
-///
-/// The two ends want opposite things and the reason is `ADD_NATS`. On FAINT
-/// fields the gate is pure loss: nothing faint enough to be a satellite can
-/// pay 10 nats, so precision holds above .98 all the way down to 1.0 while
-/// recall climbs 11 points. On BRIGHT fields it is load-bearing: a bright
-/// emitter whose width is mis-modelled leaves a residual big enough that a
-/// satellite on its wings CAN pay 10 nats, and only the gate stops the
-/// tiling (see [`placement`]). 3.0 wins on both mean and worst-arm regret,
-/// 4.0 is clearly wrong, and 2.0 falls off a cliff on the bright arms.
-///
-/// 3.0 over 2.5 is also the runtime: a lower gate means more emitters per box,
-/// and a box's fits grow faster than its emitter count. On 20 GEM frames,
-/// single-threaded, against detections per frame:
+/// Until 2026-09-14 these were two numbers. FIND's was a Bonferroni cut at a
+/// family-wise 0.05 false seeds per frame (3.8-4.4 by frame size), on the
+/// argument that a seed only costs runtime; the placement cut was 3.0,
+/// chosen on `simulate` truth across nine field types under the Poisson
+/// normalization (2026-09-12: 4.0 clearly wrong, 2.0 falling off a cliff on
+/// bright arms, where a mis-modelled bright emitter's wing can pay 10 nats).
+/// With the local noise the z is calibrated rather than inflated 1.07-1.19x,
+/// so both were re-measured on the GEM spike-in referee (false positives per
+/// frame from two matched simulations; recall of 150 and 300 e- spike-ins at
+/// D = 0, 0.43 and 2 px^2/frame; the real movie's N; single-threaded time):
 ///
 /// ```text
-/// birth   4.12    3.00    2.50    2.00
-/// ms/fr    104     187     249     318
-/// N/fr   460.9   555.9   583.6   596.9
+/// seed / placement   FP    150 e-          300 e-          N     ms
+/// 3.79 / 3.0         24    .44 .34 .27     .72 .69 .58     222   476 (128^2, Python)
+/// 3.0  / 3.0         30    .48 .38 .29     .75 .69 .60     241   506
+/// 3.0  / 2.5         31    .49 .40 .29     .76 .72 .60     249   558
+/// 2.5  / 2.5         36    .53 .41 .34     .78 .73 .61     263   572
+/// 2.0  / 2.0         45    .57 .43 .36     .78 .74 .64     282   631
 /// ```
 ///
-/// 3.0 takes 21 of the 27 points of N that 2.5 does, for 1.8x the time
-/// rather than 2.4x. Raise it toward 4 for speed, lower it toward 2.5 on
-/// faint sparse data where the extra fits are cheap.
-///
-/// Confirmed without ground truth on `hyp7gem_wt_crop`, 30 frames, linked
-/// with `tracking::link`: a real emitter is in the next frame and a spurious
-/// one is not, so the extra detections are real only if they link. They do
-/// -- N per frame 452.6 -> 545.7 -> 572.4 with the linked fraction HELD at
-/// 87.0% -> 87.3% -> 87.7% and tracks of 5+ frames 799 -> 946 -> 1000. At
-/// 2.0 both signals turn: the linked fraction drops back to 87.1% and mean
-/// track length falls, for 2% more detections.
-///
-/// # 2.5 since the gain-free search (2026-09-14)
-///
-/// Everything above was measured with the Poisson normalization, under which
-/// the null z had sd 1.07-1.19 rather than 1 (see [`find_candidates`]). With
-/// the local sd it is calibrated, so the old number does not carry over.
-/// Re-measured with [`SEED_Z`] on the GEM spike-in referee (see [`ADD_NATS`]
-/// for the columns, plus the real movie's N and single-process time for the
-/// Python prototype):
+/// The first row is the "seed costs only time" claim failing: each 0.5 off
+/// the seed cut cost 4-5 false positives. 3.0 / 2.5 was adopted for the dim,
+/// fast population the GEM data is collected for. Then, with the width
+/// band's upper-bound rule and the per-coordinate fitter step in place,
+/// one number for both against that pair (ms on 256^2 GEM frames):
 ///
 /// ```text
-/// seed / birth    FP    150 e-          300 e-          N     ms
-/// 3.79 / 3.0      24    .44 .34 .27     .72 .69 .58     222   476
-/// 3.5  / 3.0      27    .45 .35 .29     .73 .68 .59     228   471
-/// 3.0  / 3.0      30    .48 .38 .29     .75 .69 .60     241   506
-/// 3.0  / 2.5      31    .49 .40 .29     .76 .72 .60     249   558
-/// 2.5  / 2.5      36    .53 .41 .34     .78 .73 .61     263   572
-/// 2.0  / 2.0      45    .57 .43 .36     .78 .74 .64     282   631
+/// cut            FP    150 e-          300 e-          N     ms
+/// 3.0 / 2.5      21.7  .50 .38 .31     .77 .73 .61     233   297
+/// one 2.5        24.9  .51 .41 .33     .78 .73 .60     241   327
+/// one 2.75       22.5  .50 .39 .32     .77 .73 .59     232   280
+/// one 3.0        20.0  .50 .36 .31     .77 .71 .59     224   237
 /// ```
 ///
-/// 3.0 / 2.5 was chosen for the dim, fast population the GEM data is
-/// collected for: +5 and +4 recall points at 150 and 300 e- over the old
-/// defaults, for 7 more false positives per 128x128 frame and 17% more time.
-pub const BIRTH_Z: f64 = 2.5;
-/// FIND's cut, in sd of the LoG null: which light gets a box at all.
-///
-/// A constant, not derived from the frame. It used to be a Bonferroni cut at
-/// a family-wise rate of 0.05 false seeds per frame (3.79 on 128^2, 4.43 on
-/// 512^2 at sigma 1.45), on the argument that FIND IS A SEEDER, NOT A
-/// DECISION RULE -- a spurious seed still has to pay `ADD_NATS`, so it should
-/// cost only runtime. Measured on the gain-free search (the table at
-/// [`BIRTH_Z`]), that is not true: each 0.5 off the cut costs 4-5 false
-/// positives per 128x128 frame. A seed is placed at the strongest peak in its
-/// box, a maximum over positions, and among enough noise peaks some pay 10
-/// nats. So the cut is an operating point like the others, and a per-area
-/// constant describes it better than a per-frame family-wise rate: the frame
-/// size says nothing about how bright a real emitter is.
-///
-/// An over-tight seed still costs what cannot be recovered -- a box never
-/// forms around light FIND did not seed -- which is why it sits above
-/// [`BIRTH_Z`] by only 0.5.
-pub const SEED_Z: f64 = 3.0;
+/// One cut at 2.75 matches the pair to about a point and is slightly faster,
+/// so the pair went. Raise it toward 3.0 for fewer false positives and 20%
+/// less time at two points of recall.
+pub const PEAK_Z: f64 = 2.75;
 /// The amplitude floor of a fit: `max(A_MIN, A_MIN_REL * A_max)`, with
 /// `A_max` the window's own amplitude bound. `A_MIN` is only a backstop for a
 /// window whose `A_max` is itself tiny.
@@ -454,7 +399,7 @@ pub const NOISE_WIN: usize = BG_KERNEL;
 /// holds about 25 independent samples of the filter output, so the full map
 /// is itself noisy (moving the window one pixel changes it by 3% at the
 /// median and 18% at the 99th percentile). On the GEM spike-in referee at
-/// seed 3.0 / birth 2.5, full / stride 5 / stride 12 gave FP 31.4 / 31.5 /
+/// FIND / placement cuts 3.0 / 2.5, full / stride 5 / stride 12 gave FP 31.4 / 31.5 /
 /// 31.3, 150 e- recall .49 .40 .29 / .53 .39 .32 / .51 .39 .30, and N 249 /
 /// 249 / 248. Half the window.
 pub const NOISE_STRIDE: usize = 12;
@@ -531,18 +476,9 @@ pub struct Settings {
     /// In-focus PSF width, px.
     pub sigma: f64,
     pub k_max: usize,
-    /// SEED: FIND's frame-wide cut, in sd of the LoG null. What decides
-    /// which light gets a box at all; defaults to [`SEED_Z`].
-    pub seed: f64,
-    /// BIRTH: the same statistic inside a box, on the current fit's residual
-    /// -- the cut a candidate placement must clear before [`ADD_NATS`] is
-    /// even asked. See [`placement`].
-    ///
-    /// It is a separate number from `seed` because the two answer different
-    /// questions: `seed` decides where to look, `birth` how strong leftover
-    /// light inside a box must be before one more emitter is tried there.
-    /// Defaults to [`BIRTH_Z`].
-    pub birth: f64,
+    /// The cut on the LoG statistic, in local sds, for FIND and for every
+    /// placement in a box; defaults to [`PEAK_Z`].
+    pub threshold: f64,
     /// Widths a fit may take, as multiples of `sigma`.
     pub slack: (f64, f64),
     pub sweeps: usize,
@@ -924,8 +860,8 @@ fn crop<T: Copy>(v: &[T], w: usize, bb: &patches::BBox) -> Vec<T> {
 /// to 1.75x in flux: at a matched false-seed rate, recall at peak SNR 1.8
 /// went 0.217 -> 0.477, and at sigma 0.8 0.467 -> 0.927.
 ///
-/// None of that survives into the pipeline. Swapped in behind `seed` with
-/// `birth` pinned, each kernel bisected onto 15 false seeds per empty
+/// None of that survives into the pipeline. Swapped in behind FIND's cut with
+/// the placement cut pinned, each kernel bisected onto 15 false seeds per empty
 /// 128x128 frame so the operating points match (see the alpha note below),
 /// six to twelve frames per cell, `band=None` so recall measures detection
 /// and not classification:
@@ -964,8 +900,8 @@ fn crop<T: Copy>(v: &[T], w: usize, bb: &patches::BBox) -> Vec<T> {
 /// residual had sd 1.19 at a background of 20 e- and 1.07 at 100 e-, not 1.
 /// The derived cut of 3.79 therefore passed 17.9 false seeds per empty
 /// 128x128 frame, not the 0.05 per frame it named. The local sd does not
-/// share that bias, which is one reason [`SEED_Z`] and [`BIRTH_Z`] were
-/// re-measured rather than carried over. A cut compared across two different
+/// share that bias, which is one reason [`PEAK_Z`] was re-measured rather
+/// than carried over. A cut compared across two different
 /// statistics must be calibrated empirically: at one nominal z the DoG passed
 /// 10.8 seeds against the LoG's 17.9, and comparing them there compares the
 /// calibrations, not the filters.
@@ -1257,7 +1193,7 @@ fn fit_window(
 }
 
 /// `(y, x, A0)` of the strongest owned LoG peak of the fit's residual, in
-/// local sds, that passes [`Settings::birth`], or `None`.
+/// local sds, that passes [`Settings::threshold`], or `None`.
 ///
 /// The test is not optional. The deviance of the best of many placements is
 /// a maximum over positions, and `ADD_NATS` was measured only on placements
@@ -1274,14 +1210,15 @@ fn fit_window(
 /// It lost anyway, and in BOTH of this function's jobs: deciding whether to
 /// place, and where.
 ///
-/// Measured 2026-09-12 on the [`BIRTH_Z`] arms (same seeds, 1 px match,
-/// `band=None`), each statistic with `birth` swept 5.0-1.5 on its own scale
+/// Measured 2026-09-12 on the nine placement-cut arms (see [`PEAK_Z`]; same
+/// seeds, 1 px match, `band=None`), each statistic's cut swept 5.0-1.5 on its own scale
 /// and taken at its own minimax cut. Mean / worst-arm F1 regret is against
 /// each arm's best over every row and cut. Then the paired F1 change against
-/// the LoG at 3.0, per arm in the [`BIRTH_Z`] table's order:
+/// the LoG at 3.0, per arm (bright sparse, mid, dense, very dense; faint mid
+/// matched, spread, bright bg; sigma 0.8 faint; sigma 2.0 bright):
 ///
 /// ```text
-/// gate     position  birth   mean   worst   per-arm dF1 vs LoG
+/// gate     position  cut     mean   worst   per-arm dF1 vs LoG
 /// LoG      LoG        3.0   .0083   .0149   (reference)
 /// MF       MF         3.5   .0362   .0765   -.006 -.025 -.030 -.028 -.062 -.030 -.028 -.009 -.033
 /// MF+proj  MF+proj    4.0   .0395   .0812   -.008 -.026 -.034 -.032 -.066 -.031 -.027 -.010 -.047
@@ -1348,7 +1285,7 @@ fn placement(
         }
     }
     let (v, i) = best?;
-    if !(v > s.birth) {
+    if !(v > s.threshold) {
         return None;
     }
     let resid = win.sub[i] - ws.model[i];
@@ -1533,7 +1470,7 @@ pub fn localize(
     let b0 = percentile(level.as_deref().unwrap_or(dc), 10.0).max(BG_FLOOR);
     let (sd_c, phi_c) = noise_map(dc, ch, cw, bb.y0, bb.x0);
     let dispersion = median(masked_values(&phi_c, rc).as_deref().unwrap_or(&phi_c));
-    let (cand_all, amp_all, str_all) = find_candidates(dc, ch, cw, b0, s.sigma, &sd_c, s.seed);
+    let (cand_all, amp_all, str_all) = find_candidates(dc, ch, cw, b0, s.sigma, &sd_c, s.threshold);
     let (bsub, fill) = background_map(dc, ch, cw, &cand_all, s.sigma, &sd_c, rc);
     // Back to the frame. Outside the crop nothing was estimated, so each map
     // carries a fill rather than a hole: no fit reads it -- every box lies
@@ -1959,8 +1896,7 @@ mod tests {
         let s = Settings {
             sigma,
             k_max: 12,
-            seed: SEED_Z,
-            birth: BIRTH_Z,
+            threshold: PEAK_Z,
             slack: (0.7, 2.2),
             sweeps: SWEEPS,
             polish: true,

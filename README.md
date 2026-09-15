@@ -66,41 +66,34 @@ background level the search works against is measured over the mask's own
 pixels, not the frame's -- under a cell mask, the frame's dimmest pixels are
 the dark field outside the cell, which is not the background inside it.
 
-## Two thresholds: what gets searched, and what gets tried
+## One threshold
 
-The search runs one statistic twice. It is a Laplacian-of-Gaussian filter
-at `sigma`, in standard deviations of the frame's own local noise, and each
-use has its own cut:
+The search uses one statistic, a Laplacian-of-Gaussian filter at `sigma`
+measured in standard deviations of the frame's own local noise, with one cut,
+`threshold` (default 2.75, `spotsolve.PEAK_Z`). A peak in the frame must clear
+it to get a box searched around it, and a leftover peak inside a box must
+clear it before one more spot is tried there. Every spot tried still has to
+pass the 10-nat test below.
 
-| argument | default | decides |
-|---|---|---|
-| `seed_threshold` | 3.0 (`spotsolve.SEED_Z`) | which peaks in the frame get a box searched around them |
-| `birth_threshold` | 2.5 (`spotsolve.BIRTH_Z`) | how strong a leftover peak inside a box must be before a new spot is tried there |
+The cut is not free in either direction. Too strict costs recall that
+nothing recovers: light that never gets a box is never fitted. Too loose
+costs false spots as well as time, because a spot is tried at the strongest
+peak in its box, and among enough noise peaks some pass the test.
 
-A spot tried at either kind of peak still has to pass the 10-nat test below,
-but neither cut is free. A seed or birth too strict costs recall that
-nothing recovers, because light that never gets a box is never fitted. Too
-loose costs false spots as well as time: a spot is tried at the strongest
-peak in its box, and among enough noise peaks some pass.
+Measured on a GEM movie (128x128, 49 frames) with emitters of known
+brightness and diffusion added to its real frames, and false spots counted on
+two simulations matched to it; recall is at D = 0 / 0.43 / 2 px^2 per frame,
+time is single-threaded on 256x256 GEM frames:
 
-The defaults were chosen for dim, fast-moving particles. Measured on a GEM
-movie (128x128, 49 frames) with emitters of known brightness and diffusion
-added to its real frames, and false spots counted on two simulations matched
-to it; recall is at D = 0 / 0.43 / 2 px^2 per frame:
+| `threshold` | false spots per frame | recall, 150 e- | recall, 300 e- | spots per frame | ms per frame |
+|---|---|---|---|---|---|
+| 2.5 | 24.9 | .51 .41 .33 | .78 .73 .60 | 241 | 327 |
+| **2.75** | **22.5** | **.50 .39 .32** | **.77 .73 .59** | **232** | **280** |
+| 3.0 | 20.0 | .50 .36 .31 | .77 .71 .59 | 224 | 237 |
 
-| seed / birth | false spots per frame | recall, 150 e- | recall, 300 e- | spots per frame |
-|---|---|---|---|---|
-| 3.8 / 3.0 | 24 | .44 .34 .27 | .72 .69 .58 | 222 |
-| 3.0 / 3.0 | 30 | .48 .38 .29 | .75 .69 .60 | 241 |
-| **3.0 / 2.5** | **31** | **.49 .40 .29** | **.76 .72 .60** | **249** |
-| 2.5 / 2.5 | 36 | .53 .41 .34 | .78 .73 .61 | 263 |
-| 2.0 / 2.0 | 45 | .57 .43 .36 | .78 .74 .64 | 282 |
-
-(Before the width band's upper-bound rule below, which removes about 12 of
-those false spots per frame.) Raise both cuts toward 3.5 / 3.0 for fewer false
-spots and speed: on 256x256 GEM frames, single-threaded, the defaults take
-295 ms per frame and 3.5 / 3.0 takes 215 ms (53 ms per frame on all cores
-at the defaults).
+The default was chosen for dim, fast-moving particles. It matches the two
+separate cuts (3.0 in the frame, 2.5 in a box) this replaced to about a
+point. Raise it toward 3.0 for fewer false spots and speed.
 
 Other arguments: `k_max` (the most spots fitted jointly in one box, default
 12), `images=` (`model_image` and `residual` on the result; on by default
@@ -299,14 +292,14 @@ Levenberg-Marquardt with Fisher scoring.
 **The search.**
 
 1. *Find candidates.* A Laplacian-of-Gaussian filter at `sigma` is applied to
-   the image and divided by the local noise; local maxima above
-   `seed_threshold` become candidates. Candidates only seed the search; they
-   are not detections.
+   the image and divided by the local noise; local maxima above `threshold`
+   become candidates. Candidates only seed the search; they are not
+   detections.
 2. *Group into boxes.* Candidates within 2.5 `sigma` of each other share a
    box (at most 12 per box), padded by 3 `sigma` of pixels.
 3. *Decide each box*, brightest box first. Start from the background alone.
    Add one spot at a time, at the strongest peak left in the box's residual
-   (the same filter, at `sigma`) that passes `birth_threshold`, refitting all
+   (the same filter, at `sigma`) that passes `threshold`, refitting all
    spots in the box together. **A
    spot is kept only if it lowers the box's `I` by more than 10 nats** (times
    the box's `phi`) -- a likelihood ratio above e^10 ≈ 22,000. Then, while the
@@ -359,8 +352,8 @@ spots come back within 0.5 px; by 5 pixels, 2.1% and 76%. Most of that
 sensitivity is the crowded search itself, not the grid.
 
 Compared with the detector it replaced, on the GEM movie at its defaults:
-false spots per frame 13 -> 22, recall of 150 e- spots .39/.27/.24 -> .50/
-.38/.31, of 300 e- spots .67/.63/.53 -> .77/.73/.61, and about 1.6x the
+false spots per frame 13 -> 22.5, recall of 150 e- spots .39/.27/.24 ->
+.50/.39/.32, of 300 e- spots .67/.63/.53 -> .77/.73/.59, and about 1.5x the
 time.
 
 ## Development

@@ -24,8 +24,7 @@ type Frame<'py> = (Arr2, Arr1, Arr1, Arr2, Arr1, Py<PyArray1<u8>>, Arr2, Bound<'
 fn settings(
     sigma: f64,
     k_max: usize,
-    seed: Option<f64>,
-    birth: Option<f64>,
+    threshold: Option<f64>,
     slack: (f64, f64),
     sweeps: usize,
     polish: bool,
@@ -40,19 +39,14 @@ fn settings(
     if k_max == 0 {
         return Err(PyValueError::new_err("`k_max` must be at least 1"));
     }
-    let seed = seed.unwrap_or(bs::SEED_Z);
-    let birth = birth.unwrap_or(bs::BIRTH_Z);
-    if !seed.is_finite() {
-        return Err(PyValueError::new_err("`seed_threshold` must be finite"));
-    }
-    if !birth.is_finite() {
-        return Err(PyValueError::new_err("`birth_threshold` must be finite"));
+    let threshold = threshold.unwrap_or(bs::PEAK_Z);
+    if !threshold.is_finite() {
+        return Err(PyValueError::new_err("`threshold` must be finite"));
     }
     Ok(bs::Settings {
         sigma,
         k_max,
-        seed,
-        birth,
+        threshold,
         slack,
         sweeps,
         polish,
@@ -109,7 +103,7 @@ fn give<'py>(py: Python<'py>, o: bs::Output, h: usize, w: usize) -> PyResult<Fra
 /// Localize one raw frame. Everything is in ADU above `offset`; the noise is
 /// measured from the frame.
 #[pyfunction]
-#[pyo3(signature = (raw, sigma, offset=0.0, *, roi=None, k_max=bs::K_MAX, seed_threshold=None, birth_threshold=None, slack=bs::SLACK, band=Some(bs::BAND), sweeps=bs::SWEEPS, polish=true))]
+#[pyo3(signature = (raw, sigma, offset=0.0, *, roi=None, k_max=bs::K_MAX, threshold=None, slack=bs::SLACK, band=Some(bs::BAND), sweeps=bs::SWEEPS, polish=true))]
 #[allow(clippy::too_many_arguments)]
 fn box_localize<'py>(
     py: Python<'py>,
@@ -118,8 +112,7 @@ fn box_localize<'py>(
     offset: f64,
     roi: Option<PyReadonlyArray2<'_, bool>>,
     k_max: usize,
-    seed_threshold: Option<f64>,
-    birth_threshold: Option<f64>,
+    threshold: Option<f64>,
     slack: (f64, f64),
     band: Option<(f64, f64)>,
     sweeps: usize,
@@ -135,7 +128,7 @@ fn box_localize<'py>(
     }
     check_offset(offset)?;
     let roi = roi_slice(&roi, h, w)?.map(|m| m.to_vec());
-    let s = settings(sigma, k_max, seed_threshold, birth_threshold, slack, sweeps, polish, band)?;
+    let s = settings(sigma, k_max, threshold, slack, sweeps, polish, band)?;
     let o = py.detach(|| {
         let (mut ws, mut d) = (bs::Workspace::new(), Vec::new());
         bs::localize_raw(&r, h, w, offset, roi.as_deref(), &s, &mut ws, &mut d)
@@ -147,7 +140,7 @@ fn box_localize<'py>(
 /// each frame exactly as `box_localize` would. Returns one tuple per frame,
 /// in frame order.
 #[pyfunction]
-#[pyo3(signature = (raw, sigma, offset=0.0, *, roi=None, k_max=bs::K_MAX, seed_threshold=None, birth_threshold=None, slack=bs::SLACK, band=Some(bs::BAND), sweeps=bs::SWEEPS, polish=true, n_threads=1))]
+#[pyo3(signature = (raw, sigma, offset=0.0, *, roi=None, k_max=bs::K_MAX, threshold=None, slack=bs::SLACK, band=Some(bs::BAND), sweeps=bs::SWEEPS, polish=true, n_threads=1))]
 #[allow(clippy::too_many_arguments)]
 fn box_localize_stack<'py>(
     py: Python<'py>,
@@ -156,8 +149,7 @@ fn box_localize_stack<'py>(
     offset: f64,
     roi: Option<PyReadonlyArray2<'_, bool>>,
     k_max: usize,
-    seed_threshold: Option<f64>,
-    birth_threshold: Option<f64>,
+    threshold: Option<f64>,
     slack: (f64, f64),
     band: Option<(f64, f64)>,
     sweeps: usize,
@@ -174,7 +166,7 @@ fn box_localize_stack<'py>(
     }
     check_offset(offset)?;
     let roi = roi_slice(&roi, h, w)?.map(|m| m.to_vec());
-    let s = settings(sigma, k_max, seed_threshold, birth_threshold, slack, sweeps, polish, band)?;
+    let s = settings(sigma, k_max, threshold, slack, sweeps, polish, band)?;
     let r = r.to_vec();
     let outs = py.detach(|| {
         bs::localize_stack(&r, n, h, w, offset, roi.as_deref(), &s, n_threads.max(1))
@@ -219,8 +211,7 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("BOX_BAND", bs::BAND)?;
     m.add("BOX_K_MAX", bs::K_MAX)?;
     m.add("BOX_ADD_NATS", bs::ADD_NATS)?;
-    m.add("BOX_SEED_Z", bs::SEED_Z)?;
-    m.add("BOX_BIRTH_Z", bs::BIRTH_Z)?;
+    m.add("BOX_PEAK_Z", bs::PEAK_Z)?;
     m.add("BOX_BAND_Z", bs::BAND_Z)?;
     Ok(())
 }
