@@ -99,7 +99,8 @@ to it; recall is at D = 0 / 0.43 / 2 px^2 per frame:
 (Before the width band's upper-bound rule below, which removes about 12 of
 those false spots per frame.) Raise both cuts toward 3.5 / 3.0 for fewer false
 spots and speed: on 256x256 GEM frames, single-threaded, the defaults take
-395 ms per frame and 3.5 / 3.0 takes 304 ms.
+295 ms per frame and 3.5 / 3.0 takes 215 ms (53 ms per frame on all cores
+at the defaults).
 
 Other arguments: `k_max` (the most spots fitted jointly in one box, default
 12), `images=` (`model_image` and `residual` on the result; on by default
@@ -358,8 +359,8 @@ spots come back within 0.5 px; by 5 pixels, 2.1% and 76%. Most of that
 sensitivity is the crowded search itself, not the grid.
 
 Compared with the detector it replaced, on the GEM movie at its defaults:
-false spots per frame 13 -> 20, recall of 150 e- spots .39/.27/.24 -> .50/
-.38/.29, of 300 e- spots .67/.63/.53 -> .74/.71/.60, and about twice the
+false spots per frame 13 -> 22, recall of 150 e- spots .39/.27/.24 -> .50/
+.38/.31, of 300 e- spots .67/.63/.53 -> .77/.73/.61, and about 1.6x the
 time.
 
 ## Development

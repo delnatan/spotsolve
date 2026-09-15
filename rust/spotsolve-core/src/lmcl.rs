@@ -25,9 +25,10 @@
 //!
 //! Coleman-Li divides by `v_i`, the distance from parameter `i` to the bound
 //! its step is heading toward. A parameter resting exactly *on* a bound sets
-//! `v_i = 0`, and the damage is not local to it: the fraction-to-boundary rule
-//! computes one scalar step scale from `min_i (bound_i - theta_i)/delta_i`, so
-//! a single stuck coordinate collapses the step for **every** coordinate. The
+//! `v_i = 0`, and the damage is not local to it: a fraction-to-boundary rule
+//! that computes one scalar step scale from `min_i (bound_i - theta_i)/delta_i`
+//! lets a single stuck coordinate collapse the step for **every** coordinate
+//! (which is why [`scale_into_box`] now limits each coordinate alone). The
 //! step then buys ~1e-11 nats, its gain ratio reads ~2e-8 -- which measures the
 //! clipping, not the quadratic model -- so it is rejected, lambda ratchets up,
 //! and the fit burns its whole budget on micro-steps.
@@ -518,7 +519,7 @@ pub fn fit_var_sigma(
 
             if i_trial < i_cur && rho > 1e-4 {
                 i_cur = i_trial;
-                accept(ws, p, n);
+                accept(ws);
                 // Nielsen (1999): aggressive for a trustworthy step, gentle for
                 // a marginal one.
                 lam = (lam * (1.0f64 / 3.0).max(1.0 - (2.0 * rho - 1.0).powi(3))).max(1e-12);
@@ -739,11 +740,14 @@ fn idiv(ws: &FitWorkspace, d: &[f64], n: usize, trial: bool) -> f64 {
     s
 }
 
-fn accept(ws: &mut FitWorkspace, p: usize, n: usize) {
+/// The trial becomes the iterate. The model and Jacobian buffers are swapped,
+/// not copied: both pairs are grown together by `ensure`, and the trial's are
+/// overwritten by the next `eval` before anything reads them.
+fn accept(ws: &mut FitWorkspace) {
     let (a, b) = (&mut ws.theta, &ws.theta_trial);
     a.copy_from(b);
-    ws.m[..n].copy_from_slice(&ws.m_trial[..n]);
-    ws.j[..p * n].copy_from_slice(&ws.j_trial[..p * n]);
+    std::mem::swap(&mut ws.m, &mut ws.m_trial);
+    std::mem::swap(&mut ws.j, &mut ws.j_trial);
 }
 
 /// `sqrt` of the distance to whichever bound the step is heading toward.
@@ -763,26 +767,43 @@ fn coleman_li_scale(theta: &Interior, grad: &[f64], b: &Bounds, s: &mut [f64]) {
     }
 }
 
-/// Shrink `delta` so `theta + delta` stays inside the box, by one scalar factor
-/// covering every coordinate (0.995 of the distance to the nearest bound).
+/// Keep `theta + delta` inside the box, one coordinate at a time: a
+/// coordinate whose step would cross a bound moves 0.995 of the way to it,
+/// and every other coordinate keeps its step.
+///
+/// It used to shrink the WHOLE step by one scalar -- the same collapse the
+/// module note describes for a parameter on its bound, one level milder: a
+/// width creeping toward `SLACK.1` held every other parameter to its creep.
+/// Measured 2026-09-14 on 10 GEM frames (256x256), 77k fits: 22% ended with
+/// a width at a bound, averaging 53 iterations against 10 for an interior
+/// single emitter, and they were 9030 of the 10168 fits that exhausted
+/// `max_iter` -- about 56% of all iterations. Per coordinate, on 200 noisy
+/// 13x13 fits of each kind (identical data and starts):
+///
+/// ```text
+/// case                      old: maxed out   dI new - old   new iterations
+/// wide single (3.6 px)          97/200        -0.17 nats         12.1
+/// wide + point emitter         129/200        -0.41 nats         12.0
+/// in-band single, narrow         0/200         0 (identical)   5.5, 7.5
+/// ```
+///
+/// Never a worse optimum, and in the detector 26% faster (127 -> 94 ms per
+/// 128x128 GEM frame; fits exhausting `max_iter` 10168 -> 297 on the 256x256
+/// frames). Because a truncated fit under-credits the larger model (see
+/// [`fit_var_sigma`]), converging them moves decisions: on the GEM spike-in
+/// referee false positives went 20 -> 22 per frame and 300 e- recall
+/// .74/.71/.60 -> .77/.73/.61, N 225 -> 233.
+///
+/// The step stays strictly interior, and the gain ratio is taken on this
+/// feasible step, not on the Newton step it came from.
 fn scale_into_box(theta: &Interior, delta: &mut [f64], b: &Bounds) {
     let t = theta.as_slice();
-    let mut scale = 1.0f64;
-    let mut any = false;
     for i in 0..delta.len() {
         let trial = t[i] + delta[i];
         if trial > b.hi()[i] {
-            any = true;
-            scale = scale.min(0.995 * (b.hi()[i] - t[i]) / delta[i]);
+            delta[i] = 0.995 * (b.hi()[i] - t[i]);
         } else if trial < b.lo()[i] {
-            any = true;
-            scale = scale.min(0.995 * (b.lo()[i] - t[i]) / delta[i]);
-        }
-    }
-    if any {
-        let scale = scale.max(1e-8);
-        for v in delta.iter_mut() {
-            *v *= scale;
+            delta[i] = 0.995 * (b.lo()[i] - t[i]);
         }
     }
 }

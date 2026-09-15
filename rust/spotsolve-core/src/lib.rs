@@ -1,17 +1,18 @@
 //! `spotsolve` core: emitter detection and localization.
 //!
 //! The detector is [`boxsearch`]: in each box, an emitter exists iff it
-//! lowers the Poisson deviance by `ADD_NATS`, and a whole frame -- the gain,
-//! FIND, the background surface, the search, the polish and the
-//! classification -- runs here, and the measurements behind its constants
-//! are recorded beside them. Its Python reference was retired on 2026-09-11;
+//! lowers the Poisson deviance by `ADD_NATS` in units of the frame's own
+//! measured noise, and a whole frame -- the noise map, FIND, the background
+//! surface, the search, the polish and the classification -- runs here, and
+//! the measurements behind its constants are recorded beside them. Its Python reference was retired on 2026-09-11;
 //! it is last present in commit `ea6b17f`, under `src/spotsolve/deprecated/`.
 //!
 //! The rest are the layers it is built from: [`psf`] (the
 //! pixel-integrated Gaussian and its Jacobian), [`lmcl`] (the bounded Poisson
 //! fitter), [`linalg`] (its Cholesky), [`filters`] (`scipy.ndimage`'s filters,
 //! matched exactly), [`grid`] and [`patches`] (spatial grouping), [`render`]
-//! (images and masks) and [`statistics`].
+//! (images and masks) and [`statistics`]. The linker is [`track`], [`lap`]
+//! and [`trackparams`].
 //!
 //! `PORTING_NOTES.md` records the implementation practices this port is
 //! built on; its section numbers are cited throughout as `[Pn]`.

@@ -142,14 +142,4 @@ impl EmitterGrid {
             dy * dy + dx * dx <= r2
         });
     }
-
-    /// Number of cells, for tests and diagnostics.
-    pub fn n_cells(&self) -> usize {
-        self.ny * self.nx
-    }
-
-    /// Largest number of emitters in any one cell -- a query's worst case.
-    pub fn max_occupancy(&self) -> usize {
-        self.cells.iter().map(|c| c.len()).max().unwrap_or(0)
-    }
 }

@@ -35,14 +35,19 @@ def _sim(seed, density=0.034, spread=0.2, **kw):
 # recall the new cuts were chosen for; kept, not retuned, because they are
 # the arms that hold precision honest.
 #
-#   seed  density spread   true  found   recall  prec   (was, 2026-09-12)
-#    17    0.015   0.4      47     38     .745   .921    .681 / .914
-#    18    0.034   0.2     107     94     .804   .915    .710 / .950
-#    19    0.055   0.4     172    106     .488   .792    .413 / .845
+# Re-measured again the same day when the fitter stopped shrinking the whole
+# step for one coordinate near a bound (`lmcl::scale_into_box`): fits that
+# used to exhaust `max_iter` now converge, and single cells move by about 2
+# points either way.
+#
+#   seed  density spread   true  found   recall  prec   (gain-free)  (2026-09-12)
+#    17    0.015   0.4      47     37     .723   .919   .745 / .921   .681 / .914
+#    18    0.034   0.2     107     94     .785   .894   .804 / .915   .710 / .950
+#    19    0.055   0.4     172    114     .512   .772   .488 / .792   .413 / .845
 @pytest.mark.parametrize("seed,density,spread,recall,precision",
-                         [(17, 0.015, 0.4, 0.745, 0.921),
-                          (18, 0.034, 0.2, 0.804, 0.915),
-                          (19, 0.055, 0.4, 0.488, 0.792)])
+                         [(17, 0.015, 0.4, 0.723, 0.919),
+                          (18, 0.034, 0.2, 0.785, 0.894),
+                          (19, 0.055, 0.4, 0.512, 0.772)])
 def test_referee_cells_hold_their_recall_and_precision(seed, density, spread,
                                                        recall, precision):
     sim = _sim(seed, density, spread)

@@ -12,7 +12,9 @@ The statistic
 -------------
 At each candidate position the question "how much flux is unexplained here?"
 has an exact answer. With residual r = d - m and Poisson variance Var(r_i) =
-m_i (photoelectrons), the maximum-likelihood amplitude of a unit-flux PSF g
+m_i (in units where variance equals the mean: ADU above the offset divided
+by `Localizations.dispersion`), the maximum-likelihood amplitude of a
+unit-flux PSF g
 added at that position, and its variance, are
 
     A_hat = sum_i (r_i g_i / m_i) / sum_i (g_i^2 / m_i)
@@ -66,8 +68,8 @@ __all__ = ["score_map", "residual_peaks", "audit_result", "format_report"]
 def score_map(d_e, model, sigma, truncate=4.0):
     """Per-pixel score z for adding one PSF, as described in the module docstring.
 
-    `d_e` and `model` are in PHOTOELECTRONS; the Poisson variance identity
-    Var = mean holds only there.
+    `d_e` and `model` must be in units where Var = mean: ADU above the offset
+    divided by the result's `dispersion` (photoelectrons, near enough).
     """
     d_e = np.asarray(d_e, dtype=float)
     m = np.maximum(np.asarray(model, dtype=float), 1e-6)
