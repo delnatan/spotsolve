@@ -99,9 +99,17 @@ fn track_fit<'py>(
     Ok(out)
 }
 
-/// Link one movie. Returns a track id per input row, in input order.
+/// Track ids per input row, and the brightness noise `(tau2, q)` if used.
+type Linked = (Py<PyArray1<u32>>, Option<(f64, f64)>);
+
+/// Link one movie. Returns a track id per input row, in input order, and
+/// the brightness model's `(tau2, q)` when one was used.
+///
+/// `brightness` is `None` (positions only) or `(log_flux, log_flux_var)` per
+/// row: brightness as a second cue, its noise estimated from the movie
+/// (`trackparams::flux_model`).
 #[pyfunction]
-#[pyo3(signature = (frame, positions, errors, d_grid, d_logprior, p_cont, lam_birth, se_inflate))]
+#[pyo3(signature = (frame, positions, errors, d_grid, d_logprior, p_cont, lam_birth, se_inflate, brightness=None))]
 #[allow(clippy::too_many_arguments)]
 fn track_link(
     py: Python<'_>,
@@ -113,7 +121,8 @@ fn track_link(
     p_cont: f64,
     lam_birth: f64,
     se_inflate: f64,
-) -> PyResult<Py<PyArray1<u32>>> {
+    brightness: Option<(Vec<f64>, Vec<f64>)>,
+) -> PyResult<Linked> {
     let (f, p, s) = inputs(&frame, &positions, &errors)?;
     let d = detections(f, p, s)?;
     let grid = d_grid
@@ -124,15 +133,24 @@ fn track_link(
         .map_err(|_| PyValueError::new_err("`d_logprior` must be contiguous float64"))?;
     let pp = params(grid.to_vec(), prior.to_vec(), p_cont, lam_birth, se_inflate)?;
 
-    let ids = py.detach(|| {
-        let l = tk::link(&d, &pp);
+    if let Some((lf, var)) = &brightness {
+        if lf.len() != d.n_dets() || var.len() != d.n_dets() {
+            return Err(PyValueError::new_err("brightness arrays must have one value per row"));
+        }
+        if lf.iter().chain(var).any(|v| !v.is_finite()) || var.iter().any(|&v| v < 0.0) {
+            return Err(PyValueError::new_err("brightness must be finite, with non-negative variances"));
+        }
+    }
+    let (ids, noise) = py.detach(|| {
+        let fx = brightness.map(|(lf, var)| tp::flux_model(&d, &pp, lf, var));
+        let l = tk::link_with_flux(&d, &pp, fx.as_ref());
         let mut out = vec![0u32; d.n_dets()];
         for (r, &id) in l.track.iter().enumerate() {
             out[d.order[r]] = id;
         }
-        out
+        (out, fx.map(|f| (f.tau2, f.q)))
     });
-    Ok(ids.into_pyarray(py).unbind())
+    Ok((ids.into_pyarray(py).unbind(), noise))
 }
 
 pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {

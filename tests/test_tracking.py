@@ -116,15 +116,78 @@ def test_missing_columns_and_bad_errors_are_refused():
         spotsolve.link(nan)
 
 
-def test_flux_is_not_read():
-    """Intensity is real evidence about identity and is deliberately unused:
-    it is also what merge/split inference needs, and a partial dependency now
-    would make the two harder to separate later."""
+def test_flux_is_not_read_by_default():
+    """Brightness is opt-in (`brightness=True`): by default the linking must
+    not depend on `flux` at all."""
     locs, _ = movie(5)
     scrambled = locs.with_columns(
         pl.col("flux").shuffle(seed=1), pl.col("loc_id").alias("loc_id"))
     assert spotsolve.link(scrambled)["track_id"].to_list() == \
         spotsolve.link(locs)["track_id"].to_list()
+
+
+def bright_among_dim(seed, n_clusters=40, n_frames=40, half=5.0):
+    """Clusters of one bright mobile particle and three dim fast ones confined
+    to a box around it. -> (locs, true particle id, is bright)."""
+    rng = np.random.default_rng(seed)
+    centres = np.stack(np.meshgrid(np.arange(n_clusters // 8) * 30.0 + 15,
+                                   np.arange(8) * 30.0 + 15), -1).reshape(-1, 2)
+    k = 4
+    centre = np.repeat(centres, k, axis=0)
+    bright = np.tile([True, False, False, False], len(centres))
+    d = np.where(bright, 0.43, 2.0)
+    flux = np.where(bright, 6000.0, 700.0)
+    se = np.where(bright, 0.08, 0.35)
+    rel = np.where(bright, 0.03, 0.15)
+    pos = centre + np.where(bright[:, None], 0.0, rng.uniform(-half, half, centre.shape))
+    rows = []
+    for f in range(n_frames):
+        if f:
+            pos = pos + rng.normal(0.0, np.sqrt(2 * d)[:, None], pos.shape)
+            lo, hi = centre - half, centre + half
+            pos = np.where(pos < lo, 2 * lo - pos, pos)
+            pos = np.where(pos > hi, 2 * hi - pos, pos)
+        obs = pos + rng.normal(0.0, se[:, None], pos.shape)
+        # real GEM brightness flickers well beyond photon noise (0.3 in log)
+        f_obs = flux * np.exp(rng.normal(0.0, 0.3, len(flux)))
+        rows.append((np.full(len(flux), f), obs, se, f_obs, rel * f_obs))
+    cat = lambda i: np.concatenate([r[i] for r in rows])
+    frame, obs, s, fl, sfl = (cat(i) for i in range(5))
+    who = np.tile(np.arange(len(flux)), n_frames)
+    locs = pl.DataFrame({
+        "loc_id": np.arange(len(frame), dtype=np.uint32),
+        "frame": frame.astype(np.uint32), "y": obs[:, 0], "x": obs[:, 1],
+        "se_y": s, "se_x": s, "flux": fl, "se_flux": sfl})
+    return locs, who, np.tile(bright, n_frames)
+
+
+def steals(tracks, who, bright):
+    """Links from a bright particle's detection to a different particle's."""
+    tid = tracks["track_id"].to_numpy()
+    order = np.lexsort((tracks["frame"].to_numpy(), tid))
+    t, w, b = tid[order], who[order], bright[order]
+    same = t[1:] == t[:-1]
+    return int(np.sum(same & b[:-1] & (w[1:] != w[:-1])))
+
+
+def test_brightness_keeps_a_bright_particle_among_dim_fast_ones():
+    """The case positions cannot settle, and the reason `brightness` exists.
+    With an 8.6x brightness ratio and 0.3 of log flicker it settles it
+    completely: measured on seeds 3-5, bright-to-dim steals per movie went
+    182 -> 0, 226 -> 0 and 216 -> 0. (Spiked into real frames with real
+    detections the gain is smaller -- half; see `track::FluxModel`.)"""
+    for seed in (3, 4, 5):
+        locs, who, bright = bright_among_dim(seed)
+        params = spotsolve.fit_link_params(locs)
+        plain = steals(spotsolve.link(locs, params), who, bright)
+        cued = steals(spotsolve.link(locs, params, brightness=True), who, bright)
+        assert plain > 100 and cued < 0.1 * plain
+
+
+def test_brightness_needs_its_columns():
+    locs, _ = movie(6)
+    with pytest.raises(ValueError, match="se_flux"):
+        spotsolve.link(locs, brightness=True)
 
 
 # Measured at the port (2026-09-11), seeds 11-13, with the parameters fitted

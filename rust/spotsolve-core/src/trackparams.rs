@@ -53,7 +53,7 @@
 //! intensity itself cancels out of every linking decision; see `track`.
 
 use crate::track::{Buckets, CellIndex, Detections, Filter, Linking, Params};
-use crate::track::{D_GRID_DECADES, D_GRID_N, link};
+use crate::track::{D_GRID_DECADES, D_GRID_N, FluxModel, link};
 
 /// Rounds of link / re-estimate / re-link. Two is usually enough; the third
 /// rarely moves anything and is kept as headroom.
@@ -565,6 +565,79 @@ pub fn refine(d: &Detections, p: &Params, l: &Linking, anchor: &Params) -> Param
 
 /// Initialize, then refine by linking and re-estimating. Returns the final
 /// parameters and every iterate.
+/// The brightness cue's parameters, from a positions-only linking of `d`.
+///
+/// `lf` and `lf_var` are each detection's log flux and its variance, in the
+/// caller's row order. Within linked tracks, with `e = lf_var + tau2` per
+/// detection, the one-frame change has variance `V1 = 2e + q` and the
+/// two-frame change `V2 = 2e + 2q`, so `q = V2 - V1` and
+/// `tau2 = (2 V1 - V2) / 2 - mean(lf_var)`. Both variances are robust --
+/// `(1.4826 MAD)^2` -- because wrong links put a heavy tail on the changes.
+/// Trimming that tail instead biased clean data: with a true `tau2` of 0.05,
+/// dropping the largest 5% of changes read 0.024.
+///
+/// The population density is a 40-bin histogram over the 0.5-99.5% range,
+/// add-one smoothed.
+pub fn flux_model(d: &Detections, p: &Params, lf: Vec<f64>, lf_var: Vec<f64>) -> FluxModel {
+    let l = link(d, p);
+    let mut frame_of = vec![0usize; d.n_dets()];
+    for f in 0..d.n_frames {
+        for r in d.frame_rows(f) {
+            frame_of[r] = f;
+        }
+    }
+    let at = |r: usize| lf[d.order[r]];
+    let (mut one, mut two, mut vsum, mut vn) = (Vec::new(), Vec::new(), 0.0, 0usize);
+    for rows in l.tracks() {
+        for (i, &r) in rows.iter().enumerate() {
+            vsum += lf_var[d.order[r]];
+            vn += 1;
+            if let Some(&r1) = rows.get(i + 1) {
+                if frame_of[r1] == frame_of[r] + 1 {
+                    one.push(at(r1) - at(r));
+                    if let Some(&r2) = rows.get(i + 2) {
+                        if frame_of[r2] == frame_of[r] + 2 {
+                            two.push(at(r2) - at(r));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let robust_var = |v: &mut Vec<f64>| -> f64 {
+        if v.is_empty() {
+            return f64::NAN;
+        }
+        v.sort_by(f64::total_cmp);
+        let med = v[v.len() / 2];
+        let mut dev: Vec<f64> = v.iter().map(|x| (x - med).abs()).collect();
+        dev.sort_by(f64::total_cmp);
+        (1.4826 * dev[dev.len() / 2]).powi(2)
+    };
+    let (v1, v2) = (robust_var(&mut one), robust_var(&mut two));
+    let mean_var = if vn > 0 { vsum / vn as f64 } else { 0.0 };
+    let (tau2, q) = if v1.is_finite() && v2.is_finite() {
+        (((2.0 * v1 - v2) / 2.0 - mean_var).max(0.0), (v2 - v1).max(1e-4))
+    } else {
+        (0.0, 1e-4)
+    };
+
+    let mut sorted = lf.clone();
+    sorted.sort_by(f64::total_cmp);
+    let pick = |q: f64| sorted[((sorted.len().max(1) - 1) as f64 * q) as usize];
+    let (lo, hi) = if sorted.is_empty() { (0.0, 1.0) } else { (pick(0.005), pick(0.995)) };
+    let bins = 40usize;
+    let step = ((hi - lo) / bins as f64).max(1e-9);
+    let mut counts = vec![0.0f64; bins];
+    for &v in &lf {
+        let i = ((v - lo) / step).floor().clamp(0.0, (bins - 1) as f64) as usize;
+        counts[i] += 1.0;
+    }
+    let total = lf.len() as f64 + bins as f64;
+    let logdens = counts.iter().map(|c| ((c + 1.0) / (total * step)).ln()).collect();
+    FluxModel { lf, lf_var, tau2, q, lo, step, logdens }
+}
+
 pub fn fit(d: &Detections) -> (Params, Vec<Snapshot>) {
     let mut p = initialize(d);
     let anchor = p.clone();
@@ -593,6 +666,35 @@ mod tests {
             let u1 = self.uniform().max(1e-12);
             (-2.0 * u1.ln()).sqrt() * (std::f64::consts::TAU * self.uniform()).cos()
         }
+    }
+
+    /// `flux_model` reads the brightness noise it was shown: immobile,
+    /// well-separated particles (so the linking is right), a log-flux random
+    /// walk with `q = 0.02` per frame, and detections with a reported
+    /// variance of 0.01 plus an unreported scatter `tau2 = 0.05`.
+    #[test]
+    fn flux_model_recovers_the_brightness_noise() {
+        let (n, frames) = (100usize, 40usize);
+        let mut rng = Rng(7);
+        let mut level: Vec<f64> = (0..n).map(|_| 7.0 + rng.normal()).collect();
+        let (mut frame, mut pos, mut se, mut lf, mut var) = (vec![], vec![], vec![], vec![], vec![]);
+        for f in 0..frames {
+            for (k, l) in level.iter_mut().enumerate() {
+                if f > 0 {
+                    *l += 0.02f64.sqrt() * rng.normal();
+                }
+                frame.push(f as i64);
+                pos.extend([20.0 * (k / 10) as f64 + 0.05 * rng.normal(), 20.0 * (k % 10) as f64 + 0.05 * rng.normal()]);
+                se.extend([0.05, 0.05]);
+                lf.push(*l + (0.01f64 + 0.05).sqrt() * rng.normal());
+                var.push(0.01);
+            }
+        }
+        let d = Detections::new(&frame, &pos, &se).unwrap();
+        let (p, _) = fit(&d);
+        let m = flux_model(&d, &p, lf, var);
+        assert!((m.tau2 - 0.05).abs() < 0.015, "tau2 {}", m.tau2);
+        assert!((m.q - 0.02).abs() < 0.01, "q {}", m.q);
     }
 
     /// The resolvability floor must land exactly on a grid point, so

@@ -647,6 +647,74 @@ impl Linking {
 struct Live {
     id: u32,
     f: Filter,
+    /// Log-flux level: mean and variance. Unused without a [`FluxModel`].
+    fm: f64,
+    fv: f64,
+}
+
+/// Brightness as a second link cue, opt-in ([`link_with_flux`]).
+///
+/// Each track carries its log-flux level as a random walk: per frame the
+/// level's variance grows by `q`, and a detection reads it with its own
+/// variance `lf_var` plus `tau2`, the detection-to-detection scatter photon
+/// noise does not explain (blinking, defocus, blur). A link's gain gains
+/// `log N(lf; level, v + q + lf_var + tau2) - log pop(lf)`: the same ratio
+/// of "this track" against "a new track", whose flux is drawn from the
+/// movie's population density `pop`. Built from the data by
+/// [`crate::trackparams::flux_model`]; nothing is set by hand.
+///
+/// # What it buys, measured 2026-09-14
+///
+/// Its job is the case positions cannot settle: a bright particle among
+/// dimmer, faster ones keeps its identity. Spiked into the real GEM frames,
+/// 36 clusters of one bright spot (2500 e-) with three dim fast spots (300
+/// e-, D = 2 px^2/frame) moving within 5 px of it, every true consecutive
+/// pair classified against truth:
+///
+/// ```text
+/// bright spot   cue          linked   wrong link   bright -> dim   purity
+/// D 0.05        positions     .956      .025            21          .98
+/// D 0.05        + flux        .954      .026            20          .98
+/// D 0.43        positions     .865      .078            56          .92
+/// D 0.43        + flux        .909      .044            30          .96
+/// ```
+///
+/// An immobile spot's gate is already tight, so it gains nothing; a mobile
+/// one is stolen half as often. The dim fast spots are unchanged: 78-80% of
+/// their pairs miss a detection, which no linker cue recovers. The noise
+/// estimates there were `tau2` 0.027-0.032 and `q` 0.001-0.014, and the
+/// result does not hinge on them: fixed at (0.037, 0.086), (0.10, 0.05) or
+/// (0.15, 0.03) it was the same. On spike-ins whose fluxes overlap the
+/// population's it does nearly nothing (wrong links at 600 e-, D = 2: .23 ->
+/// .19).
+///
+/// Why it is not the default: real GEM flux varies by a factor of 1.7-2.2
+/// from one frame to the next (sd of the log step .53-.80, of which the
+/// reported flux errors explain .28-.48). On `hyp7gem_wt_01` the estimates
+/// are `tau2` 0.037 and no detectable drift (`q` at its floor), and it
+/// fragments slightly: single-detection tracks 47.0% -> 48.9%, tracks of 8+
+/// frames 309 -> 285. Without truth on that movie, whether those breaks are
+/// wrong links cut or right ones lost is open.
+#[derive(Clone, Debug)]
+pub struct FluxModel {
+    /// `(N,)` in the caller's row order: log flux, and its variance.
+    pub lf: Vec<f64>,
+    pub lf_var: Vec<f64>,
+    pub tau2: f64,
+    pub q: f64,
+    /// Population log density of log flux on uniform bins from `lo`.
+    pub lo: f64,
+    pub step: f64,
+    pub logdens: Vec<f64>,
+}
+
+impl FluxModel {
+    fn logpop(&self, v: f64) -> f64 {
+        let n = self.logdens.len();
+        let i = ((v - self.lo) / self.step).floor();
+        let i = if i < 0.0 { 0 } else { (i as usize).min(n - 1) };
+        self.logdens[i]
+    }
 }
 
 /// Links every frame to the next. Every detection ends up in some track; one
@@ -658,6 +726,20 @@ struct Live {
 /// (Jaqaman's stage two), where it costs one more assignment instead of
 /// multiplying the hypothesis space at every frame.
 pub fn link(d: &Detections, p: &Params) -> Linking {
+    link_with_flux(d, p, None)
+}
+
+/// [`link`], with brightness as a second cue when `flux` is given.
+pub fn link_with_flux(d: &Detections, p: &Params, flux: Option<&FluxModel>) -> Linking {
+    const LOG_2PI: f64 = 1.837_877_066_409_345_5;
+    // Row (sorted) -> log flux and its variance.
+    let (lfs, lfv): (Vec<f64>, Vec<f64>) = match flux {
+        Some(fx) => (
+            d.order.iter().map(|&i| fx.lf[i]).collect(),
+            d.order.iter().map(|&i| fx.lf_var[i]).collect(),
+        ),
+        None => (Vec::new(), Vec::new()),
+    };
     let m = p.m();
     let mut track = vec![0u32; d.n_dets()];
     let mut next_id: u32 = 0;
@@ -723,7 +805,12 @@ pub fn link(d: &Detections, p: &Params) -> Linking {
                     // Gain of linking over ending this track and starting a
                     // new one at r; see the module docs for the cancellation
                     // that removes the clutter intensity from it.
-                    let gain = log_p_cont + log_l - term - birth;
+                    let mut gain = log_p_cont + log_l - term - birth;
+                    if let Some(fx) = flux {
+                        let s = lv.fv + fx.q + lfv[r] + fx.tau2;
+                        let e = lfs[r] - lv.fm;
+                        gain += -0.5 * (LOG_2PI + s.ln() + e * e / s) - fx.logpop(lfs[r]);
+                    }
                     if gain > 0.0 {
                         edges.push((r - rows.start, gain));
                     }
@@ -749,11 +836,20 @@ pub fn link(d: &Detections, p: &Params) -> Linking {
             lv.f.loglik(&var_p, z, rv, &mut ll);
             lv.f.marginalize(&ll);
             lv.f.update(&var_p, z, rv);
+            let (mut fm, mut fv) = (lv.fm, lv.fv);
+            if let Some(fx) = flux {
+                let vp = fv + fx.q;
+                let k = vp / (vp + lfv[r] + fx.tau2);
+                fm += k * (lfs[r] - fm);
+                fv = (1.0 - k) * vp;
+            }
             taken[c] = true;
             track[r] = lv.id;
             next_live.push(Live {
                 id: lv.id,
                 f: lv.f.clone(),
+                fm,
+                fv,
             });
         }
         for (c, &t) in taken.iter().enumerate() {
@@ -764,9 +860,15 @@ pub fn link(d: &Detections, p: &Params) -> Linking {
             let z = [d.pos[2 * r], d.pos[2 * r + 1]];
             let se2 = [d.se2[2 * r], d.se2[2 * r + 1]];
             track[r] = next_id;
+            let (fm, fv) = match flux {
+                Some(fx) => (lfs[r], lfv[r] + fx.tau2),
+                None => (0.0, 0.0),
+            };
             next_live.push(Live {
                 id: next_id,
                 f: Filter::root(z, se2, p),
+                fm,
+                fv,
             });
             next_id += 1;
         }

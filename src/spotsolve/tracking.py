@@ -30,9 +30,15 @@ bright, precisely localized spot is genuinely tighter than the one around a
 dim one, and the cost of a link is a likelihood ratio rather than a distance.
 The measurements behind that choice sit in `rust/spotsolve-core/src/track.rs`.
 
-`flux` is deliberately not read, though a bright particle staying bright is
-real evidence. Intensity is also what merge/split inference needs, and taking
-a partial dependency on it now would make the two harder to separate later.
+`flux` and `se_flux` are read only with `link(locs, brightness=True)`. Then
+each track also carries its log-flux level, and a link is scored on how well
+a detection's brightness matches it, so a bright particle keeps its identity
+among dimmer, faster ones: spiked into real GEM frames, a mobile bright spot
+was taken over by a dim neighbour half as often (56 -> 29 steals). It is not
+the default because real GEM flux flickers by a factor of about 2 per frame,
+and on that movie about 2% more tracks end as single detections, without
+truth to say whether those breaks are right. The measurement sits in
+`rust/spotsolve-core/src/track.rs` at `FluxModel`.
 
 `is_aggregate` is not read either: this links what it is given. Aggregates are
 flagged by `loctable`, not deleted, and whether to drop them is the caller's
@@ -157,22 +163,44 @@ def fit_link_params(locs):
         trajectory=tuple(out["trajectory"]))
 
 
-def link(locs, params=None):
+def _brightness(locs):
+    """Per-row log flux and its variance, from `flux` and `se_flux`. A row
+    whose flux error is missing or not positive gets a variance of 1 (a
+    factor of e), which leaves its brightness nearly uninformative."""
+    missing = [c for c in ("flux", "se_flux") if c not in locs.columns]
+    if missing:
+        raise ValueError(f"brightness=True needs the columns {missing}")
+    flux = locs["flux"].to_numpy().astype(float)
+    se = locs["se_flux"].to_numpy().astype(float)
+    ok = np.isfinite(flux) & (flux > 0) & np.isfinite(se) & (se > 0)
+    lf = np.log(np.where(ok, flux, 1.0))
+    if ok.any():
+        lf[~ok] = np.median(lf[ok])
+    var = np.where(ok, (se / np.where(ok, flux, 1.0)) ** 2, 1.0)
+    return [float(v) for v in lf], [float(v) for v in var]
+
+
+def link(locs, params=None, brightness=False):
     """Link a localization table into trajectories. -> the table + `track_id`.
 
     `params` is fitted from `locs` when omitted. The returned frame is the
     input with one `UInt32` column added, in the input's row order; a
     `track_id` column already present is replaced.
+
+    `brightness=True` also reads `flux` and `se_flux`, so that a particle's
+    brightness helps keep its identity; its noise is estimated from the movie.
+    See the module docstring for what that buys and costs.
     """
     import polars as pl
 
     if params is None:
         params = fit_link_params(locs)
     frame, pos, se = _arrays(locs)
-    ids = _rs.track_link(
+    ids, _ = _rs.track_link(
         frame, pos, se,
         np.ascontiguousarray(params.d_grid, dtype=float),
         np.ascontiguousarray(params.d_logprior, dtype=float),
         float(params.p_cont), float(params.lam_birth),
-        float(params.se_inflate))
+        float(params.se_inflate),
+        brightness=_brightness(locs) if brightness else None)
     return locs.with_columns(pl.Series("track_id", ids, dtype=pl.UInt32))

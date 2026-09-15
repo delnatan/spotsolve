@@ -190,6 +190,13 @@ tracks = spotsolve.link(locs, params)
 
 Everything is in pixels and frames, which is what the table holds.
 
+**Brightness, if you ask for it.** `spotsolve.link(locs, brightness=True)`
+also reads `flux` and `se_flux`, so a bright particle keeps its identity
+among dimmer, faster ones: a mobile bright spot with dim fast spots around it
+was taken over half as often. It is off by default because real brightness
+flickers a lot from frame to frame, and on the GEM movie it leaves about 2%
+more tracks as single detections.
+
 **A missed detection ends a track.** Gaps are not closed here: fragmenting a
 trajectory is a failure you can recover from downstream, and switching its
 identity is not. `p_cont` tells you what that costs -- mean track length is
