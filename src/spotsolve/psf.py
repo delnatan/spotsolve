@@ -1,41 +1,12 @@
-"""Pixel-integrated 2D Gaussian PSF model, with analytic derivatives.
+"""Pixel-integrated Gaussian PSFs and analytic derivatives.
 
-Model
------
-    m[i,j] = b + sum_k A_k * ey_k[i] * ex_k[j]
-    ey_k[i] = 0.5*(erf((i - cy_k + 0.5)/(sigma*sqrt2))
-                 - erf((i - cy_k - 0.5)/(sigma*sqrt2)))
+Each emitter contributes A * E(y; cy, sigma) * E(x; cx, sigma), where E
+integrates a unit Gaussian over one pixel and A is total flux. Fixed-width
+parameters are [background, A, y, x, ...]; variable-width parameters add
+sigma after each emitter's x coordinate.
 
-A_k is TOTAL FLUX: the pixel-integrated Gaussian sums to A over all pixels,
-so a peak-height guess must be divided by `peak_factor(sigma)` to become an
-A. `theta` is `[b, A_0, y_0, x_0, ...]`, with a fourth entry per emitter,
-its own sigma, in the `_var_sigma` layout (`pack_var_sigma`).
-
-Why numpy and not JAX
----------------------
-This was originally jax.jit + jax.jacfwd. On the array sizes this pipeline
-actually uses -- patches of ~81 to ~200 pixels -- JAX's tracing and dispatch
-cost dominates the arithmetic completely, and the model search changes the
-parameter-vector length on every proposal, so each new (3K+1, h, w)
-combination triggers a fresh compile costing ~40 ms against ~0.02 ms for a
-warm call. Analytic derivatives in numpy have no compile step, no shape
-specialization, and no dispatch overhead.
-
-The derivatives are elementary. With u_pm = (i - cy_k +- 0.5)/(sigma*sqrt2),
-
-    d(ey)/d(cy)    = -(1/(sigma*sqrt(2*pi))) * (exp(-u_+^2) - exp(-u_-^2))
-    d(ey)/d(sigma) =  (1/(sigma*sqrt(pi)))   * (u_- * exp(-u_-^2)
-                                              - u_+ * exp(-u_+^2))
-
-and the model separates, so ey (h x K) and ex (w x K) are built as 1-D
-factors and combined by outer products rather than evaluated on the full
-2-D grid per emitter.
-
-Grid convention
----------------
-`yy, xx` are the 2-D pixel-centre grids from numpy/jax mgrid. Only their
-separable axes are used (yy[:,0] and xx[0,:]), which is what mgrid provides;
-do not pass non-separable coordinate arrays.
+Models use separable pixel-center grids. The `_ax` variants accept their
+1-D axes directly; `halo` adds fixed neighboring light or background shape.
 """
 
 import math
@@ -55,21 +26,15 @@ __all__ = ["peak_factor", "axes", "model", "model_ax", "jac",
 
 
 def peak_factor(sigma):
-    """Ratio of an on-pixel-centre peak height to the amplitude parameter A:
-    peak = A * peak_factor(sigma). Roughly 0.104 at sigma=1.2, so an observed
-    peak-minus-background must be divided by ~0.104 (multiplied by ~9.6) to
-    become an initial guess for A."""
-    return math.erf(0.5 / (sigma * SQRT2)) ** 2
+    """Central-pixel signal per unit flux for scalar or array `sigma`.
+
+    For an emitter centered on a pixel, `peak = flux * peak_factor(sigma)`.
+    """
+    return erf(0.5 / (np.asarray(sigma, float) * SQRT2)) ** 2
 
 
 def axes(yy, xx):
-    """The two 1-D pixel-centre axes of a separable mgrid pair.
-
-    The model separates, so only `yy[:,0]` and `xx[0,:]` are ever read. A
-    caller that evaluates repeatedly on ONE patch -- which is every fit --
-    should hoist this out of its loop and use the `_ax` entry points below;
-    `lmga.fit` calls the model ~160 times per fit and the grid never changes.
-    """
+    """Extract the 1-D pixel-center axes from a separable mgrid pair."""
     yy = np.asarray(yy)
     xx = np.asarray(xx)
     return yy[:, 0].astype(float), xx[0, :].astype(float)
@@ -86,20 +51,16 @@ def _unpack(theta):
 
 
 def _shape(ax, c, sigma):
-    """E only, for one axis; (len(ax), K). What `model` needs and no more."""
+    """Pixel integrals for one axis, shape (len(ax), K)."""
     k = 1.0 / (sigma * SQRT2)
     return 0.5 * (erf((ax[:, None] - c[None, :] + 0.5) * k)
                   - erf((ax[:, None] - c[None, :] - 0.5) * k))
 
 
 def _factors(ax, c, sigma):
-    """(E, dE_dc) for one axis; each (len(ax), K).
+    """Return (E, dE_dc), each shaped (len(ax), K).
 
-    dE_dsigma is deliberately NOT computed here -- see `_factors_sigma`. It is
-    read only by `jac_free_sigma`, i.e. by the free-sigma diagnostic, while
-    this function is on the fixed-sigma fitting path that runs ~1.4M times per
-    frame. Computing a derivative nothing reads cost two exps, a multiply and
-    a divide on every one of those calls.
+    Width derivatives are computed separately by `_factors_sigma`.
     """
     k = 1.0 / (sigma * SQRT2)
     up = (ax[:, None] - c[None, :] + 0.5) * k

@@ -5,7 +5,7 @@ API examples and linking.
 
 | Guide | Contents |
 |---|---|
-| [Multi-emitter detection](DETECTION.md) | Image/noise model, fixed-cost search, widths, masks and earlier validation |
+| [Multi-emitter detection](DETECTION.md) | Image/noise model, count search, widths, Fisher diagnostics, masks and validation |
 | [Experimental BIC selection](COUNT_SELECTION.md) | Count score, forward/backward search, error budgets and threading measurements |
 | [Aguet / spotfitlm baseline](AGUET_BASELINE.md) | Sparse screening/fitting, reference parity, uncertainties and speed |
 | [Tracking](TRACKING.md) | Motion model, assignment, parameters, benchmarks and limits |
@@ -42,10 +42,11 @@ python -m pytest -q
 cargo test --release --workspace --manifest-path rust/Cargo.toml
 ```
 
-The 2026-09-17 run passed **69 Python and 45 Rust tests**. Cleanup and scheduler
-sharing left all output fields unchanged in 134 regression cases: 49 real
-frames in both count-selection modes, plus three seeds in six simulation
-conditions in both modes.
+The 2026-09-17 run passed **75 Python and 47 Rust tests**, including peak
+output, Fisher diagnostics and invalidation of stale uncertainties. Existing
+output arrays were unchanged in six simulation frames across both selection
+modes. The earlier scheduler cleanup preserved all fields in 134 regression
+cases, including 49 real frames in both modes.
 
 Fixtures under `tests/fixtures` are frozen. Most came from the retired Python
 reference. `08_track.json` comes from `tracksolve`; `09_aguet.json` pins the

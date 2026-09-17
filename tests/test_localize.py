@@ -102,7 +102,8 @@ def test_full_roi_is_no_roi():
                    roi=np.ones(img.shape, dtype=bool))
     np.testing.assert_array_equal(a.positions, b.positions)
     np.testing.assert_array_equal(a.amplitudes, b.amplitudes)
-    assert a.info == b.info
+    for key in a.info:
+        np.testing.assert_equal(a.info[key], b.info[key])
 
 
 def test_roi_confines_the_search():
@@ -129,6 +130,8 @@ def test_stack_is_frame_by_frame_and_thread_count_free():
             np.testing.assert_array_equal(r.positions, single.positions)
             np.testing.assert_array_equal(r.amplitudes, single.amplitudes)
             np.testing.assert_array_equal(r.se, single.se)
+            np.testing.assert_array_equal(r.info["fisher_fraction"],
+                                          single.info["fisher_fraction"])
         assert a.model_image is None and a.residual is None
     with_images = L.localize_stack(stack[:1], sigma=SIGMA,
                                    images=True)[0]
@@ -179,3 +182,26 @@ def test_an_empty_roi_asks_for_nothing():
     assert len(res) == 0
     assert res.background.shape == img.shape
     assert res.info["candidates"] == 0 and res.info["boxes"] == 0
+    assert res.info["fisher_fraction"].shape == (0, 4)
+    assert res.info["reject_fisher_fraction"].shape == (0, 4)
+
+
+@pytest.mark.parametrize("selection", ["fixed", "bic"])
+def test_fisher_diagnostics_follow_the_reporting_partition(selection):
+    image = _sim(17, density=0.015, spread=0.4).image
+    raw = rs.box_localize(image, sigma=SIGMA, selection=selection)
+    result = L.localize(image, sigma=SIGMA, selection=selection, images=False)
+    fraction = raw[-1]["fisher_fraction"]
+    assert fraction.shape == (len(raw[0]), 4)
+    assert np.all((fraction > 0) & (fraction <= 1))
+    focus = raw[5] == 0
+    assert focus.any() and (~focus).any()
+    np.testing.assert_array_equal(result.info["fisher_fraction"], fraction[focus])
+    np.testing.assert_array_equal(result.info["reject_fisher_fraction"], fraction[~focus])
+    assert result.info["reject_fisher_fraction"].shape == (len(result.rejects), 4)
+
+    # No covariance exists without the final fit; workspace reuse must not
+    # accidentally attach another frame's diagnostic.
+    unpolished = rs.box_localize(image, sigma=SIGMA, selection=selection, polish=False)
+    assert len(unpolished[0]) > 0
+    assert np.isnan(unpolished[-1]["fisher_fraction"]).all()

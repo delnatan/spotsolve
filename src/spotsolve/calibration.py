@@ -9,39 +9,11 @@ from .native import localize_stack
 __all__ = ["SigmaCalibration", "calibrate_sigma"]
 
 
-TOL = 0.002
-# Relative change in sigma below which the iteration stops. From a guess 0.8x
-# or 1.25x the truth it converges to the same value either way, in 2-6 rounds
-# (simulated 96x96 fields, sigma 1.0 / 1.3 / 1.6, densities 0.005-0.04 px^-2).
-
+TOL = 0.002  # relative change in sigma
 MAX_ROUNDS = 8
 
-# How the estimate is formed, and why. Measured 2026-09-11 on simulated
-# fields of one true width (three 96x96 frames per cell), converged
-# estimate / truth:
-#
-#   The reporting band must be OFF while calibrating. With it on, a guess
-#   25% too large puts the true in-focus spots at 0.8x the guess -- the band's
-#   lower edge -- and loses half of them: estimates 1.02-1.13x truth. Off, the
-#   same starts give 1.00x on bright fields.
-#
-#   The MEDIAN of all fitted widths, not of the brightest:
-#
-#     field                         all fits    brightest 50%   brightest 25%
-#     sparse, bright                1.00-1.01   1.00-1.01       1.00-1.01
-#     dense or dim (0.02-0.04)      1.00-1.03   1.01-1.06       1.02-1.07
-#
-#   In crowded fields the brightest spots include merged pairs, which fit
-#   wide. A half-sample MODE targets the narrowest peak instead but was
-#   noisier (-2% to +5% on single-width fields) and read 0.80-0.85x when the
-#   widths genuinely vary; it was measured and not chosen.
-#
-# What the median does NOT do is separate populations: any wider
-# sub-population pulls it up. On the 80% glycerol bead frames 0-4 (measured
-# with the camera's gain 1.93 and read noise 2.41 e-, before the detector
-# stopped taking them) it read 1.309 px [1.298, 1.326], where the mode of the
-# same widths is 1.184 -- the difference is the out-of-focus beads. For a
-# sample like that, `SigmaCalibration.widths` holds every fitted width.
+# Disable width reporting to avoid truncating the calibration sample.
+# Use all fitted widths: selecting only bright spots favors merged pairs.
 
 
 @dataclass(frozen=True)
@@ -64,13 +36,12 @@ class SigmaCalibration:
 def calibrate_sigma(frames, sigma_guess, *, offset=0.0, roi=None, tol=TOL,
                     max_rounds=MAX_ROUNDS,
                     n_boot=2000, seed=0, n_threads=None):
-    """Measure the in-focus PSF width from one frame or a `(T, H, W)` stack.
+    """Estimate PSF width from one frame or a (T, H, W) stack.
 
-    Localizes every frame at the current guess with the reporting band off,
-    takes the median of all fitted widths, and repeats at that value until it
-    moves by less than `tol` (relative). The guess only needs to be within
-    ~25% of the truth. `offset` and `roi` are as in `localize`; the more
-    spots, the tighter `ci`.
+    Refit with the reporting band disabled, update sigma to the median fitted
+    width, and repeat until its relative change is below `tol`. `offset` and
+    `roi` follow `localize`. The returned interval bootstraps spots from the
+    final round; broad or out-of-focus populations can bias the median upward.
     """
     stack = np.asarray(frames, dtype=float)
     if stack.ndim == 2:

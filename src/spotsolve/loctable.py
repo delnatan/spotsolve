@@ -1,59 +1,24 @@
-"""The standard localization table: `spotsolve` results as `polars` DataFrames.
+"""Convert per-frame results to Polars localization and summary tables.
 
-`spotsolve.localize` answers a question about ONE image. Everything downstream --
-trajectory linking first among them -- asks questions about a MOVIE, and needs
-the per-frame results in one table with a fixed, documented set of columns.
-This module defines that table and nothing else: no detection, no linking, no
-plotting. It is the contract between the localizer and whatever consumes it.
+`LOCALIZATION_SCHEMA` has one row per detection; `FRAME_SCHEMA` one per
+frame; `AGGREGATE_SCHEMA` one per linked bright object; `REJECT_SCHEMA` one
+per fit outside the reporting band.
 
-Four tables come out of a run, because there are four different row units
-and forcing them into one would mean either duplicating frame-level facts on
-every detection or hiding them:
+Coordinates and errors use pixels, with derived micrometre columns for
+tracking. Flux is total signal in ADU above the camera offset; divide by
+gain for photoelectrons. `peak` is the model's central-pixel signal above
+background, derived from flux and fitted width.
 
-  `locs`        one row per detection          -- LOCALIZATION_SCHEMA
-  `frames`      one row per frame              -- FRAME_SCHEMA
-  `aggregates`  one row per flagged object     -- AGGREGATE_SCHEMA
-  `rejects`     one row per out-of-band fit     -- REJECT_SCHEMA
-
-Units
------
-Pixels and frames are CANONICAL; micrometres and seconds are derived columns,
-present only because the linker's motion model lives in physical units and
-converting in two places invites two conventions. `flux` is in ADU above
-the camera offset, as everywhere downstream of `localize` -- the detector
-takes no gain -- and never a peak height. Divide by the gain for
-photoelectrons.
-
-What the linker actually needs from this table
-----------------------------------------------
-Position and frame are the obvious part. The part that is not obvious, and is
-the reason a table from this localizer is worth more to a multiple-hypothesis
-tracker than one from a centroid finder, is `se_y`/`se_x`: the per-detection
-CRLB from the polish's Fisher information. A gate built on them is a
-real Mahalanobis distance rather than a hand-tuned radius, and it is
-*heteroscedastic* -- a dim emitter in a crowd carries a genuinely wider gate
-than a bright isolated one, which is exactly the distinction that decides
-hard assignments in a dense field. The PSF is isotropic and the position
-block of the Fisher matrix is diagonal to the precision that matters here, so
-the two numbers are the whole covariance.
-
-`flux` and `se_flux` are the second linking cue: a real trajectory's flux is
-continuous frame to frame, and `flux_snr` (= A/SE(A)) says how much to trust
-it.
-
-Filtering
----------
-`is_aggregate` is a FLAG, never a deletion. `filter_aggregates` returns the
-filtered view and leaves the full table intact, because how much of a frame
-went into aggregates is a fact about the frame that the tracker should be
-able to read -- a movie whose flux is half aggregate is not a movie to report
-diffusion coefficients from without saying so.
+The linker uses position errors and optionally flux errors. Tables retain
+only marginal position errors, not the full joint-fit covariance.
+Aggregate flags preserve all rows; `filter_aggregates` returns a filtered
+table.
 """
 
 import numpy as np
 import polars as pl
 
-from . import aggregates
+from . import aggregates, psf
 from .results import REJECT_DTYPE
 
 LOCALIZATION_SCHEMA = {
@@ -72,6 +37,7 @@ LOCALIZATION_SCHEMA = {
     "flux": pl.Float64,       # ADU above offset, total, background-free
     "se_flux": pl.Float64,
     "flux_snr": pl.Float64,   # flux / se_flux
+    "peak": pl.Float64,       # ADU, on-centre model pixel value; read vs `bg`
     "bg": pl.Float64,         # ADU/px above offset, background surface here
     "sigma": pl.Float64,      # px, the in-focus PSF sigma the search ran at
     "fit_sigma": pl.Float64,  # px, this emitter's own fitted width
@@ -105,6 +71,7 @@ REJECT_SCHEMA = {
     "y_um": pl.Float64,
     "x_um": pl.Float64,
     "flux": pl.Float64,
+    "peak": pl.Float64,
     "fit_sigma": pl.Float64,
     "sigma_ratio": pl.Float64,
     "reason": pl.String,
@@ -135,12 +102,11 @@ def _sample_background(bmap, positions):
 
 def frame_tables(result, frame, t=0.0, pixel_size=1.0, agg_ratio=None,
                  seconds=float("nan"), loc_id0=0):
-    """One `Localizations` -> its (locs, frame_row, aggregates) tables.
+    """Return (localizations, frame summary, aggregates) as DataFrames.
 
-    `agg_ratio` is the over-bright cut as a multiple of THIS frame's median
-    detection; `None` uses `aggregates.AGG_AMP_RATIO`. Being relative to the
-    frame's own median is what lets one number serve a whole movie whose
-    illumination and bleaching drift -- see `aggregates.flag_aggregates`.
+    `agg_ratio` is the flux threshold relative to the frame's median detection;
+    None uses `aggregates.AGG_AMP_RATIO`. `pixel_size` is micrometres per pixel,
+    `t` is seconds, and `loc_id0` starts the consecutive localization IDs.
     """
     ratio = aggregates.AGG_AMP_RATIO if agg_ratio is None else float(agg_ratio)
     pos = np.asarray(result.positions, float).reshape(-1, 2)
@@ -165,6 +131,7 @@ def frame_tables(result, frame, t=0.0, pixel_size=1.0, agg_ratio=None,
             "flux_snr": np.divide(amp, se[:, 0],
                                   out=np.full(n, np.nan),
                                   where=np.isfinite(se[:, 0]) & (se[:, 0] > 0)),
+            "peak": np.asarray(result.peak, float),
             "bg": _sample_background(result.background, pos),
             "sigma": np.full(n, float(result.sigma)),
             "fit_sigma": np.asarray(result.fit_sigma, float),
@@ -222,6 +189,7 @@ def reject_table(result, frame, t=0.0, pixel_size=1.0):
             "y": rec["y"], "x": rec["x"],
             "y_um": rec["y"] * ps, "x_um": rec["x"] * ps,
             "flux": rec["flux"],
+            "peak": rec["flux"] * psf.peak_factor(rec["sigma"]),
             "fit_sigma": rec["sigma"],
             "sigma_ratio": rec["sigma_ratio"],
             "reason": rec["reason"],
@@ -238,21 +206,14 @@ def concat(parts):
 
 
 def filter_aggregates(locs, keep_flagged=False):
-    """The point-emitter localizations, with over-bright detections removed.
-
-    A view, not a mutation: `locs` still holds everything, which is what makes
-    `agg_flux_fraction` auditable afterwards.
-    """
+    """Return rows without aggregate flags, or all rows if `keep_flagged`."""
     return locs if keep_flagged else locs.filter(~pl.col("is_aggregate"))
 
 
 def link_input(locs, units="um"):
-    """The minimal columns a tracker needs, in one consistent unit system.
+    """Select loc_id, frame, t, y, x, se_y, se_x, flux and se_flux.
 
-    Returned as `loc_id, frame, t, y, x, se_y, se_x, flux, se_flux` with the
-    position columns in `units` ("um" or "px"). Kept deliberately narrow: a
-    linker that reads only these cannot accidentally come to depend on a
-    detector-internal column, so the two stay separable.
+    Positions and their errors use `units` ("um" or "px").
     """
     if units == "um":
         cols = [pl.col("y_um").alias("y"), pl.col("x_um").alias("x"),

@@ -55,8 +55,9 @@ def main(args):
     a = audit.audit_result(d_e, model, res.sigma)
     nr = (d_e - model) / np.sqrt(np.maximum(model, 1e-6))
 
+    counts = {key: value for key, value in res.info.items() if np.isscalar(value)}
     print(f"\nN={len(res.positions)}  dispersion={res.dispersion:.3f}  "
-          f"bg={np.median(res.background):.2f}  {dt:.3f}s  {res.info}")
+          f"bg={np.median(res.background):.2f}  {dt:.3f}s  {counts}")
     print(audit.format_report(a, label=args.image))
     if res.se is not None and len(res.se) and np.isfinite(res.se).any():
         sp = np.nanmedian(np.hypot(res.se[:, 1], res.se[:, 2]))

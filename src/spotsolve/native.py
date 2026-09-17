@@ -73,6 +73,9 @@ def _result(out, raw, kw, images):
     info.update(selection=kw["selection"], count_penalty=kw["count_penalty"])
     focus = cls == 0
     out_band = ~focus
+    fraction = info.pop("fisher_fraction")
+    info["fisher_fraction"] = fraction[focus]
+    info["reject_fisher_fraction"] = fraction[out_band]
     rejects = np.empty(int(out_band.sum()), dtype=REJECT_DTYPE)
     rejects["y"], rejects["x"] = pos[out_band, 0], pos[out_band, 1]
     rejects["flux"], rejects["sigma"] = amp[out_band], sig[out_band]
@@ -118,6 +121,12 @@ def localize(frame, sigma, *, offset=0.0, roi=None, k_max=K_MAX,
     BIC-inspired score, not calibrated evidence or a false-positive rate.
     `count_penalty` is a finite non-negative extra cost per emitter; it also
     adds to the 10-nat cost in fixed mode. Higher values favor fewer emitters.
+
+    `info['fisher_fraction']` is an (N, 4) array for `(flux, y, x, sigma)`.
+    Each entry is conditional/marginal Fisher variance: small values mean
+    strong coupling to other fitted parameters, not necessarily poor absolute
+    precision. NaN means covariance unavailable. The corresponding rejected
+    fits are in `info['reject_fisher_fraction']`. These are diagnostics only.
     """
     raw = np.ascontiguousarray(frame, dtype=float)
     if raw.ndim != 2:

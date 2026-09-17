@@ -28,17 +28,15 @@ use crate::statistics;
 /// Allowed fitted widths, as multiples of `sigma`. Wider-than-reportable
 /// sources remain in the model so their light does not become extra spots.
 pub const SLACK: (f64, f64) = (0.70, 2.2);
-/// Widths reported as detections, as multiples of `sigma`: the REPORTING
-/// BAND, a downstream contract about what the caller is handed. Its upper
-/// edge is how far out of focus an emitter may still be reported: a point
-/// source images at 1.26x the in-focus width at |z| = 0.25 um, 1.95x at 0.35
-/// and 3.2x at 0.50, so 2.0 is |z| < ~0.36 um.
+/// Reporting band for fitted widths, as multiples of `sigma`.
 pub const BAND: (f64, f64) = (0.80, 2.0);
 /// Most emitters one box fits jointly. `patches::K_MAX`.
 pub const K_MAX: usize = crate::patches::K_MAX;
 
 /// Base addition/removal cost in dispersion-scaled I-divergence for fixed
 /// selection. The actual cost is `(ADD_NATS + count_penalty) * phi`.
+/// Empirical complexity cost, not a Laplace Bayes factor: coincident mixture
+/// components violate the isolated-mode assumption. See docs/DETECTION.md.
 pub const ADD_NATS: f64 = 10.0;
 /// Maximum proposal distance from an owned candidate, in units of sigma.
 /// Ownership also excludes pixels closer to another group's candidate.
@@ -48,8 +46,7 @@ pub const SWEEPS: usize = 2;
 /// Search-fit objective tolerance, in nats.
 pub const FIT_TOL_OBJ: f64 = 1e-6;
 pub const FIT_MAX_ITER: usize = 100;
-/// Most sweeps of the polish; see `polish` for why the queue does not
-/// drain on its own.
+/// Maximum refinement sweeps; overlapping groups may keep moving.
 pub const POLISH_SWEEPS: usize = 4;
 /// Iteration budget per refinement fit; reaching it is not convergence.
 pub const POLISH_MAX_ITER: usize = 50;
@@ -75,18 +72,14 @@ pub const PEAK_Z: f64 = 2.75;
 /// at near-zero flux. This is a numerical guard, not a detection threshold.
 pub const A_MIN: f64 = 1e-4;
 pub const A_MIN_REL: f64 = 1e-6;
-/// sigma. An out-of-band fit this near the frame border is `Edge`, not a
-/// width flag. On beads_60x_still (in-focus beads on the coverslip, sigma0
-/// 1.0 px) the fits the border cut off sat 0-0.5 px from it; the two narrow
-/// interior fits sat 1.9 px and further in.
+/// Border distance in sigma within which out-of-band fits are `Edge`.
 pub const EDGE_MARGIN: f64 = 1.0;
 /// px. The window of [`noise_map`]'s two local medians, tied to the
 /// background's: both describe the frame at the scale haze varies on.
 pub const NOISE_WIN: usize = BG_KERNEL;
 /// Spacing of the exact median grid, in pixels; interpolate between nodes.
 pub const NOISE_STRIDE: usize = 12;
-/// ADU^2. Integer-valued camera data can not be less variable than its own
-/// quantization, `1/12`. Only a noise-free or constant image reaches it.
+/// Noise-variance floor, ADU², based on unit-step quantization variance.
 pub const NOISE_VAR_FLOOR: f64 = 1.0 / 12.0;
 /// Width-reporting tolerance in standard errors. An out-of-band width at
 /// the upper fitting bound is too wide, regardless of its uncertainty.
@@ -152,6 +145,10 @@ pub struct Output {
     pub se: Vec<f64>,
     /// `N`: SE of each fitted width, likewise.
     pub se_sig: Vec<f64>,
+    /// `4N`: conditional/marginal variance ratios for `(A, y, x, sigma)`:
+    /// `1 / (F_qq * (F^-1)_qq)`. Small values indicate parameter confounding.
+    /// From the last polish fit, NaN if its covariance is unavailable.
+    pub fisher_fraction: Vec<f64>,
     /// `N`: each emitter's [`Class`].
     pub class: Vec<Class>,
     /// The median of [`noise_map`]'s dispersion over the searched pixels:
@@ -207,12 +204,9 @@ pub fn percentile(v: &[f64], q: f64) -> f64 {
 /// The median of `a` (`h*w`) over the `win`-px square centred on each pixel,
 /// the array's edge clamped outward.
 ///
-/// Exact at the nodes of a grid [`NOISE_STRIDE`] apart and bilinear between
-/// them (see its note for why that is enough). The nodes are the rows and
-/// columns whose GLOBAL index `oy + r`, `ox + c` is a multiple of the stride,
-/// plus the array's own first and last: an ROI crop of the frame then shares
-/// every interior node with the whole frame, and only pixels within a stride
-/// of the crop's edge -- inside [`crop_margin`] -- can tell the difference.
+/// Evaluate at frame-aligned [`NOISE_STRIDE`] nodes and array endpoints,
+/// then interpolate bilinearly. `(oy, ox)` keeps ROI and full-frame interior
+/// nodes aligned; crop-boundary differences stay within [`crop_margin`].
 pub fn local_median(a: &[f64], h: usize, w: usize, win: usize, oy: usize, ox: usize) -> Vec<f64> {
     let nodes = |n: usize, o: usize| -> Vec<usize> {
         let mut v: Vec<usize> = (0..n).filter(|&i| i == 0 || i == n - 1 || (o + i) % NOISE_STRIDE == 0).collect();
@@ -366,11 +360,7 @@ fn median(v: &[f64]) -> f64 {
     }
 }
 
-/// The values `keep` selects, or `None` to mean "use the array itself".
-///
-/// `None` for no mask, and also for a mask that selects nothing: an empty
-/// selection is no statistic at all, and the whole array is a better answer
-/// than a panic.
+/// Selected values, or `None` to use the full array for an absent/empty mask.
 fn masked_values(v: &[f64], keep: Option<&[bool]>) -> Option<Vec<f64>> {
     let m = keep?;
     let sel: Vec<f64> = v.iter().zip(m).filter(|&(_, &k)| k).map(|(&x, _)| x).collect();
@@ -404,12 +394,8 @@ fn widen(lo: usize, hi: usize, want: usize, n: usize) -> (usize, usize) {
 /// bounding box plus [`crop_margin`], clamped to the frame. `None` when the
 /// ROI selects no pixel at all.
 ///
-/// Also at least `3 * BG_KERNEL` px on a side where the frame allows, because
-/// [`background_map`] narrows its kernel on an array too small to hold it
-/// (`BG_KERNEL.min(3.max(min(h, w) / 3))`). Without the floor a thin ROI
-/// would silently get a different background kernel from the one the frame
-/// would have used, which is exactly the margin's promise broken. It costs
-/// nothing in the ordinary case: the margin alone already gives 83 px.
+/// Keep sides at least `3 * BG_KERNEL` where possible so [`background_map`]
+/// uses the same kernel size as the full frame.
 fn roi_crop(roi: &[bool], h: usize, w: usize, sigma: f64) -> Option<patches::BBox> {
     let (mut y0, mut y1) = (usize::MAX, 0usize);
     let (mut x0, mut x1) = (usize::MAX, 0usize);
@@ -554,12 +540,9 @@ struct Noise {
 
 /// A window's pixels and the parameter-free part of its model.
 ///
-/// The background map enters split into a free `level` (its median here,
-/// where the fit's `b` starts) and a known `shape`, added like a frozen
-/// emitter. The split keeps `b` strictly interior: folding the whole surface
-/// into the known term would leave `b` wanting to be 0, its lower bound, and
-/// Coleman-Li collapses every coordinate's step when one parameter sits on a
-/// bound (see [`lmcl`]).
+/// Split the background map into a fitted `level`, initialized at its median,
+/// and a fixed `shape`. This avoids placing the fitted background at zero,
+/// where its lower bound restricts Coleman-Li steps.
 struct Window {
     y0: usize,
     x0: usize,
@@ -636,7 +619,7 @@ impl Window {
     }
 }
 
-/// One converged window fit: its data-only I and parameters, local coords.
+/// One window fit: data-only I-divergence and parameters in local coordinates.
 #[derive(Clone)]
 struct Fitted {
     i_div: f64,
@@ -644,15 +627,9 @@ struct Fitted {
     em: Vec<Em>,
 }
 
-/// One bounded free-width ML fit: bounds from the window's peak, the start
-/// pulled 1e-9 inside them.
-///
-/// `a_max` is raised by `slack.1^2`: it comes from the window's peak through
-/// `peak_factor(sigma)`, and a source `n` times the PSF width carries the
-/// same flux at `1/n^2` of the peak, so the in-focus bound would clip exactly
-/// the defocused emitters the slack exists for. Positions stay inside the
-/// window: letting a centre leave it was tried -- it lets the fit put rim
-/// flux where it came from -- and measurably lost real detections elsewhere.
+/// Bounded free-width ML fit, with a strictly interior starting point.
+/// Scale the peak-derived flux bound by `slack.1^2` to allow broad sources.
+/// Positions remain inside the window.
 fn fit_window(
     ws: &mut Workspace,
     win: &Window,
@@ -1089,11 +1066,7 @@ pub fn localize(
     let l2 = filters::log_kernel_l2(s.sigma);
     let mut search_fits = 0usize;
     let mut ems: Vec<Em> = Vec::new();
-    // The halo each box was last decided against. A box is a pure function of
-    // its pixels and its halo, so when a later sweep hands it the same halo
-    // bit for bit its answer cannot change and it is not re-decided. On GEM
-    // frames that is a box with no neighbour in reach, or whose neighbours'
-    // emitters all came back where they were.
+    // Skip a box when its fixed neighboring light has not changed.
     let mut seen: Vec<Option<Vec<Em>>> = vec![None; nb];
     for _ in 0..s.sweeps {
         for i in 0..nb {
@@ -1117,8 +1090,9 @@ pub fn localize(
     let mut amp: Vec<f64> = all.iter().map(|e| e[0]).collect();
     let mut sig: Vec<f64> = all.iter().map(|e| e[3]).collect();
     let mut se4 = vec![f64::NAN; 4 * n];
+    let mut fisher_fraction = vec![f64::NAN; 4 * n];
     let mut polish_fits = if s.polish && n > 0 {
-        polish(d, h, w, &bmap, &mut pos, &mut amp, &mut sig, &mut se4, s, ws)
+        polish(d, h, w, &bmap, &mut pos, &mut amp, &mut sig, &mut se4, &mut fisher_fraction, s, ws)
     } else {
         0
     };
@@ -1158,8 +1132,9 @@ pub fn localize(
         // Refresh parameters and uncertainty after selection. This is one
         // bounded selection pass, not a claim of a global fixed point.
         se4 = vec![f64::NAN; 4 * n];
+        fisher_fraction = vec![f64::NAN; 4 * n];
         if n > 0 {
-            polish_fits += polish(d, h, w, &bmap, &mut pos, &mut amp, &mut sig, &mut se4, s, ws);
+            polish_fits += polish(d, h, w, &bmap, &mut pos, &mut amp, &mut sig, &mut se4, &mut fisher_fraction, s, ws);
         }
     }
     // The Fisher matrix treated the ADU as Poisson counts, whose variance is
@@ -1181,6 +1156,7 @@ pub fn localize(
         sig,
         se,
         se_sig,
+        fisher_fraction,
         class,
         dispersion,
         background: bmap,
@@ -1206,6 +1182,7 @@ fn polish(
     amp: &mut Vec<f64>,
     sig: &mut Vec<f64>,
     se: &mut [f64],
+    fisher_fraction: &mut [f64],
     s: &Settings,
     ws: &mut Workspace,
 ) -> usize {
@@ -1253,20 +1230,16 @@ fn polish(
                 moved[i] = (opos[2 * i] - pos[2 * i]).hypot(opos[2 * i + 1] - pos[2 * i + 1])
                     > POLISH_MOVE_TOL;
             }
-            // SEs from the Fisher matrix of the fit whose parameters are
-            // reported. An indefinite matrix leaves the previous SEs.
+            // Use the undamped Fisher matrix at the returned parameters.
+            // A failed factorization must invalidate the previous fit's SEs.
             let pdim = 4 * p.indices.len() + 1;
             ws.chol.ensure(pdim);
+            var.clear();
+            var.resize(pdim, f64::NAN);
             if ws.chol.factor(ws.fit.fisher(pdim), pdim) {
-                var.resize(pdim, 0.0);
                 ws.chol.inv_diag(&mut var, &mut ws.scratch);
-                for (j, &i) in p.indices.iter().enumerate() {
-                    for c in 0..4 {
-                        let v = var[1 + 4 * j + c];
-                        se[4 * i as usize + c] = if v > 0.0 { v.sqrt() } else { f64::NAN };
-                    }
-                }
             }
+            store_uncertainties(ws.fit.fisher(pdim), &var, &p.indices, se, fisher_fraction);
         }
         *pos = opos;
         *amp = oamp;
@@ -1279,9 +1252,38 @@ fn polish(
     fits
 }
 
+/// Conditional variance is `1/F_qq`; marginal variance includes all fitted
+/// nuisance parameters, including background. Their ratio is dimensionless,
+/// invariant to parameter ordering and diagonal rescaling, and costs O(p)
+/// once the inverse diagonal needed for SEs is available. It measures local
+/// confounding, not absolute precision or the probability an emitter is real.
+fn store_uncertainties(
+    fisher: &[f64],
+    var: &[f64],
+    indices: &[u32],
+    se: &mut [f64],
+    fraction: &mut [f64],
+) {
+    let p = var.len();
+    for (j, &i) in indices.iter().enumerate() {
+        for c in 0..4 {
+            let q = 1 + 4 * j + c;
+            let dst = 4 * i as usize + c;
+            let (v, f) = (var[q], fisher[q * p + q]);
+            se[dst] = if v.is_finite() && v > 0.0 { v.sqrt() } else { f64::NAN };
+            fraction[dst] = if v.is_finite() && v > 0.0 && f.is_finite() && f > 0.0 {
+                // Sequential division avoids overflow in F_qq * var_q.
+                // The exact ratio is <= 1; clip roundoff at that endpoint.
+                (1.0 / f / v).clamp(0.0, 1.0)
+            } else {
+                f64::NAN
+            };
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
-/// Localize one raw frame, `d = raw - offset` in ADU. No gain and no read
-/// noise: [`noise_map`] measures what they would have said.
+/// Localize one raw frame using `d = raw - offset` in ADU and measured noise.
 pub fn localize_raw(
     raw: &[f64],
     h: usize,
@@ -1430,6 +1432,66 @@ mod tests {
             filters::log_kernel_l2(s.sigma),
         );
         assert!(em.is_empty());
+    }
+
+    #[test]
+    fn fisher_fraction_measures_coupling_independently_of_units_and_order() {
+        // Two emitter fluxes correlated through the information matrix;
+        // everything else is independent. Each flux retains 1-rho^2 of its
+        // conditional information after the other flux is allowed to vary.
+        let p = 9;
+        let rho = 0.99;
+        for order in [[0u32, 1], [1, 0]] {
+            for scale in [[1.0; 9], [0.01, 1e-3, 2.0, 3.0, 4.0, 1e3, 5.0, 6.0, 7.0]] {
+                let mut f = vec![0.0; p * p];
+                for q in 0..p { f[q * p + q] = scale[q] * scale[q]; }
+                f[p + 5] = rho * scale[1] * scale[5];
+                f[5 * p + 1] = f[p + 5];
+                let mut chol = Chol::new(p);
+                assert!(chol.factor(&f, p));
+                let mut var = vec![0.0; p];
+                chol.inv_diag(&mut var, &mut Vec::new());
+                let mut se = vec![f64::NAN; 12];
+                let mut fraction = se.clone();
+                store_uncertainties(&f, &var, &order, &mut se, &mut fraction);
+                for i in 0..2 {
+                    assert!((fraction[4 * i] - (1.0 - rho * rho)).abs() < 1e-12);
+                    for c in 1..4 { assert!((fraction[4 * i + c] - 1.0).abs() < 1e-12); }
+                }
+                assert!(fraction[8..].iter().all(|v| v.is_nan()));
+                // A later failed covariance must replace, not inherit, these
+                // finite uncertainties. Unvisited emitters are left alone.
+                var.fill(f64::NAN);
+                store_uncertainties(&f, &var, &[1, 2], &mut se, &mut fraction);
+                assert!(se[..4].iter().all(|v| v.is_finite()));
+                assert!(se[4..].iter().chain(&fraction[4..]).all(|v| v.is_nan()));
+            }
+        }
+    }
+
+    #[test]
+    fn failed_polish_covariance_clears_old_uncertainties() {
+        let (h, w) = (17, 17);
+        let mut pos = vec![8.0, 8.0, 8.0, 8.0];
+        let mut amp = vec![600.0; 2];
+        let mut sig = vec![1.2; 2];
+        let theta = psf::pack_var(20.0, &amp, &[8.0, 8.0], &[8.0, 8.0], &sig);
+        let mut data = vec![0.0; h * w];
+        psf::model_var_sigma_ax(
+            &theta, &psf::local_axis(h), &psf::local_axis(w), None,
+            &mut psf::Factors::new(h, w, 2), &mut data,
+        );
+        let s = Settings {
+            sigma: 1.2, k_max: 4, threshold: PEAK_Z,
+            selection: Selection::Fixed, count_penalty: 0.0,
+            slack: SLACK, sweeps: SWEEPS, polish: true, band: None,
+        };
+        let mut se = vec![42.0; 8];
+        let mut fraction = vec![0.5; 8];
+        polish(&data, h, w, &vec![20.0; h * w], &mut pos, &mut amp, &mut sig,
+               &mut se, &mut fraction, &s, &mut Workspace::new());
+        // Coincident, identical emitters have duplicate Jacobian columns.
+        assert!(se.iter().chain(&fraction).all(|v| v.is_nan()));
     }
 
     #[test]

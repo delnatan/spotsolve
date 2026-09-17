@@ -39,7 +39,8 @@ def test_bic_stack_and_roi_preserve_the_frame_result():
             np.testing.assert_array_equal(res.amplitudes, single.amplitudes)
             np.testing.assert_array_equal(res.se, single.se)
             np.testing.assert_array_equal(res.model_image, single.model_image)
-            assert res.info == single.info
+            for key in res.info:
+                np.testing.assert_equal(res.info[key], single.info[key])
 
 
 def test_bic_score_keeps_camera_scale_invariance():

@@ -18,9 +18,7 @@ use crate::psf;
 
 /// Fraction of each bound's own range kept as a margin.
 ///
-/// **Relative**, because the ranges are not comparable: a position is bounded
-/// over ~20 px and an amplitude over ~1e4 electrons, so one absolute epsilon
-/// would be a completely different constraint for each [P1].
+/// A relative margin accommodates different position and flux scales.
 const INTERIOR_FRAC: f64 = 1e-10;
 
 /// Box constraints, with the interiority margin precomputed.
@@ -153,7 +151,7 @@ pub struct FitInfo {
     pub stalled: bool,
 }
 
-/// Tuning. The defaults are the retired `lmga.fit`'s.
+/// Optimizer settings.
 #[derive(Clone, Copy, Debug)]
 pub struct FitOpts {
     pub max_iter: usize,
@@ -283,9 +281,7 @@ impl FitWorkspace {
 
     /// The objective's gradient at the returned parameters.
     ///
-    /// Interior components are zero to the stationarity tolerance, so what
-    /// this is actually read for is the components at an active bound -- the
-    /// KKT multipliers.
+    /// At active bounds, components give the KKT multipliers.
     pub fn gradient(&self, p: usize) -> &[f64] {
         &self.grad[..p]
     }
@@ -374,9 +370,7 @@ pub fn fit_var_sigma(
         // scalar `lam` in front of the second changes as the inner loop grows
         // it. Built once here rather than per lambda trial [P5].
         //
-        // NOTE the two are written differently on purpose: `|g|/(s*s)` and
-        // `(1/s)^2`. Those are not the same float, and the Python computes them
-        // exactly this way [P2].
+        // Preserve `|g|/(s*s)` and `(1/s)^2` evaluation order for parity [P2].
         for q in 0..p {
             let s = ws.s[q];
             ws.jac_of_v[q] = ws.grad[q].abs() / (s * s);
@@ -517,10 +511,7 @@ fn quadratic_decrease(grad: &[f64], fisher: &[f64], delta: &[f64]) -> f64 {
 fn fisher(ws: &mut FitWorkspace, p: usize, n: usize, clip: bool) {
     // `W` multiplies the SECOND factor, matching `J.T @ (W[:,None] * J)`.
     //
-    // `clip` is loop-invariant, so it is tested once rather than `p*n` times;
-    // that leaves the inner loop a bare divide. `eval` has already floored `m`
-    // at the same 1e-9, so the clipped form is a no-op on a post-`eval` model
-    // and is kept only because `fisher` is also called on a raw `m` [P3].
+    // Branch outside the inner loops. `eval` already floors the model at 1e-9.
     if clip {
         for q in 0..p {
             for i in 0..n {

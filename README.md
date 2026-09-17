@@ -56,6 +56,7 @@ All return `Localizations` (one per frame for stacks):
 |---|---|
 | `positions` | `(N, 2)` coordinates `(y, x)` in pixels; centers are integers |
 | `amplitudes` | `(N,)` total Gaussian flux above the offset |
+| `peak` | `(N,)` model signal above background for a pixel centered on the emitter |
 | `se` | `(N, 3)` standard errors of `(flux, y, x)` |
 | `fit_sigma`, `sigma_se` | Fitted width and its standard error, in pixels |
 | `sigma_ratio` | `fit_sigma / sigma` |
@@ -69,6 +70,24 @@ Flux and background use ADU above `offset`; divide flux by camera gain for
 photoelectrons. The multi-emitter PSF is pixel-integrated. Aguet uses a sampled
 Gaussian and reports continuous flux `2*pi*peak*sigma_fit**2`, including
 amplitude-width covariance in its flux uncertainty.
+
+`peak` is derived from flux and fitted width. It helps compare a spot with
+the image background, but varies with width and can exceed the brightest
+observed pixel when the emitter lies between pixels. Localization and reject
+tables include `peak`; linking and aggregate flags use total flux.
+
+Multi-emitter uncertainties use the final, undamped expected Fisher matrix,
+scaled by local dispersion. If covariance cannot be computed, errors are NaN.
+`locs.info["fisher_fraction"]` contains one row per detection and columns
+`(flux, y, x, sigma)`: values near zero indicate strong coupling to other
+fitted parameters; 1 means no coupling. This diagnostic is independent of
+parameter units and does not change count selection. Rejected fits have a
+matching `info["reject_fisher_fraction"]` array. See
+[curvature and uncertainty](docs/DETECTION.md#curvature-and-uncertainty).
+
+The detectors' fitted widths differ slightly by convention: pixel integration
+adds `1/12` pixel² to the profile variance, so Aguet's sampled-Gaussian width
+is typically larger. See [PSF conventions](docs/AGUET_BASELINE.md#reference-and-method).
 
 ## Detection controls
 
@@ -169,10 +188,11 @@ python -m pytest -q
 cargo test --release --workspace --manifest-path rust/Cargo.toml
 ```
 
-The 2026-09-17 verification passed **69 Python and 45 Rust tests**. Cleanup
-and shared threading preserved every returned field in 134 dense-detector
-regression cases. Aguet is checked against frozen original `spotfitlm` fits,
-including covariance, masks and worker-count consistency.
+The 2026-09-17 verification passed **75 Python and 47 Rust tests**, including
+singular-covariance handling, Fisher diagnostics and peak output. Existing
+fit, uncertainty, classification and background arrays were unchanged in six
+simulation frames covering fixed and BIC selection. Aguet is checked against
+frozen original `spotfitlm` fits, including covariance, masks and worker counts.
 
 [Documentation index](docs/README.md) · [Source map and validation](docs/README.md#implementation)
 · [Historical experiments](docs/archive/README.md)

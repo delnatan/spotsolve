@@ -1,24 +1,12 @@
 //! Small dense symmetric-positive-definite linear algebra, f64.
 //!
-//! Everything in the hot path is a few dozen parameters square, and nothing
-//! in a fit needs the heap once the workspace is built [P13]. One [`Chol`]
-//! serves the LM step ([`Chol::solve_in_place`]) and the reported standard
-//! errors ([`Chol::inv_diag`]).
-//!
-//! # Which triangle
-//!
-//! `F = J^T W J` is symmetric only to within rounding: `F_ij` and `F_ji` are
-//! separate reductions with different summation orders and can differ by an
-//! ulp, so *which triangle you factorize changes the answer* [P3]. Rather than
-//! pick one and hope every caller agrees, [`Chol::factor`] symmetrizes on entry
-//! (`F <- (F + F^T)/2`) and then factorizes the **lower** triangle. At `n <= 37`
-//! that costs ~600 flops and removes a whole class of "why did this change".
+//! [`Chol`] reuses storage for LM steps and inverse-diagonal estimates.
+//! Inputs are symmetrized as `(A + A^T)/2` before lower-triangle factorization
+//! so rounding differences between triangles do not affect the choice.
 
 /// A Cholesky factorization `A = L L^T`, with reusable storage.
 ///
-/// Allocated once per fit and re-factorized in place: the LM inner loop
-/// factorizes a ~25x25 matrix on the order of 700k times per frame, so this
-/// must not allocate [P6].
+/// Call [`Chol::ensure`] before fitting; factorization does not allocate.
 pub struct Chol {
     n: usize,
     /// Lower-triangular `L`, row-major `n x n`. Entries above the diagonal are
@@ -38,9 +26,8 @@ impl Chol {
 
     /// Factorize the symmetric part of `a` (row-major `n x n`), in place.
     ///
-    /// Returns `false` if `a` is not positive definite or is not finite, in
-    /// which case no other method may be called. Callers must treat that as
-    /// "this model is ill-posed", never as evidence for anything.
+    /// Returns `false` for non-positive-definite or non-finite input.
+    /// Solve and inverse methods require a successful factorization.
     pub fn factor(&mut self, a: &[f64], n: usize) -> bool {
         debug_assert_eq!(a.len(), n * n);
         assert!(
@@ -92,10 +79,7 @@ impl Chol {
 
     /// Grow so that an `n x n` factorization fits. A no-op when it already does.
     ///
-    /// [`Chol::factor`] asserts rather than reallocating, because a
-    /// reallocation inside a comparison is a latency cliff in the middle of a
-    /// decision. Callers whose `n` is data-dependent -- a group transaction's
-    /// `4*K+1` -- call this once when the context is built.
+    /// Call before [`Chol::factor`], which asserts capacity instead of growing.
     pub fn ensure(&mut self, n: usize) {
         if self.l.len() < n * n {
             self.l = vec![0.0; n * n];
@@ -134,8 +118,7 @@ impl Chol {
     /// the triangular factor is enough and the full inverse is never formed.
     /// `scratch` is resized to `n*n` and used for `L^-1`.
     ///
-    /// This is off the LM inner loop: it is read only for the polish's
-    /// reported standard errors, once per fit.
+    /// Used for final uncertainties, outside the LM inner loop.
     pub fn inv_diag(&self, out: &mut [f64], scratch: &mut Vec<f64>) {
         debug_assert!(self.ok);
         let n = self.n;
@@ -166,10 +149,7 @@ impl Chol {
 
     /// Solve `A x = b` with `b` overwritten in place.
     ///
-    /// The LM inner loop solves for the step ~700k times per frame; going
-    /// through [`Chol::solve`] would need a separate right-hand side buffer,
-    /// and materializing one per trial is the allocation [P6] exists to
-    /// forbid.
+    /// Reuses the LM step buffer without allocating a second right-hand side.
     pub fn solve_in_place(&self, v: &mut [f64]) {
         let n = self.n;
         for i in 0..n {

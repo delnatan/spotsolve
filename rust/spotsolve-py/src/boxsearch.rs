@@ -100,6 +100,7 @@ fn give<'py>(py: Python<'py>, o: bs::Output, h: usize, w: usize) -> PyResult<Fra
     info.set_item("search_fits", o.search_fits)?;
     info.set_item("polish_fits", o.polish_fits)?;
     info.set_item("selection_fits", o.selection_fits)?;
+    info.set_item("fisher_fraction", o.fisher_fraction.into_pyarray(py).reshape([n, 4])?)?;
     let class: Vec<u8> = o.class.iter().map(|&c| c as u8).collect();
     Ok((
         o.pos.into_pyarray(py).reshape([n, 2])?.unbind(),

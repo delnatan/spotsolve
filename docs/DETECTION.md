@@ -63,6 +63,61 @@ width avoids explaining them as several narrow sources. Bright aggregates
 with ordinary width need a separate brightness flag (`flag_aggregates`);
 width alone does not identify them.
 
+## Curvature and uncertainty
+
+The fixed 10-nat cost is an empirical complexity penalty. A Fisher
+log-determinant alone is not Bayesian evidence: its value depends on parameter
+units, and a Bayes factor also requires specified, normalized priors. When
+two mixture components coincide, the model is non-identifiable and the usual
+isolated quadratic-mode Laplace approximation fails. This is a general
+[singular-model limitation](https://www.jmlr.org/papers/v14/watanabe13a.html),
+also relevant to interpreting the experimental BIC score.
+
+The optimizer factors a **damped** Fisher matrix to choose steps. Uncertainties
+use a separate factorization of the **undamped** expected information
+`F = J.T @ diag(1/m) @ J` at the returned parameters, including fitted
+background. Reported variances are multiplied by local dispersion. If that
+factorization fails, uncertainties become NaN; they cannot be carried over
+from a previous fit. No diagonal jitter hides this failure.
+
+`result.info['fisher_fraction']` has shape `(N, 4)`, aligned with detections,
+in `(flux, y, x, sigma)` order. For each parameter `q` it reports
+
+```text
+fraction[q] = 1 / (F[q,q] * inverse(F)[q,q])
+           = conditional variance / marginal variance
+```
+
+This is reciprocal variance inflation in the local quadratic model: 1 means
+no coupling to other fitted parameters; values near zero mean strong
+confounding. It is invariant to diagonal changes of parameter units,
+parameter ordering and a common dispersion scale. It reuses the inverse
+diagonal already needed for SEs. `info['reject_fisher_fraction']` aligns with
+`rejects`; both arrays are NaN where covariance is unavailable, including
+when native refinement is disabled. Neither array changes selection or
+reporting. Read it alongside SEs: a weak isolated source can be imprecise
+without strong confounding, and a bright crowded source can have both small
+SEs and a small fraction. Frozen neighbors and estimated background shape
+are treated as known, so this is not a full uncertainty budget.
+
+The 2026-09-17 working note supports retaining expected Fisher information
+and the fixed penalty, but its scratch simulations were not supplied and its
+numerical comparisons are not reproduced here. Several qualifications matter:
+
+- Raw condition numbers and Cholesky pivots depend on units; a large value
+  alone does not establish failure of Laplace. Coincident components provide
+  the structural reason. Adding a flat prior's normalization does not cure a
+  singular local Gaussian approximation, and a flat prior has no interior
+  curvature. A fixed penalty is not generally equivalent to a Bayes factor.
+- Expected Fisher information is positive semidefinite, not guaranteed
+  invertible. The observed Hessian also must be positive semidefinite at an
+  exact interior minimum; an indefinite result calls for checking convergence,
+  bounds and numerical differentiation. Neither curvature gives reliable
+  asymptotic coverage automatically at low signal or active bounds.
+- Here `I` is half the conventional Poisson deviance; count comparisons use
+  changes in `I/phi`. Comparisons of noisy SE estimates do not by themselves
+  establish which covariance gives better tracking decisions.
+
 ## ROI and calibration
 
 A boolean ROI restricts the search; sources may fit outside it. Process its

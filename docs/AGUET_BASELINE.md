@@ -37,6 +37,14 @@ Amplitude/width filters remain optional downstream choices. Overlapping sources
 can bias independent fits. The Poisson uncertainty retains the reference's
 noise assumptions: offset subtraction does not correct gain or read noise.
 
+Fitted widths are not directly interchangeable with the multi-emitter
+detector's pixel-integrated widths. Integrating a Gaussian over unit pixels
+convolves it with a unit-width box, adding `1/12` pixel² to the continuous
+profile variance. A sampled-Gaussian fit therefore typically gives
+`sigma_sampled ≈ sqrt(sigma_integrated² + 1/12)` (about 2% larger at sigma
+1.45). This is a moment-based approximation, not an exact fit correction:
+finite windows, background, subpixel position and noise can affect the fit.
+
 ## Screening simplification
 
 For kernel pixel count `n`, significance `alpha`, and amplitude entry `C00`
