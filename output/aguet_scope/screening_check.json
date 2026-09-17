@@ -1,0 +1,62 @@
+{
+  "reference_revision": "e0f4036de786ac3a14c15c5a353e60231fc030a6",
+  "scope": "Screening only; not a complete detector or fitter",
+  "seed": 1542,
+  "shape": [
+    128,
+    128
+  ],
+  "cases": 99,
+  "pixels": 1622016,
+  "rows": [
+    {
+      "sigma": 0.8,
+      "alpha": 0.01,
+      "pixel_decision_differences": 0
+    },
+    {
+      "sigma": 0.8,
+      "alpha": 0.05,
+      "pixel_decision_differences": 0
+    },
+    {
+      "sigma": 0.8,
+      "alpha": 0.1,
+      "pixel_decision_differences": 0
+    },
+    {
+      "sigma": 1.45,
+      "alpha": 0.01,
+      "pixel_decision_differences": 0
+    },
+    {
+      "sigma": 1.45,
+      "alpha": 0.05,
+      "pixel_decision_differences": 0
+    },
+    {
+      "sigma": 1.45,
+      "alpha": 0.1,
+      "pixel_decision_differences": 0
+    },
+    {
+      "sigma": 2.4,
+      "alpha": 0.01,
+      "pixel_decision_differences": 0
+    },
+    {
+      "sigma": 2.4,
+      "alpha": 0.05,
+      "pixel_decision_differences": 0
+    },
+    {
+      "sigma": 2.4,
+      "alpha": 0.1,
+      "pixel_decision_differences": 0
+    }
+  ],
+  "seconds": {
+    "reference": 0.006403334002243355,
+    "prototype": 0.00028816700069000944
+  }
+}

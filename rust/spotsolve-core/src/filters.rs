@@ -1,37 +1,10 @@
-//! Separable image filters, matching `scipy.ndimage` exactly.
+//! Separable image filters with SciPy-compatible kernels and boundaries.
 //!
-//! Four calls in the pipeline sit on top of one scaffold: a 1-D pass along
-//! each axis, with a boundary rule. `find_candidates` needs
-//! `gaussian_laplace` and `maximum_filter`; `placement` needs
-//! `gaussian_laplace`; `background_map` needs `uniform_filter` and
-//! `gaussian_filter`.
-//!
-//! | call | site | kernel / reducer | mode |
-//! |---|---|---|---|
-//! | [`gaussian_laplace`] | FIND, BIRTH | Gaussian order 2, summed over axes | reflect / nearest |
-//! | [`maximum_filter`] | FIND | sliding max | reflect |
-//! | [`uniform_filter`] | background | box | nearest |
-//! | [`gaussian_filter`] | background | Gaussian order 0 | nearest |
-//!
-//! # The one convention that must not be "fixed"
-//!
-//! [`gaussian_kernel1d`] normalizes the **order-0** kernel to sum 1 and only
-//! then applies the derivative recurrence. A truncated order-2 kernel
-//! therefore does **not** sum to zero -- at `sigma = 0.6, radius = 2` it sums
-//! to `-6.5e-2`. That looks like a bug and is not: re-normalizing it rescales
-//! the entire LoG response, which is then compared against a *fixed* threshold
-//! of 1.5, and the candidate list changes. `tests/fixtures/07_filters.json` pins the
-//! kernels as impulse responses precisely so this cannot drift.
-//!
-//! # Why matching scipy bit-for-bit is not required here
-//!
-//! It is required of the *kernels*, and the fixture asserts them to 1e-12. It
-//! is not required of the filtered image, because of what consumes it: on a
-//! 512x512 frame the weakest accepted candidate scores 1.5515 against a
-//! threshold of 1.5 and the strongest rejected scores 1.4948, a margin of
-//! 5.7e-2, and no accepted candidate has an exact tie in its max-filter
-//! window. The candidate list has about eleven orders of magnitude of slack
-//! over the difference any correct summation order could produce.
+//! Gaussian derivatives are formed from the normalized order-zero kernel.
+//! A truncated second derivative need not sum to zero; changing that
+//! normalization would change the detector response. Golden fixtures pin
+//! the kernels and filtered images. Historical timing and threshold notes
+//! are in `docs/archive/DETECTOR_DESIGN_NOTES.md`.
 
 /// How a filter reads outside the array. `scipy.ndimage`'s names.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -135,7 +108,7 @@ pub fn gaussian_kernel1d(sigma: f64, order: usize, radius: usize) -> Vec<f64> {
 /// which is what this is. The distinction is invisible for the symmetric
 /// order-0 and order-2 kernels and flips the sign of the antisymmetric
 /// order-1 one, so the fixture carries an order-1 case to hold it down.
-fn convolve1d(
+pub(crate) fn convolve1d(
     src: &[f64],
     dst: &mut [f64],
     h: usize,

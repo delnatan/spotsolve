@@ -1,100 +1,67 @@
-# Development documentation
+# Documentation
 
-## The detector
+Start with the [README](../README.md) for installation, detector choice,
+API examples and linking.
 
-One detector: the box search. `spotsolve.localize` / `localize_stack`
-(`src/spotsolve/native.py`) call `rust/spotsolve-core/src/boxsearch.rs`
-through `rust/spotsolve-py/src/boxsearch.rs`; the whole frame -- gain, FIND,
-background, search, polish, classification -- runs in Rust, and the
-defaults are the Rust constants. Results are `spotsolve.Localizations`.
-`spotsolve.calibrate_sigma` measures the in-focus PSF width on top of it.
+| Guide | Contents |
+|---|---|
+| [Multi-emitter detection](DETECTION.md) | Image/noise model, fixed-cost search, widths, masks and earlier validation |
+| [Experimental BIC selection](COUNT_SELECTION.md) | Count score, forward/backward search, error budgets and threading measurements |
+| [Aguet / spotfitlm baseline](AGUET_BASELINE.md) | Sparse screening/fitting, reference parity, uncertainties and speed |
+| [Tracking](TRACKING.md) | Motion model, assignment, parameters, benchmarks and limits |
+| [Archive](archive/README.md) | Retired designs and historical experiments |
 
-`boxsearch.rs` is also the record of every design measurement, each beside
-the constant or function it set: the decision rule (`ADD_NATS`),
-ownership, sweeps, the fit tolerances, the read-noise model, the background
-surface, the seed rate, and the arms measured and rejected (a plane per
-box, a width prior, a fixed-width mode, a wider model space). The fitter's
-own measurements are in `lmcl.rs`, the patch radii's in `patches.rs`.
+## Implementation
 
-Tests: `cargo test --workspace` in `rust/` checks each layer against the
-golden fixtures in `tests/fixtures/`, and `pytest` checks the detector
-against `simulate` truth (`tests/test_localize.py`) and the fitter against
-`psf`'s analytic Jacobian. The fixtures are FROZEN: the Python reference
-that wrote them is retired (below).
+Python wraps native results as `Localizations`. Both stack APIs use
+`rust/spotsolve-core/src/frames.rs` for independent, ordered frame processing
+with reusable worker storage. There is no nested thread pool.
 
-Parity and speed when the port landed (2026-09-11):
+| Component | Python | Rust core |
+|---|---|---|
+| Multi-emitter detection | `src/spotsolve/native.py` | `boxsearch.rs`, `lmcl.rs`, `patches.rs` |
+| Aguet baseline | `src/spotsolve/aguet.py` | `aguet.rs` |
+| Shared filters/algebra | Native bindings | `filters.rs`, `linalg.rs` |
+| Sigma calibration | `src/spotsolve/calibration.py` | Uses multi-emitter detection |
+| Tables and results | `src/spotsolve/loctable.py`, `results.py` | — |
+| Tracking | `src/spotsolve/tracking.py` | `track.rs`, `lap.rs`, `trackparams.rs` |
 
-| | Python reference | native, 1 thread | native stack, 10 threads |
-|---|---|---|---|
-| glycerol f0, 256², 489 emitters | 815 ms | 107 ms | 24 ms/frame |
-| GEM f0, 256², 440 emitters | 1042 ms | 104 ms | 24 ms/frame |
+Core files live under `rust/spotsolve-core/src`; bindings are in
+`rust/spotsolve-py/src`. Rust retains current algorithm rules and numerical
+invariants. Long benchmark commentary moved to
+[detector design history](archive/DETECTOR_DESIGN_NOTES.md); halo collection
+and frame scheduling are shared, while sparse and joint fitting remain
+separate because their models differ.
 
-Identical recall, precision and inventions on all ten referee cells
-(64x64 `simulate`, flat and hazy), identical counts and search-fit counts on
-both real frames. About 87% of native time is inside the fits themselves.
+## Verification
 
-## The linker
+After rebuilding the release extension:
 
-`spotsolve.link` / `fit_link_params` (`src/spotsolve/tracking.py`) read the
-`loctable` localization table and return it with a `track_id` column added.
-The work is `rust/spotsolve-core/src/track.rs` (the per-track filter bank
-over a D grid, the union gate, the score, the frame loop), `lap.rs` (an
-exact sparse assignment by shortest augmenting paths, over gated pairs only)
-and `trackparams.rs` (the link-free initializer and the damped soft-EM
-refinement), bound in `rust/spotsolve-py/src/track.rs`. Pixels and frames
-throughout.
+```sh
+python -m pytest -q
+cargo test --release --workspace --manifest-path rust/Cargo.toml
+```
 
-Ported from [tracksolve](https://github.com/delnatan/tracksolve)
-(`mode="lap"`), which stays the Python reference and holds the parts not
-ported: gap closing, multiple-hypothesis deferral, mobility classification
-and link posteriors. Two deliberate departures, both recorded in the Rust:
+The 2026-09-17 run passed **69 Python and 45 Rust tests**. Cleanup and scheduler
+sharing left all output fields unchanged in 134 regression cases: 49 real
+frames in both count-selection modes, plus three seeds in six simulation
+conditions in both modes.
 
-- The gate reads the INFLATED CRLB. tracksolve's `gate.accept` sees the raw
-  `se^2` while its filter sees `se^2 * se_inflate`, so above an inflation of
-  1 its gate is tighter than its own model and the miss-rate bound does not
-  hold. The fixture was generated with that fixed on the Python side too.
-- The clutter intensity `lam_fa` and the "stop if evidence fell" rule are
-  absent. `lam_fa` cancels algebraically out of every linking decision, and
-  the rule fired in 0 of 27 fits (and cannot fire honestly in this mode,
-  since every detection lands in some track).
+Fixtures under `tests/fixtures` are frozen. Most came from the retired Python
+reference. `08_track.json` comes from `tracksolve`; `09_aguet.json` pins the
+original `spotfitlm` revision and source hashes. Its generator,
+`scripts/make_aguet_fixture.py`, remains available for audit, not routine
+regeneration to accommodate a failing test. Aguet checks cover candidate
+selection, 18 reference fits and full covariance, numerical derivatives,
+mask context, thread determinism, output conversion and failures.
 
-Parity and speed when the port landed (2026-09-11), on
-`data/hyp7gem_wt_crop.tif`, 49 frames and 21,438 detections, each side
-fitting its own parameters: **100% of links identical**, every fitted
-parameter identical to the digits printed, the parameter fit 13.03 s -> 0.13 s
-and one linking 2.17 s -> 0.03 s. `tests/fixtures/08_track.json` (three
-simulated movies at step/nearest-neighbour 0.11, 0.31 and 0.53) is checked
-detection-for-detection by `rust/spotsolve-core/tests/layer6_track.rs`; it is
-FROZEN, and was written by a generator that is not part of the repository,
-like every other fixture here. `tests/test_tracking.py` holds the Python
-boundary and an accuracy floor against simulated truth.
+Benchmark runners:
 
-## Retired on 2026-09-11
+- `scripts/benchmark_count_selection.py`: simulated recall/unmatched-count curves.
+- `scripts/benchmark_detector_speed.py`: real-stack timing and output fingerprints.
+- `scripts/benchmark_aguet.py`: original `spotfitlm` comparison; requires its
+  sibling checkout and a C compiler, neither needed at runtime.
 
-The Python reference implementation (`src/spotsolve/deprecated/`: `box`,
-`core`, `lmga`, `backend`, `patches`, `calibrate`, `structs`), the scripts
-that generated the fixtures from it (`make_fixtures.py`) and the tests that
-held the port to it. At retirement the two agreed exactly on the referee
-cells, the real frames and the gain estimate; its measurement notes were
-moved into the Rust. To prototype an algorithm change in Python again,
-restore it from commit `ea6b17f`.
-
-The sparse localizer (`localize_sparse`, `sparse.rs`): on sparse fields it
-was no faster than the box search (3.2 vs 2.8 ms/frame at 0.002 px^-2),
-recalled .57-.79 against .96-.99, and its fitted sigma read 1.27 / 1.18 /
-1.10 for a true 1.30 as density rose -- undetected neighbours in its 10 px
-windows. The fixed-width fitter only it used went with it.
-
-The Bayes-factor `detect` pipeline (`core.detect`, `passes.rs`,
-`dense_group.rs`, `evidence`, `prior`, `moves`) and the calibrated
-PSF-bank inference stack (`spotsolve.inference`, `affine`/`inference`/
-`geometry`/`uncertainty`/`search.rs`) were removed in favour of the box
-search. Their code, plans (`DENSE_DETECT.md`, `RUST_GROUP_SEARCH_PLAN.md`,
-`FOCUSED_EMITTER_PROPOSAL.md`, `INFERENCE_CONTRACT.md`) and results are in
-the git history before that date; notes in the Rust that say "measured
-under the retired `detect`" refer to it.
-
-[Historical plans and experiment results](archive/README.md) are retained as
-documentation, not executable code or active instructions.
-`archive/PORTING_NOTES.md` holds the implementation practices the Rust code
-cites as `[Pn]`.
+`scripts/localize_movie.py` exports multi-emitter results and accepts
+`--selection`, `--count-penalty` and `--threads`. Aguet is currently exposed
+through its Python API, not that script.

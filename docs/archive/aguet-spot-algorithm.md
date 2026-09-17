@@ -1,5 +1,10 @@
 # Statistical Foundations of Sub-Pixel Spot Detection
 
+Historical conceptual sketch, not an implementation specification. In
+particular, its zero-amplitude t-test is not the amplitude-versus-residual-noise
+test in `spotfitlm`. See the current [Aguet baseline](../AGUET_BASELINE.md)
+for the implemented method, reference code and compatibility limits.
+
 **Based on the method by Aguet et al.**
 
 This document outlines the theoretical framework for detecting diffraction-limited spots in fluorescence microscopy images. It details why simple intensity thresholding fails and derives the rigorous statistical test (Student's t-test) used to identify "significant" signals.

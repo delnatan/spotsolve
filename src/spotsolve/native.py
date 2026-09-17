@@ -1,44 +1,20 @@
-"""The detector: one frame, or a whole timecourse in parallel.
+"""Multi-emitter localization of one frame or a parallel frame stack.
 
-`localize` and `localize_stack` run the box search in Rust
-(`spotsolve_core::boxsearch`) with the GIL released: the noise map, FIND, the
-background surface, the search in each box, the polish and the
-classification of every fit.
+The Rust box search measures local noise/background, proposes LoG peaks,
+selects emitter counts, refines joint fits and classifies fitted widths.
+`selection="fixed"` uses a 10-nat cost plus `count_penalty`; `"bic"` compares
+count models. Frames are independent, each with its own workspace.
 
-There is no camera calibration to pass. The frame stays in ADU above
-`offset`, and the noise every decision is scaled by -- gain, read noise and
-haze alike -- is measured from the frame itself (`boxsearch::noise_map`). This module only arranges the
-arrays into `Localizations`. Its defaults are the Rust constants, read from
-the extension, so there is no second copy of them here.
+Input stays in ADU above `offset`; local dispersion scales fit comparisons
+and uncertainties. An ROI restricts search and crops work while retaining
+context. Fits may lie outside it. Background reference levels use masked
+pixels, so masked results can differ from filtering an unmasked result.
+Use one mask rather than separate tile calls, which can duplicate sources.
 
-In each box an emitter exists iff it lowers the box's Poisson deviance by
-`spotsolve_rs.BOX_ADD_NATS` nats, in units of the box's own dispersion. The reasoning and measurement behind every
-constant sit beside it in `rust/spotsolve-core/src/boxsearch.rs`.
-
-Frames of a timecourse are independent, so `localize_stack` hands them to a
-pool of native threads, each with its own workspace.
-
-An `roi` confines the SEARCH, not the answer: a source just outside it
-whose light crosses into it is fitted where it actually is. So pass one ROI
-covering everything wanted, in one call. Tiling a frame into separate ROI
-calls double-reports sources at the seams (measured: about 1.6 per frame at
-one seam through a 64x64 frame) and loses recall there, because neither
-tile's boxes see the other's emitters. One call never double-reports.
-
-An `roi` also confines the WORK. FIND, the background surface and the level
-they are measured against run on the ROI's bounding box plus a 41 px margin,
-not on the frame, which is what a masked call used to waste: a 32x32 ROI on
-a 512x512 frame went from 25.4 ms to 3.4 ms. The margin is wide enough that
-nothing inside the ROI can tell, so this costs no accuracy; an ROI whose
-bounding box is the whole frame (scattered cells, a diagonal band) simply
-buys nothing.
-
-One thing it does change: the flat level FIND works against, and the
-background's fallback, are measured over the ROI's pixels rather than the
-frame's. Under a cell mask the frame's own 10th percentile is the dark field
-OUTSIDE the cell -- 11.1 e- against 18-20 inside it on `hyp7gem_wt_crop` --
-so this is the level the mask asked for. It moves N by up to 5% against
-earlier versions on masked calls. Unmasked calls are unchanged, bit for bit.
+This module converts native output to `Localizations`. Defaults come from
+the Rust extension. Current methods and measurements are in docs/DETECTION.md
+and docs/COUNT_SELECTION.md; historical notes are in
+docs/archive/DETECTOR_DESIGN_NOTES.md.
 """
 
 import os
@@ -81,9 +57,11 @@ def _roi(roi, shape):
     return roi
 
 
-def _kw(sigma, offset, roi, shape, k_max, threshold, slack, band):
+def _kw(sigma, offset, roi, shape, k_max, threshold, slack, band,
+        selection, count_penalty):
     return dict(sigma=float(sigma), offset=float(offset), roi=_roi(roi, shape),
                 k_max=int(k_max), threshold=threshold,
+                selection=selection, count_penalty=float(count_penalty),
                 slack=tuple(map(float, slack)),
                 band=None if band is None else tuple(map(float, band)))
 
@@ -92,6 +70,7 @@ def _result(out, raw, kw, images):
     pos, amp, sig, se, sig_se, cls, bmap, info = out
     dispersion = info.pop("dispersion")
     sigma = kw["sigma"]
+    info.update(selection=kw["selection"], count_penalty=kw["count_penalty"])
     focus = cls == 0
     out_band = ~focus
     rejects = np.empty(int(out_band.sum()), dtype=REJECT_DTYPE)
@@ -111,7 +90,8 @@ def _result(out, raw, kw, images):
 
 
 def localize(frame, sigma, *, offset=0.0, roi=None, k_max=K_MAX,
-             threshold=None, slack=SLACK, band=BAND, images=True):
+             threshold=None, slack=SLACK, band=BAND, images=True,
+             selection="fixed", count_penalty=0.0):
     """Localize one frame. Returns `Localizations`.
 
     `frame` is in camera units (ADU) and `offset` is the camera's offset,
@@ -125,34 +105,45 @@ def localize(frame, sigma, *, offset=0.0, roi=None, k_max=K_MAX,
     `threshold` (default `PEAK_Z`) is the one cut on the LoG statistic, in
     sds of the local noise: a peak must clear it to get a box, and a residual
     peak inside a box must clear it before one more emitter is tried there.
-    Every emitter tried still has to pay `ADD_NATS`. Lower it for dim data,
-    raise it for fewer false positives and speed; the measured trade sits
-    beside the Rust constant. `images=False` skips `model_image` and
+    The selected count rule then decides which fits to keep. Lower the
+    threshold for dim data, raise it for fewer false positives and speed;
+    the measured tradeoff is documented in docs/DETECTION.md. `images=False` skips `model_image` and
     `residual`.
+
+    `selection="fixed"` keeps the existing greedy 10-nat rule.
+    `selection="bic"` compares background-only and multiple emitter counts
+    using I/phi + K*(2*log(n_pixels) + count_penalty), with all four emitter
+    parameters free. It follows forward and backward fit paths, then makes
+    one removal comparison pass after refinement. This is an experimental
+    BIC-inspired score, not calibrated evidence or a false-positive rate.
+    `count_penalty` is a finite non-negative extra cost per emitter; it also
+    adds to the 10-nat cost in fixed mode. Higher values favor fewer emitters.
     """
     raw = np.ascontiguousarray(frame, dtype=float)
     if raw.ndim != 2:
         raise ValueError(f"expected a 2-D frame, got shape {raw.shape}")
-    kw = _kw(sigma, offset, roi, raw.shape, k_max, threshold, slack, band)
+    kw = _kw(sigma, offset, roi, raw.shape, k_max, threshold, slack, band,
+             selection, count_penalty)
     return _result(_rs.box_localize(raw, **kw), raw, kw, images)
 
 
 def localize_stack(stack, sigma, *, offset=0.0, roi=None, k_max=K_MAX,
                    threshold=None, slack=SLACK, band=BAND, n_threads=None,
-                   images=False):
+                   images=False, selection="fixed", count_penalty=0.0):
     """Localize every frame of a `(T, H, W)` stack, in parallel.
 
     Returns one `Localizations` per frame, in frame order, each what
     `localize` returns for that frame; each frame's noise is its own.
     `n_threads` defaults to the machine's cores. `images` defaults to False
     here: for a long timecourse the model and residual are two more copies of
-    the movie.
+    the movie. `selection` and `count_penalty` have the same meaning as
+    in `localize`.
     """
     raw = np.ascontiguousarray(stack, dtype=float)
     if raw.ndim != 3:
         raise ValueError(f"expected a (T, H, W) stack, got shape {raw.shape}")
     kw = _kw(sigma, offset, roi, raw.shape[1:], k_max, threshold, slack,
-             band)
+             band, selection, count_penalty)
     outs = _rs.box_localize_stack(
         raw, **kw, n_threads=int(n_threads or os.cpu_count() or 1))
     return [_result(o, raw[t], kw, images) for t, o in enumerate(outs)]

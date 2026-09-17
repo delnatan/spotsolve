@@ -5,6 +5,7 @@ decision real data forces: separating point emitters from aggregates.
 
     python localize_movie.py                    # first 10 frames of hyp7gem
     python localize_movie.py --frames 0 49 --out hyp7_all
+    python localize_movie.py --selection bic --count-penalty 2 --threads 5
 
 Detection is strictly per frame -- nothing here uses the previous frame's
 answer, so the output is an honest input for a tracker rather than something
@@ -71,7 +72,10 @@ def main(args):
     t0 = time.time()
     results = spotsolve.localize_stack(stack, sigma=args.sigma,
                                        offset=CAMERA_OFFSET,
-                                       k_max=args.k_max)
+                                       k_max=args.k_max,
+                                       selection=args.selection,
+                                       count_penalty=args.count_penalty,
+                                       n_threads=args.threads)
     dt = (time.time() - t0) / len(stack)
     print(f"  {len(stack)} frames in {dt * len(stack):.2f} s "
           f"({1 / dt:.1f} frames/s)")
@@ -150,6 +154,9 @@ def main(args):
         "camera_offset_adu": CAMERA_OFFSET,
         "pixel_size_um": args.pixel_size, "frame_interval_s": args.interval,
         "k_max": args.k_max,
+        "selection": args.selection,
+        "count_penalty": args.count_penalty,
+        "threads": args.threads,
         "agg_ratio": args.agg_ratio if args.agg_ratio is not None
         else spotsolve.AGG_AMP_RATIO,
         "flux_units": "ADU above offset", "position_units": "px (y, x)",
@@ -172,6 +179,11 @@ if __name__ == "__main__":
     ap.add_argument("--interval", type=float, default=DEFAULT_INTERVAL,
                     help="seconds per frame")
     ap.add_argument("--k-max", type=int, default=spotsolve.K_MAX)
+    ap.add_argument("--selection", choices=("fixed", "bic"), default="fixed")
+    ap.add_argument("--count-penalty", type=float, default=0.0,
+                    help="extra cost per emitter (default: 0)")
+    ap.add_argument("--threads", type=int, default=None,
+                    help="parallel frame workers (default: machine's cores)")
     ap.add_argument("--agg-ratio", type=float, default=None,
                     help=f"over-bright cut, flux / the frame's median "
                          f"detection (default {spotsolve.AGG_AMP_RATIO:.0f})")

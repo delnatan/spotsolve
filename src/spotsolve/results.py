@@ -36,28 +36,33 @@ class Localizations:
     positions: np.ndarray
     """(N, 2) float `(y, x)`."""
     amplitudes: np.ndarray
-    """(N,) total flux, ADU above the offset."""
+    """(N,) total flux, ADU above the offset. Aguet converts sampled-Gaussian
+    peak amplitude to continuous flux, 2*pi*peak*fit_sigma**2."""
     se: np.ndarray
-    """(N, 3) standard errors of `(flux, y, x)`, from the Fisher information of
-    the fit that produced them scaled by the local dispersion; NaN where it
-    was singular."""
+    """(N, 3) standard errors of `(flux, y, x)`. Multi-emitter fits use Fisher
+    information scaled by local dispersion; Aguet uses the observed Hessian
+    and includes amplitude-width covariance in flux uncertainty."""
     fit_sigma: np.ndarray
     """(N,) each emitter's own fitted width, px."""
     sigma_se: np.ndarray
     """(N,) standard error of `fit_sigma`, px."""
     rejects: np.ndarray
-    """Fits outside the reporting band, as `REJECT_DTYPE` rows."""
+    """Fits outside the reporting band, as `REJECT_DTYPE` rows. Empty for Aguet;
+    its failed fits are recorded in `info['failures']`."""
     background: np.ndarray
-    """(H, W) background surface, ADU per pixel above the offset."""
+    """(H, W) background, ADU per pixel above the offset. Aguet returns the
+    diagnostic screening estimate, with NaNs outside the processed crop."""
     sigma: float
     """The in-focus PSF width the search was run at, px."""
     dispersion: float
     """The frame's measured pixel variance per unit of signal, ADU: about the
-    camera gain plus `gain^2 * read_noise^2 / background`."""
+    camera gain plus `gain^2 * read_noise^2 / background`. Unavailable (NaN)
+    for the Aguet baseline."""
     info: dict = field(default_factory=dict)
-    """Work done: candidates, boxes, search and polish fits."""
+    """Method-specific work counts, settings and fit diagnostics."""
     model_image: np.ndarray = None
-    """(H, W) background plus every fitted emitter, when requested."""
+    """(H, W) diagnostic model when requested. Multi-emitter rendering includes
+    width-rejected fits; Aguet renders accepted fits on its screening background."""
     residual: np.ndarray = None
     """(H, W) data minus offset minus `model_image`, ADU, when requested."""
 

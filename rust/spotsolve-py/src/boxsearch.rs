@@ -25,6 +25,8 @@ fn settings(
     sigma: f64,
     k_max: usize,
     threshold: Option<f64>,
+    selection: &str,
+    count_penalty: f64,
     slack: (f64, f64),
     sweeps: usize,
     polish: bool,
@@ -43,10 +45,20 @@ fn settings(
     if !threshold.is_finite() {
         return Err(PyValueError::new_err("`threshold` must be finite"));
     }
+    let selection = match selection {
+        "fixed" => bs::Selection::Fixed,
+        "bic" => bs::Selection::Bic,
+        _ => return Err(PyValueError::new_err("`selection` must be 'fixed' or 'bic'")),
+    };
+    if !count_penalty.is_finite() || count_penalty < 0.0 {
+        return Err(PyValueError::new_err("`count_penalty` must be finite and non-negative"));
+    }
     Ok(bs::Settings {
         sigma,
         k_max,
         threshold,
+        selection,
+        count_penalty,
         slack,
         sweeps,
         polish,
@@ -87,6 +99,7 @@ fn give<'py>(py: Python<'py>, o: bs::Output, h: usize, w: usize) -> PyResult<Fra
     info.set_item("boxes", o.n_boxes)?;
     info.set_item("search_fits", o.search_fits)?;
     info.set_item("polish_fits", o.polish_fits)?;
+    info.set_item("selection_fits", o.selection_fits)?;
     let class: Vec<u8> = o.class.iter().map(|&c| c as u8).collect();
     Ok((
         o.pos.into_pyarray(py).reshape([n, 2])?.unbind(),
@@ -103,7 +116,7 @@ fn give<'py>(py: Python<'py>, o: bs::Output, h: usize, w: usize) -> PyResult<Fra
 /// Localize one raw frame. Everything is in ADU above `offset`; the noise is
 /// measured from the frame.
 #[pyfunction]
-#[pyo3(signature = (raw, sigma, offset=0.0, *, roi=None, k_max=bs::K_MAX, threshold=None, slack=bs::SLACK, band=Some(bs::BAND), sweeps=bs::SWEEPS, polish=true))]
+#[pyo3(signature = (raw, sigma, offset=0.0, *, roi=None, k_max=bs::K_MAX, threshold=None, selection="fixed", count_penalty=0.0, slack=bs::SLACK, band=Some(bs::BAND), sweeps=bs::SWEEPS, polish=true))]
 #[allow(clippy::too_many_arguments)]
 fn box_localize<'py>(
     py: Python<'py>,
@@ -113,6 +126,8 @@ fn box_localize<'py>(
     roi: Option<PyReadonlyArray2<'_, bool>>,
     k_max: usize,
     threshold: Option<f64>,
+    selection: &str,
+    count_penalty: f64,
     slack: (f64, f64),
     band: Option<(f64, f64)>,
     sweeps: usize,
@@ -128,7 +143,7 @@ fn box_localize<'py>(
     }
     check_offset(offset)?;
     let roi = roi_slice(&roi, h, w)?.map(|m| m.to_vec());
-    let s = settings(sigma, k_max, threshold, slack, sweeps, polish, band)?;
+    let s = settings(sigma, k_max, threshold, selection, count_penalty, slack, sweeps, polish, band)?;
     let o = py.detach(|| {
         let (mut ws, mut d) = (bs::Workspace::new(), Vec::new());
         bs::localize_raw(&r, h, w, offset, roi.as_deref(), &s, &mut ws, &mut d)
@@ -140,7 +155,7 @@ fn box_localize<'py>(
 /// each frame exactly as `box_localize` would. Returns one tuple per frame,
 /// in frame order.
 #[pyfunction]
-#[pyo3(signature = (raw, sigma, offset=0.0, *, roi=None, k_max=bs::K_MAX, threshold=None, slack=bs::SLACK, band=Some(bs::BAND), sweeps=bs::SWEEPS, polish=true, n_threads=1))]
+#[pyo3(signature = (raw, sigma, offset=0.0, *, roi=None, k_max=bs::K_MAX, threshold=None, selection="fixed", count_penalty=0.0, slack=bs::SLACK, band=Some(bs::BAND), sweeps=bs::SWEEPS, polish=true, n_threads=1))]
 #[allow(clippy::too_many_arguments)]
 fn box_localize_stack<'py>(
     py: Python<'py>,
@@ -150,6 +165,8 @@ fn box_localize_stack<'py>(
     roi: Option<PyReadonlyArray2<'_, bool>>,
     k_max: usize,
     threshold: Option<f64>,
+    selection: &str,
+    count_penalty: f64,
     slack: (f64, f64),
     band: Option<(f64, f64)>,
     sweeps: usize,
@@ -166,7 +183,7 @@ fn box_localize_stack<'py>(
     }
     check_offset(offset)?;
     let roi = roi_slice(&roi, h, w)?.map(|m| m.to_vec());
-    let s = settings(sigma, k_max, threshold, slack, sweeps, polish, band)?;
+    let s = settings(sigma, k_max, threshold, selection, count_penalty, slack, sweeps, polish, band)?;
     let r = r.to_vec();
     let outs = py.detach(|| {
         bs::localize_stack(&r, n, h, w, offset, roi.as_deref(), &s, n_threads.max(1))

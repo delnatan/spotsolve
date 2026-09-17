@@ -1,48 +1,17 @@
-//! Bounded Levenberg-Marquardt with Coleman-Li affine scaling.
+//! Bounded Levenberg-Marquardt with Coleman-Li scaling.
 //!
-//! Ported from the retired Python reference's `lmga.py` (last present in
-//! `ea6b17f`). **The name differs deliberately**: `lmga` meant "LM with
-//! geodesic acceleration", and the geodesic acceleration was implemented,
-//! measured and removed long ago -- it changed the converged objective by under
-//! 1e-13 on ordinary fits while costing 133 model/Jacobian evaluations per fit
-//! instead of 18. What actually distinguishes this optimizer is the Coleman-Li
-//! affine scaling, so it is named for that. The `02_lmga` fixture keeps its
-//! name; it is the same code.
+//! Minimize Poisson I-divergence:
+//! `I(d, m) = sum(d * log(d/m) - (d - m))`, with `0 * log(0) = 0`.
+//! The step uses gradient `J^T ((m-d)/m)` and expected Fisher information
+//! `J^T diag(1/m) J`; this is Fisher scoring, not the observed Hessian.
 //!
-//! # Objective
+//! Parameters stay strictly inside their bounds because Coleman-Li scaling
+//! divides by distance to a bound. `Interior` enforces this invariant.
+//! Accept steps using the predicted decrease of the actual feasible step;
+//! certify convergence with the information-scaled projected gradient.
 //!
-//! The Poisson I-divergence
-//!
-//! ```text
-//! I(d, m) = sum_i [ d_i*log(d_i/m_i) - (d_i - m_i) ]      (0*log(0) := 0)
-//! ```
-//!
-//! minimized by Fisher scoring: `W = diag(1/m)` is held fixed within an
-//! iteration, so `F = J^T W J` is the *expected* Fisher information -- exact
-//! for Poisson's canonical link, where Fisher scoring coincides with IRLS.
-//!
-//! # Strict interiority is a precondition, not a preference
-//!
-//! Coleman-Li divides by `v_i`, the distance from parameter `i` to the bound
-//! its step is heading toward. A parameter resting exactly *on* a bound sets
-//! `v_i = 0`, and the damage is not local to it: a fraction-to-boundary rule
-//! that computes one scalar step scale from `min_i (bound_i - theta_i)/delta_i`
-//! lets a single stuck coordinate collapse the step for **every** coordinate
-//! (which is why [`scale_into_box`] now limits each coordinate alone). The
-//! step then buys ~1e-11 nats, its gain ratio reads ~2e-8 -- which measures the
-//! clipping, not the quadratic model -- so it is rejected, lambda ratchets up,
-//! and the fit burns its whole budget on micro-steps.
-//!
-//! Measured on a 39x39 frame before this was fixed in the Python: 68.6% of LM
-//! iterations began with a parameter on a bound, 46.5% of inner trials were
-//! scaled to the 1e-8 floor, and 73.2% of all fits exhausted `max_iter`.
-//! Removing the clip made the frame solve 2.5x faster *and* made the emitter
-//! count reproducible.
-//!
-//! The Python documented this invariant in its module docstring and violated it
-//! in its body for months. Here [`Interior`] makes the broken state
-//! unrepresentable: there is no way to obtain one that is not strictly inside
-//! its box, and no `&mut [f64]` escapes [P1].
+//! Historical benchmarks are in `docs/archive/DETECTOR_DESIGN_NOTES.md`;
+//! floating-point port contracts are in `docs/archive/PORTING_NOTES.md`.
 
 use crate::linalg::Chol;
 use crate::psf;
@@ -100,11 +69,8 @@ impl Bounds {
     }
 }
 
-/// A parameter vector guaranteed strictly inside its box.
-///
-/// The constructors are the only way in and every one of them pulls the value
-/// inside, so the optimizer cannot express the state that broke it [P1].
-/// Deliberately exposes no mutable slice.
+/// A parameter vector kept strictly inside its bounds. Constructors enforce
+/// this invariant, and no mutable slice is exposed.
 #[derive(Clone)]
 pub struct Interior(Vec<f64>);
 
@@ -120,10 +86,7 @@ impl Interior {
         )
     }
 
-    /// `self <- interior(base + delta)`. The only way to advance an iterate.
-    ///
-    /// NOT a clamp onto the bounds: clamping parks a parameter exactly on one,
-    /// which is precisely the state this type exists to prevent.
+    /// `self <- interior(base + delta)`, preserving the margin to each bound.
     pub fn set_step(&mut self, base: &Interior, delta: &[f64], b: &Bounds) {
         debug_assert_eq!(delta.len(), b.len());
         self.0.clear();
@@ -136,10 +99,7 @@ impl Interior {
         );
     }
 
-    /// `self <- interior(theta)`, reusing this vector's allocation.
-    ///
-    /// `fit` is called on the order of 700k times per frame, so even a
-    /// once-per-fit allocation is worth not making [P6].
+    /// `self <- interior(theta)`, reusing the allocation.
     pub fn set_from(&mut self, theta: &[f64], b: &Bounds) {
         assert_eq!(theta.len(), b.len());
         self.0.clear();
@@ -187,7 +147,7 @@ pub struct FitInfo {
     /// Poisson I-divergence at the solution, in nats.
     pub i_div: f64,
     pub n_iter: usize,
-    /// The gradient or the objective genuinely converged. NOT merely "stopped".
+    /// The information-scaled projected gradient meets the stopping tolerance.
     pub converged: bool,
     /// Lambda saturated without an improving step. Distinct from `converged`.
     pub stalled: bool,
@@ -197,15 +157,8 @@ pub struct FitInfo {
 #[derive(Clone, Copy, Debug)]
 pub struct FitOpts {
     pub max_iter: usize,
-    /// Objective resolution, **in nats**: a fit has converged when its
-    /// information-scaled projected score is <= sqrt(2*tol_obj).
-    ///
-    /// The only test in units the caller cares about: decisions compare
-    /// I-divergences, so "this fit cannot improve I by more than `tol_obj`"
-    /// is a statement about the decision, not the parameterization. Before
-    /// it existed, with only the absolute `tol_grad` and a step test, 34.5% of
-    /// the 9400 patch fits on a bead-matched 39x39 field exhausted
-    /// `max_iter = 100` and only 62.7% reported convergence.
+    /// Objective tolerance in nats. Convergence requires the information-scaled
+    /// projected score to be <= max(tol_grad, sqrt(2 * tol_obj)).
     pub tol_obj: f64,
     /// Backstop only -- absolute, and the natural scale here is set by fluxes
     /// running to ~2000 electrons, so this is near f64 noise.
@@ -224,17 +177,8 @@ impl Default for FitOpts {
     }
 }
 
-/// Everything one fit needs, allocated once and borrowed for the duration.
-///
-/// The Python's LM inner loop allocates two dense `p x p` matrices per lambda
-/// trial -- whose off-diagonals are known to be zero -- purely to write
-/// `F + diag(u) + lam*diag(v)`, and there are ~700k such trials per frame [P6].
-/// It also re-derives the separable pixel axes and the I-divergence's data-only
-/// terms on every one of the ~160 model evaluations a fit makes [P5]. All of
-/// that lives here instead.
-///
-/// `ensure` grows the buffers on demand, so after the first few patches of a
-/// run `fit` allocates nothing at all.
+/// Reusable fit buffers. `ensure` grows storage as needed; iterations do
+/// not allocate after the workspace reaches the required size.
 pub struct FitWorkspace {
     factors: psf::Factors,
     ay: Vec<f64>,
@@ -324,7 +268,7 @@ impl FitWorkspace {
         }
     }
 
-    /// The fitted parameters. Valid after [`fit`].
+    /// The fitted parameters. Valid after [`fit_var_sigma`].
     pub fn theta(&self) -> &[f64] {
         self.theta.as_slice()
     }
@@ -359,27 +303,13 @@ fn grow(v: &mut Vec<f64>, n: usize) {
     }
 }
 
-/// Fit a variable-sigma theta `[b, A0, y0, x0, sigma0, ...]` on a `h x w`
-/// patch by bounded Fisher-scoring LM: the Poisson maximum likelihood.
+/// Fit `[background, amplitude, y, x, sigma, ...]` on a row-major patch.
+/// `halo` adds fixed neighboring light and background shape. Data and model
+/// must use the same units (the detector uses ADU above the offset).
+/// Results remain in [`FitWorkspace::theta`] and [`FitWorkspace::fisher`].
 ///
-/// `d` is the patch data in photoelectrons, row-major. `halo` is the
-/// parameter-free additive contribution (frozen neighbours plus the
-/// background's shape term), or `None`. Results are left in the workspace:
-/// [`FitWorkspace::theta`] and [`FitWorkspace::fisher`].
-///
-/// Each step is assessed on the actual feasible quadratic step, and
-/// convergence is certified by an information-scaled projected gradient. The
-/// trajectory intentionally need not follow the Python reference's.
-///
-/// # Why `max_iter` must not be cut for speed
-///
-/// Truncating iterations does *not* add symmetric noise. A proposal fit starts
-/// further from its optimum than the incumbent it is compared against, so
-/// truncation systematically leaves the proposal's objective too high and
-/// biases model selection toward the smaller model -- it under-credits exactly
-/// the moves that add an emitter. Measured: capping at 40 iterations still left
-/// 21% of fits more than 0.1 nat above their optimum, with a p99 gap of 72
-/// nats. Make each iteration cheaper instead.
+/// Do not shorten fits to accelerate model selection: proposed models often
+/// start farther from their optimum, so truncation can favor fewer emitters.
 pub fn fit_var_sigma(
     ws: &mut FitWorkspace,
     theta0: &[f64],
@@ -457,19 +387,9 @@ pub fn fit_var_sigma(
         let mut step_accepted = false;
 
         for _ in 0..30 {
-            // Coleman-Li form:
-            //   (F + diag(|grad|/s^2) + lam*diag(1/s^2)) delta = -grad
-            //
-            // The scaled-space system is (D F D + diag(|grad|) + lam I) shat =
-            // -D grad with D = diag(s), s = sqrt(v). Mapping back to the
-            // unscaled step delta = D shat sends BOTH extra diagonals through
-            // D^-1 (.) D^-1, so both pick up 1/s^2 -- not 1/s for one of them.
-            // The mismatched version under-damps every parameter approaching a
-            // bound (at v = 0.01 it applies 10|g| where the correct term is
-            // 100|g|). Over 200 randomized 1-3 emitter fits the consistent form
-            // reached a lower converged I 6 times to 1 with 193 ties, better by
-            // 3.5 nats on average -- large on the scale a Bayes factor is
-            // decided on -- in 10.9 iterations against 20.4.
+            // Coleman-Li system:
+            // (F + diag(|grad|/s^2) + lambda*diag(1/s^2)) delta = -grad.
+            // Both diagonal terms use s^2; using s for either under-damps bound steps.
             ws.a[..p * p].copy_from_slice(&ws.f[..p * p]);
             for q in 0..p {
                 // Two separate adds, in this order, so the summation is
@@ -501,16 +421,9 @@ pub fn fit_var_sigma(
             let i_trial = idiv(ws, d, n, true);
 
             let actual_dec = i_cur - i_trial;
-            // LM gain ratio: how much of the promised improvement was real.
-            // lambda MUST be driven by this and not by the sign of the
-            // improvement alone. Accepting any decrease and halving lambda for
-            // it lets lambda collapse to its floor while the quadratic model is
-            // worthless, and then nothing damps the near-null directions of F.
-            // Traced on a real patch (K=7, one emitter at the amplitude floor
-            // so cond(F) = 1.5e20): every iteration predicted 5.2e4 nats,
-            // delivered 1.05e-3, halved lambda anyway, and took the identical
-            // 2.3e-5 step again -- 3000+ iterations, finishing 364 nats above
-            // the optimum.
+            // Gain ratio: actual / predicted decrease of the feasible step.
+            // Using only the sign of the improvement can accept tiny steps along
+            // poorly constrained directions and drive damping to its floor.
             let rho = if pred_dec > 0.0 {
                 actual_dec / pred_dec
             } else {
@@ -599,19 +512,8 @@ fn quadratic_decrease(grad: &[f64], fisher: &[f64], delta: &[f64]) -> f64 {
     -linear - 0.5 * quadratic
 }
 
-/// `F = J^T W J` with `W = diag(1/m)`, into `ws.f`.
-///
-/// Only the upper triangle is computed and then mirrored. `F` is symmetric by
-/// construction, and computing both halves independently is not merely wasted
-/// work: it produces `F_ij != F_ji` in the last ulp, because the two are
-/// separate reductions over different orders. That is the whole reason [P3]
-/// exists. Mirroring makes the matrix exactly symmetric, so
-/// `Chol::factor`'s symmetrization becomes a no-op and the question of which
-/// triangle gets read cannot arise at all.
-///
-/// This is the dominant arithmetic in the fit: `p^2 * n` per outer iteration
-/// against `p*n` for everything else. The Python reaches it through BLAS
-/// `dgemm`, so it is the one place the port does NOT start ahead.
+/// Compute `F = J^T diag(1/m) J`. Mirror the upper triangle so the result
+/// is exactly symmetric despite floating-point rounding.
 fn fisher(ws: &mut FitWorkspace, p: usize, n: usize, clip: bool) {
     // `W` multiplies the SECOND factor, matching `J.T @ (W[:,None] * J)`.
     //
@@ -632,33 +534,9 @@ fn fisher(ws: &mut FitWorkspace, p: usize, n: usize, clip: bool) {
             }
         }
     }
-    // Four columns of `wj` per pass over `c1`.
-    //
-    // **This does not reassociate anything** [P2]. Each `s*` accumulates one
-    // output element over `i` in the same increasing order the scalar loop
-    // used, so every individual sum is bit-identical; what changes is only how
-    // many *different* sums are in flight. A lone dot product is bound by the
-    // ~3-cycle latency of the dependent `FADD`, not by throughput, so it
-    // retires one add per three cycles however wide the machine is. Several
-    // independent chains fill those slots with useful work.
-    //
-    // Measured on frame 0 of `beads_80pct-glycerol_crop.tif` (1141 emitters,
-    // 14k window fits), median of 9 runs, interleaved builds, `positions /
-    // amplitudes / se` SHA equal for every arm:
-    //
-    // ```text
-    //   scalar    2.844 s  2.888 s
-    //   width 2   2.531 s
-    //   width 4   2.541 s  2.568 s     <- 11.2% under scalar
-    //   width 8   2.637 s
-    // ```
-    //
-    // 2 and 4 tie; 8 regresses, because `p` is 5 at the median (`K = 1`) and
-    // only reaches 37, so a width-8 block almost never fills and the work
-    // falls through to the scalar tail with the wider prologue already paid.
-    // 4 is kept over 2 for the larger windows, where it has the longer runs to
-    // amortize. This buys nothing on its own if `p` is small -- see §4: at
-    // these sizes the ranking is not the FLOP count.
+    // Accumulate four independent matrix entries per pass. Each entry keeps
+    // its original pixel summation order; do not reassociate or fuse operations.
+    // This hides addition latency without changing the numerical result.
     let (j, wj, f) = (&ws.j, &ws.wj, &mut ws.f);
     for q1 in 0..p {
         let c1 = &j[q1 * n..q1 * n + n];
@@ -767,35 +645,9 @@ fn coleman_li_scale(theta: &Interior, grad: &[f64], b: &Bounds, s: &mut [f64]) {
     }
 }
 
-/// Keep `theta + delta` inside the box, one coordinate at a time: a
-/// coordinate whose step would cross a bound moves 0.995 of the way to it,
-/// and every other coordinate keeps its step.
-///
-/// It used to shrink the WHOLE step by one scalar -- the same collapse the
-/// module note describes for a parameter on its bound, one level milder: a
-/// width creeping toward `SLACK.1` held every other parameter to its creep.
-/// Measured 2026-09-14 on 10 GEM frames (256x256), 77k fits: 22% ended with
-/// a width at a bound, averaging 53 iterations against 10 for an interior
-/// single emitter, and they were 9030 of the 10168 fits that exhausted
-/// `max_iter` -- about 56% of all iterations. Per coordinate, on 200 noisy
-/// 13x13 fits of each kind (identical data and starts):
-///
-/// ```text
-/// case                      old: maxed out   dI new - old   new iterations
-/// wide single (3.6 px)          97/200        -0.17 nats         12.1
-/// wide + point emitter         129/200        -0.41 nats         12.0
-/// in-band single, narrow         0/200         0 (identical)   5.5, 7.5
-/// ```
-///
-/// Never a worse optimum, and in the detector 26% faster (127 -> 94 ms per
-/// 128x128 GEM frame; fits exhausting `max_iter` 10168 -> 297 on the 256x256
-/// frames). Because a truncated fit under-credits the larger model (see
-/// [`fit_var_sigma`]), converging them moves decisions: on the GEM spike-in
-/// referee false positives went 20 -> 22 per frame and 300 e- recall
-/// .74/.71/.60 -> .77/.73/.61, N 225 -> 233.
-///
-/// The step stays strictly interior, and the gain ratio is taken on this
-/// feasible step, not on the Newton step it came from.
+/// If a step crosses a bound, move that coordinate 99.5% of the way there.
+/// A single coordinate near a bound must not shrink every other coordinate.
+/// `Interior::set_step` applies the final strict-interiority margin.
 fn scale_into_box(theta: &Interior, delta: &mut [f64], b: &Bounds) {
     let t = theta.as_slice();
     for i in 0..delta.len() {

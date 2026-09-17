@@ -1,0 +1,18 @@
+{
+  "image": "/Users/delnatan/Projects/github/spotsolve/data/hyp7gem_wt_01_crop_128x128.tif",
+  "frames": [
+    0,
+    5
+  ],
+  "sigma_px": 1.45,
+  "camera_offset_adu": 100.0,
+  "pixel_size_um": 0.065,
+  "frame_interval_s": 0.020005,
+  "k_max": 12,
+  "selection": "bic",
+  "count_penalty": 2.0,
+  "threads": 5,
+  "agg_ratio": 20.0,
+  "flux_units": "ADU above offset",
+  "position_units": "px (y, x)"
+}

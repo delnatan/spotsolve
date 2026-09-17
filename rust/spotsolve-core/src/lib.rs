@@ -25,7 +25,9 @@
 //! `-C target-cpu=native`: FMA contraction would change f64 results between
 //! machines [P2].
 
+pub mod aguet;
 pub mod boxsearch;
+mod frames;
 pub mod filters;
 pub mod grid;
 pub mod lap;
