@@ -157,7 +157,11 @@ validation; broad or out-of-focus populations can pull the estimate upward.
 
 ## Link detections
 
+For a compact filtering workflow for either detector, see the
+[localization-quality guide](docs/LOCALIZATION_QUALITY.md).
+
 ```python
+import polars as pl
 from spotsolve import loctable
 
 parts, next_id = [], 0
@@ -167,12 +171,19 @@ for t, result in enumerate(movie):
     next_id += len(rows)
 locs = loctable.concat(parts)
 locs = loctable.filter_aggregates(locs)  # optional: retain point emitters
+locs = loctable.filter_quality(locs)  # require usable coordinates and errors
+# Optional precision cut: max_se_pos=0.5 (pixels; calibrate for your data).
 
 tracks = spotsolve.link(locs)
 tracks.select("track_id", "frame", "y", "x")
 
 params = spotsolve.fit_link_params(locs)  # inspect or reuse estimated parameters
 tracks = spotsolve.link(locs, params)
+
+# Optional conservative linking; 1 nat is an example, not a calibrated cutoff.
+tracks = spotsolve.link(locs, params, min_link_margin=1.0,
+                       min_track_length=4, diagnostics=True)
+accepted = tracks.filter(pl.col("track_accepted"))
 ```
 
 Linking preserves rows and columns and adds `track_id`. Motion, continuation

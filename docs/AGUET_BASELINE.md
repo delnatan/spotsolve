@@ -93,6 +93,10 @@ Intentional corrections to invalid/degenerate reference cases:
 
 ## Outputs
 
+The [localization-quality guide](LOCALIZATION_QUALITY.md) shows how to filter
+coordinate precision and optionally inspect patch deviance without adding
+diagnostic columns to the results.
+
 Positions are `(y, x)`. Continuous sampled-Gaussian flux is `F=2*pi*A*sigma²`:
 
 ```text

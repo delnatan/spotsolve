@@ -101,6 +101,11 @@ fn track_fit<'py>(
 
 /// Track ids per input row, and the brightness noise `(tau2, q)` if used.
 type Linked = (Py<PyArray1<u32>>, Option<(f64, f64)>);
+type Scored = (
+    Py<PyArray1<u32>>,
+    Option<(f64, f64)>,
+    Option<(Vec<Option<f64>>, Vec<bool>)>,
+);
 
 /// Link one movie. Returns a track id per input row, in input order, and
 /// the brightness model's `(tau2, q)` when one was used.
@@ -123,6 +128,36 @@ fn track_link(
     se_inflate: f64,
     brightness: Option<(Vec<f64>, Vec<f64>)>,
 ) -> PyResult<Linked> {
+    let (ids, noise, _) = track_link_scored(
+        py, frame, positions, errors, d_grid, d_logprior, p_cont, lam_birth, se_inflate,
+        brightness, 0.0, false,
+    )?;
+    Ok((ids, noise))
+}
+
+/// Link with an optional exclusion-margin cutoff and incoming diagnostics.
+#[pyfunction]
+#[pyo3(signature = (frame, positions, errors, d_grid, d_logprior, p_cont, lam_birth, se_inflate, brightness=None, min_link_margin=0.0, diagnostics=false))]
+#[allow(clippy::too_many_arguments)]
+fn track_link_scored(
+    py: Python<'_>,
+    frame: PyReadonlyArray1<'_, i64>,
+    positions: PyReadonlyArray2<'_, f64>,
+    errors: PyReadonlyArray2<'_, f64>,
+    d_grid: PyReadonlyArray1<'_, f64>,
+    d_logprior: PyReadonlyArray1<'_, f64>,
+    p_cont: f64,
+    lam_birth: f64,
+    se_inflate: f64,
+    brightness: Option<(Vec<f64>, Vec<f64>)>,
+    min_link_margin: f64,
+    diagnostics: bool,
+) -> PyResult<Scored> {
+    if !min_link_margin.is_finite() || min_link_margin < 0.0 {
+        return Err(PyValueError::new_err(
+            "min_link_margin must be finite and non-negative",
+        ));
+    }
     let (f, p, s) = inputs(&frame, &positions, &errors)?;
     let d = detections(f, p, s)?;
     let grid = d_grid
@@ -135,27 +170,41 @@ fn track_link(
 
     if let Some((lf, var)) = &brightness {
         if lf.len() != d.n_dets() || var.len() != d.n_dets() {
-            return Err(PyValueError::new_err("brightness arrays must have one value per row"));
+            return Err(PyValueError::new_err(
+                "brightness arrays must have one value per row",
+            ));
         }
         if lf.iter().chain(var).any(|v| !v.is_finite()) || var.iter().any(|&v| v < 0.0) {
-            return Err(PyValueError::new_err("brightness must be finite, with non-negative variances"));
+            return Err(PyValueError::new_err(
+                "brightness must be finite, with non-negative variances",
+            ));
         }
     }
-    let (ids, noise) = py.detach(|| {
+    let (ids, noise, diag) = py.detach(|| {
         let fx = brightness.map(|(lf, var)| tp::flux_model(&d, &pp, lf, var));
-        let l = tk::link_with_flux(&d, &pp, fx.as_ref());
+        let (l, diag) = tk::link_scored(&d, &pp, fx.as_ref(), min_link_margin, diagnostics);
         let mut out = vec![0u32; d.n_dets()];
         for (r, &id) in l.track.iter().enumerate() {
             out[d.order[r]] = id;
         }
-        (out, fx.map(|f| (f.tau2, f.q)))
+        let diag = diag.map(|diag| {
+            let mut margin = vec![None; d.n_dets()];
+            let mut rejected = vec![false; d.n_dets()];
+            for (r, &original) in d.order.iter().enumerate() {
+                margin[original] = diag.margin[r];
+                rejected[original] = diag.rejected[r];
+            }
+            (margin, rejected)
+        });
+        (out, fx.map(|f| (f.tau2, f.q)), diag)
     });
-    Ok((ids.into_pyarray(py).unbind(), noise))
+    Ok((ids.into_pyarray(py).unbind(), noise, diag))
 }
 
 pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(track_fit, m)?)?;
     m.add_function(wrap_pyfunction!(track_link, m)?)?;
+    m.add_function(wrap_pyfunction!(track_link_scored, m)?)?;
     m.add("TRACK_GATE_ALPHA", tk::GATE_ALPHA)?;
     m.add("TRACK_D_GRID_N", tk::D_GRID_N)?;
     m.add("TRACK_EM_ITERS", tp::EM_ITERS)?;

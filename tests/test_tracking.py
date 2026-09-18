@@ -232,3 +232,94 @@ def test_the_fit_recovers_the_motion_it_was_shown():
     assert 0.5 * 0.7 * D_PX < p.d_mean < 1.6 * 0.7 * D_PX, p
     assert 0.80 < p.p_cont < 0.95, p
     assert p.se_inflate < 1.6, p
+
+
+def fixed_params():
+    return spotsolve.tracking.LinkParams(
+        d_grid=np.array([0.0, 0.5]), d_logprior=np.log([0.5, 0.5]),
+        p_cont=0.95, lam_birth=0.001, se_inflate=1.0)
+
+
+def coordinate_table(frame, x, y=None):
+    n = len(frame)
+    return pl.DataFrame({
+        "loc_id": np.arange(n, dtype=np.uint32), "frame": frame,
+        "x": x, "y": np.zeros(n) if y is None else y,
+        "se_x": np.full(n, 0.2), "se_y": np.full(n, 0.2),
+    })
+
+
+def test_competing_successors_end_track_without_second_choice_fallback():
+    # Two identical candidates at frame 1 have an exactly tied assignment.
+    # At frame 2, two identical histories compete for one successor too.
+    locs = coordinate_table([0, 1, 1, 2], [0.0, 0.0, 0.0, 0.0])
+    tracks = spotsolve.link(locs, fixed_params(), min_link_margin=0.1,
+                            min_track_length=2, diagnostics=True)
+    assert tracks["track_id"].n_unique() == 4
+    assert tracks["link_rejected"].sum() == 2
+    assert tracks["link_margin"].drop_nulls().to_list() == [0.0, 0.0]
+    assert not tracks["track_accepted"].any()
+    # Diagnostics alone neither break ties nor change original assignments.
+    plain = spotsolve.link(locs, fixed_params())
+    scored = spotsolve.link(locs, fixed_params(), diagnostics=True)
+    assert scored["track_id"].equals(plain["track_id"])
+    assert not scored["link_rejected"].any()
+
+
+def test_minimum_length_preserves_dead_ends_and_does_not_close_gaps():
+    # One four-frame segment, a singleton, and a two-frame segment after a gap.
+    locs = coordinate_table([5, 6, 7, 8, 7, 10, 11], [0., 0., 0., 0., 100., 0., 0.])
+    tracks = spotsolve.link(locs, fixed_params(), min_track_length=3,
+                            min_link_margin=0.1, diagnostics=True)
+    assert tracks["track_length"].to_list() == [4, 4, 4, 4, 1, 2, 2]
+    assert tracks["track_accepted"].to_list() == [True] * 4 + [False] * 3
+    assert tracks["link_margin"].is_null().to_list() == [True, False, False, False, True, True, False]
+    assert not tracks["link_rejected"].any()
+    assert tracks.select(locs.columns).equals(locs)
+    longer = spotsolve.link(locs, fixed_params(), min_track_length=100,
+                            min_link_margin=0.1)
+    assert longer["track_id"].equals(tracks["track_id"])
+    assert not longer["track_accepted"].any()
+
+
+def test_conservative_diagnostics_follow_input_rows():
+    locs, _ = movie(38, n_particles=40, n_frames=8, field=24.)
+    params = spotsolve.fit_link_params(locs)
+    opts = dict(min_link_margin=1., min_track_length=3, diagnostics=True)
+    a = spotsolve.link(locs, params, **opts)
+    b = spotsolve.link(locs.sample(fraction=1., shuffle=True, seed=9), params, **opts).sort("loc_id")
+    # Track labels may differ; canonicalize by the first localization id.
+    for column in ("track_length", "track_accepted", "link_rejected"):
+        assert a[column].equals(b[column])
+    np.testing.assert_allclose(a["link_margin"].to_numpy(), b["link_margin"].to_numpy(), atol=1e-10)
+    def canonical(df):
+        return df.select(pl.col("loc_id").min().over("track_id"))["loc_id"]
+    assert canonical(a).equals(canonical(b))
+
+
+@pytest.mark.parametrize("minimum", [0, -1, 2.5, True, np.bool_(False), "3", float("nan")])
+def test_bad_minimum_length_is_rejected(minimum):
+    with pytest.raises(ValueError, match="positive integer"):
+        spotsolve.link(coordinate_table([0], [0.]), fixed_params(), min_track_length=minimum)
+
+
+@pytest.mark.parametrize("margin", [-1., float("nan"), float("inf"), None, True, "bad"])
+def test_bad_margin_is_rejected(margin):
+    with pytest.raises(ValueError, match="finite and non-negative"):
+        spotsolve.link(coordinate_table([0], [0.]), fixed_params(), min_link_margin=margin)
+
+
+def test_empty_conservative_output_and_relinking_metadata():
+    locs = coordinate_table([0, 1], [0., 0.])
+    opts = dict(min_track_length=np.int64(2), min_link_margin=0.1, diagnostics=True)
+    empty = spotsolve.link(locs.head(0), fixed_params(), **opts)
+    assert empty.height == 0
+    assert empty.schema["track_length"] == pl.UInt32
+    assert empty.schema["track_accepted"] == pl.Boolean
+    assert empty.schema["link_margin"] == pl.Float64
+    assert empty.schema["link_rejected"] == pl.Boolean
+    tracks = spotsolve.link(locs, fixed_params(), **opts)
+    relinked = spotsolve.link(tracks, fixed_params(), min_link_margin=1e6)
+    assert relinked.columns == locs.columns + ["track_id"]
+    assert relinked["track_id"].n_unique() == 2
+    assert spotsolve.link(tracks, fixed_params(), **opts).equals(tracks)

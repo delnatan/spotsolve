@@ -2,6 +2,7 @@
 
 import numpy as np
 import polars as pl
+import pytest
 
 from spotsolve import loctable, psf
 from spotsolve.results import REJECT_DTYPE, Localizations
@@ -64,3 +65,51 @@ def test_peak_is_present_and_typed_in_both_tables():
     assert list(rt.columns) == list(loctable.REJECT_SCHEMA)
     assert locs.schema["peak"] == pl.Float64
     assert abs(rt["peak"][0] - 900.0 * psf.peak_factor(2.9)) < 1e-9
+
+
+def test_quality_filter_excludes_invalid_coordinates_and_preserves_rows():
+    locs = pl.DataFrame({
+        "loc_id": [8, 3, 7, 1, 5, 9],
+        "x": [0., float("nan"), 2., 3., 4., 5.],
+        "y": [0., 1., 2., 3., 4., 5.],
+        "se_x": [0.3, 0.3, 0., None, float("inf"), 0.6],
+        "se_y": [0.4, 0.4, 0.4, 0.4, 0.4, 0.8],
+        "se_pos": [100.] * 6,  # stale derived values must not decide the cut
+    })
+    valid = loctable.filter_quality(locs)
+    assert valid.equals(locs[[0, 5]])
+    precise = loctable.filter_quality(locs, max_se_pos=0.5)
+    assert precise.equals(locs[[0]])
+    assert precise.schema == locs.schema
+    assert loctable.filter_quality(locs.head(0), max_se_pos=0.5).equals(locs.head(0))
+
+
+def test_quality_filter_flux_is_optional_and_uses_uncertainty():
+    locs, _, _ = loctable.frame_tables(_result([6., 6., 6., 6., 6.], [1.45] * 5), 0)
+    locs = locs.with_columns(
+        pl.Series("se_flux", [2., 3., 0., float("nan"), None]),
+        pl.lit(100.).alias("flux_snr"),  # stale derived SNR
+    )
+    assert loctable.filter_quality(locs).equals(locs)
+    assert loctable.filter_quality(locs, min_flux_snr=3.).equals(locs[[0]])
+    assert loctable.filter_quality(locs, max_se_pos=0.1, min_flux_snr=3.).is_empty()
+    assert loctable.filter_quality(locs, max_se_pos=0.2, min_flux_snr=3.).equals(locs[[0]])
+
+
+def test_quality_filter_coordinate_units_and_extreme_precision_values():
+    locs, _, _ = loctable.frame_tables(_result([100.], [1.45]), 0)
+    original = loctable.filter_quality(locs, max_se_pos=0.2)
+    converted = locs.with_columns([pl.col(c) * 0.104 for c in ("x", "y", "se_x", "se_y")])
+    assert loctable.filter_quality(converted, max_se_pos=0.0208)["loc_id"].equals(original["loc_id"])
+    tiny = locs.with_columns(pl.lit(1e-200).alias("se_x"), pl.lit(1e-200).alias("se_y"))
+    assert loctable.filter_quality(tiny, max_se_pos=1e-200).is_empty()
+    huge = locs.with_columns(pl.lit(1e200).alias("se_x"), pl.lit(1e200).alias("se_y"))
+    assert loctable.filter_quality(huge, max_se_pos=1.5e200).equals(huge)
+
+
+@pytest.mark.parametrize("cutoff", [0, -1, float("nan"), float("inf"), True, "0.5", [0.5]])
+def test_quality_filter_invalid_cutoffs(cutoff):
+    locs, _, _ = loctable.frame_tables(_result([100.], [1.45]), 0)
+    for name in ("max_se_pos", "min_flux_snr"):
+        with pytest.raises(ValueError, match=f"{name} must be positive and finite"):
+            loctable.filter_quality(locs, **{name: cutoff})

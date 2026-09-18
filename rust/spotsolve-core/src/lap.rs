@@ -99,6 +99,127 @@ pub fn max_gain_matching(
     cols: &[usize],
     gain: &[f64],
 ) -> Vec<Option<usize>> {
+    solve(n_cols, row_ptr, cols, gain).matching(n_cols)
+}
+
+struct Solution {
+    u: Vec<f64>,
+    v: Vec<f64>,
+    col4row: Vec<usize>,
+    row4col: Vec<usize>,
+}
+
+impl Solution {
+    fn matching(&self, n_cols: usize) -> Vec<Option<usize>> {
+        self.col4row
+            .iter()
+            .map(|&j| (j < n_cols).then_some(j))
+            .collect()
+    }
+}
+
+/// The exact loss in optimal total gain when each chosen edge is forbidden.
+/// Unmatched rows have no margin. A tie has margin zero; margins are in the
+/// same units as `gain`, NOT probabilities of correct association.
+///
+/// Find the cheapest residual path from a chosen row back to its chosen
+/// column, excluding their edge. Together with that edge's reverse, this is
+/// the cheapest cycle that removes the link. Optimal dual potentials make
+/// reduced costs nonnegative. Free columns can reach the flow sink at zero
+/// cost, and the sink can reach every occupied column at cost -v[column].
+/// These sink edges are essential: another row may take the freed column
+/// while the original row terminates. Private columns represent termination.
+pub fn max_gain_matching_with_margins(
+    n_cols: usize,
+    row_ptr: &[usize],
+    cols: &[usize],
+    gain: &[f64],
+) -> (Vec<Option<usize>>, Vec<Option<f64>>) {
+    let s = solve(n_cols, row_ptr, cols, gain);
+    let matched = s.matching(n_cols);
+    let mut margins = vec![None; matched.len()];
+    let mut dist = vec![f64::INFINITY; s.v.len()];
+    let mut touched = Vec::new();
+    let mut heap = BinaryHeap::new();
+    for (r, chosen) in matched.iter().enumerate() {
+        let Some(j) = *chosen else { continue };
+        let mut best = f64::INFINITY;
+        let mut sink_visited = false;
+        let mut row = r;
+        let mut base = 0.0;
+        loop {
+            let mut relax = |c: usize, cost: f64| {
+                if row == r && c == j {
+                    return;
+                }
+                // Roundoff can make a tight edge slightly negative.
+                let next = base + (cost - s.u[row] - s.v[c]).max(0.0);
+                if next < dist[c] && next < best {
+                    if dist[c].is_infinite() {
+                        touched.push(c);
+                    }
+                    dist[c] = next;
+                    heap.push(Entry {
+                        dist: next,
+                        free: false,
+                        col: c,
+                    });
+                }
+            };
+            for k in row_ptr[row]..row_ptr[row + 1] {
+                relax(cols[k], -gain[k]);
+            }
+            relax(n_cols + row, 0.0);
+
+            let next_row = loop {
+                let Some(e) = heap.pop() else { break None };
+                if e.dist >= best {
+                    break None;
+                }
+                if e.dist > dist[e.col] {
+                    continue;
+                }
+                if e.col == j {
+                    best = e.dist;
+                    break None;
+                } else if s.row4col[e.col] == NONE {
+                    if !sink_visited {
+                        sink_visited = true;
+                        for &c in &s.col4row {
+                            let next = e.dist + (-s.v[c]).max(0.0);
+                            if next < dist[c] {
+                                if dist[c].is_infinite() {
+                                    touched.push(c);
+                                }
+                                dist[c] = next;
+                                heap.push(Entry {
+                                    dist: next,
+                                    free: false,
+                                    col: c,
+                                });
+                            }
+                        }
+                    }
+                } else {
+                    break Some((s.row4col[e.col], e.dist));
+                }
+            };
+            let Some((next, distance)) = next_row else {
+                break;
+            };
+            row = next;
+            base = distance;
+        }
+        margins[r] = Some(best.max(0.0));
+        for c in touched.drain(..) {
+            dist[c] = f64::INFINITY;
+        }
+        heap.clear();
+    }
+    (matched, margins)
+}
+
+fn solve(n_cols: usize, row_ptr: &[usize], cols: &[usize], gain: &[f64]) -> Solution {
     let n_rows = row_ptr.len().saturating_sub(1);
     // Real columns, then row i's private "unmatched" column at n_cols + i.
     let nc = n_cols + n_rows;
@@ -197,10 +318,12 @@ pub fn max_gain_matching(
         heap.clear();
     }
 
-    col4row
-        .into_iter()
-        .map(|j| if j < n_cols { Some(j) } else { None })
-        .collect()
+    Solution {
+        u,
+        v,
+        col4row,
+        row4col,
+    }
 }
 
 #[cfg(test)]
@@ -298,12 +421,75 @@ mod tests {
     }
 
     #[test]
+    fn margins_include_competing_rows_and_termination() {
+        // Row 1 has no second candidate, but can lose its column to row 0.
+        let (m, margin) =
+            max_gain_matching_with_margins(2, &[0, 2, 3], &[0, 1, 0], &[5.0, 4.0, 5.0]);
+        assert_eq!(m, vec![Some(1), Some(0)]);
+        assert_eq!(margin, vec![Some(4.0), Some(4.0)]);
+        let (_, margin) =
+            max_gain_matching_with_margins(2, &[0, 2, 4], &[0, 1, 0, 1], &[5.0, 5.0, 5.0, 5.0]);
+        assert_eq!(margin, vec![Some(0.0), Some(0.0)]);
+        let (_, margin) = max_gain_matching_with_margins(1, &[0, 1], &[0], &[2.5]);
+        assert_eq!(margin, vec![Some(2.5)]);
+    }
+
+    #[test]
+    fn margins_match_exhaustive_forbidden_edge_assignments() {
+        let mut rng = Rng(0x123456789ABCDEF);
+        for trial in 0..1000 {
+            let nr = 1 + (rng.uniform() * 6.0) as usize;
+            let nc = 1 + (rng.uniform() * 6.0) as usize;
+            let mut ptr = vec![0];
+            let (mut cols, mut gains) = (vec![], vec![]);
+            for _ in 0..nr {
+                for c in 0..nc {
+                    if rng.uniform() < 0.65 {
+                        cols.push(c);
+                        // Include exact ties and negative gains.
+                        let value = rng.uniform() * 8.0;
+                        gains.push(if trial % 2 == 0 {
+                            value.floor() - 2.0
+                        } else {
+                            value - 2.0
+                        });
+                    }
+                }
+                ptr.push(cols.len());
+            }
+            let (m, margins) = max_gain_matching_with_margins(nc, &ptr, &cols, &gains);
+            let optimum = total(&m, &ptr, &cols, &gains);
+            for r in 0..nr {
+                let Some(c) = m[r] else {
+                    assert_eq!(margins[r], None);
+                    continue;
+                };
+                let k = (ptr[r]..ptr[r + 1]).find(|&k| cols[k] == c).unwrap();
+                let saved = gains[k];
+                gains[k] = f64::NEG_INFINITY;
+                let alternative = brute(0, &mut vec![false; nc], &ptr, &cols, &gains);
+                gains[k] = saved;
+                let want = optimum - alternative;
+                let got = margins[r].unwrap();
+                assert!(
+                    (got - want).abs() < 1e-9,
+                    "trial {trial}, row {r}: margin {got}, expected {want}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn empty_and_edgeless_rows() {
         assert!(max_gain_matching(3, &[0], &[], &[]).is_empty());
         assert_eq!(max_gain_matching(0, &[0, 0, 0], &[], &[]), vec![None, None]);
         assert_eq!(
             max_gain_matching(1, &[0, 0, 1], &[0], &[-2.0]),
             vec![None, None]
+        );
+        assert_eq!(
+            max_gain_matching_with_margins(0, &[0, 0, 0], &[], &[]),
+            (vec![None, None], vec![None, None])
         );
     }
 }

@@ -518,7 +518,14 @@ impl CellIndex {
             1.0
         };
         let area = ((y1 - y0) * (x1 - x0)).max(f64::MIN_POSITIVE);
-        let cell = (area / per_frame.max(1.0)).sqrt().max(1e-9);
+        // A line of detections has zero bounding-box area but nonzero span.
+        // Bound cells along its long axis too, rather than allocating billions
+        // of empty buckets from the 1e-9 cell floor. Square fields retain the
+        // original spacing; this only coarsens highly elongated fields.
+        let cell = (area / per_frame.max(1.0))
+            .sqrt()
+            .max((y1 - y0).max(x1 - x0) / per_frame.max(1.0))
+            .max(1e-9);
         let ny = (((y1 - y0) / cell).floor() as usize) + 1;
         let nx = (((x1 - x0) / cell).floor() as usize) + 1;
         CellIndex {
@@ -633,6 +640,14 @@ pub struct Linking {
     pub n_tracks: u32,
 }
 
+/// Per-detection diagnostics for the proposed incoming assignment, in sorted
+/// order. A rejected proposal still has a margin; a birth without a proposal
+/// has None. These describe the original frame optimum, before abstention.
+pub struct LinkDiagnostics {
+    pub margin: Vec<Option<f64>>,
+    pub rejected: Vec<bool>,
+}
+
 impl Linking {
     /// Rows of each track, ascending by track id, each in frame order.
     pub fn tracks(&self) -> Vec<Vec<usize>> {
@@ -731,6 +746,23 @@ pub fn link(d: &Detections, p: &Params) -> Linking {
 
 /// [`link`], with brightness as a second cue when `flux` is given.
 pub fn link_with_flux(d: &Detections, p: &Params, flux: Option<&FluxModel>) -> Linking {
+    link_scored(d, p, flux, 0.0, false).0
+}
+
+/// Conservative linking. Keep only original optimal links whose exclusion
+/// margin is >= `min_margin` (finite and nonnegative). Rejected proposals end
+/// their source tracks and start new tracks at their destinations. Do not
+/// re-solve after rejection: removing competitors must not turn an ambiguous
+/// second choice into an apparently certain association. Filtering precedes
+/// updates to position, diffusion, and brightness state.
+pub fn link_scored(
+    d: &Detections,
+    p: &Params,
+    flux: Option<&FluxModel>,
+    min_margin: f64,
+    diagnostics: bool,
+) -> (Linking, Option<LinkDiagnostics>) {
+    assert!(min_margin.is_finite() && min_margin >= 0.0);
     const LOG_2PI: f64 = 1.837_877_066_409_345_5;
     // Row (sorted) -> log flux and its variance.
     let (lfs, lfv): (Vec<f64>, Vec<f64>) = match flux {
@@ -742,9 +774,13 @@ pub fn link_with_flux(d: &Detections, p: &Params, flux: Option<&FluxModel>) -> L
     };
     let m = p.m();
     let mut track = vec![0u32; d.n_dets()];
+    let mut diag = diagnostics.then(|| LinkDiagnostics {
+        margin: vec![None; d.n_dets()],
+        rejected: vec![false; d.n_dets()],
+    });
     let mut next_id: u32 = 0;
     if d.n_dets() == 0 {
-        return Linking { track, n_tracks: 0 };
+        return (Linking { track, n_tracks: 0 }, diag);
     }
 
     let index = CellIndex::new(d);
@@ -822,7 +858,26 @@ pub fn link_with_flux(d: &Detections, p: &Params, flux: Option<&FluxModel>) -> L
                 }
                 row_ptr[t + 1] = cols.len();
             }
-            matched = lap::max_gain_matching(nd, &row_ptr, &cols, &gains);
+            if min_margin > 0.0 || diagnostics {
+                let (proposals, margins) =
+                    lap::max_gain_matching_with_margins(nd, &row_ptr, &cols, &gains);
+                matched = proposals;
+                for (t, proposal) in matched.iter_mut().enumerate() {
+                    if let Some(c) = *proposal {
+                        let margin = margins[t].expect("matched row has a margin");
+                        let rejected = margin < min_margin;
+                        if let Some(diag) = diag.as_mut() {
+                            diag.margin[rows.start + c] = Some(margin);
+                            diag.rejected[rows.start + c] = rejected;
+                        }
+                        if rejected {
+                            *proposal = None;
+                        }
+                    }
+                }
+            } else {
+                matched = lap::max_gain_matching(nd, &row_ptr, &cols, &gains);
+            }
         }
 
         next_live.clear();
@@ -875,15 +930,28 @@ pub fn link_with_flux(d: &Detections, p: &Params, flux: Option<&FluxModel>) -> L
         std::mem::swap(&mut live, &mut next_live);
     }
 
-    Linking {
-        track,
-        n_tracks: next_id,
-    }
+    (
+        Linking {
+            track,
+            n_tracks: next_id,
+        },
+        diag,
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn collinear_detections_use_bounded_buckets() {
+        let d = Detections::new(&[0, 0, 1], &[0., 0., 0., 100., 0., 0.], &[0.2; 6]).unwrap();
+        let index = CellIndex::new(&d);
+        assert!(index.ny * index.nx <= 4);
+        let mut b = Buckets::default();
+        index.bucket(&d, 0, &mut b);
+        assert_eq!(index.nearest(&d, &b, [0., 99.], None), Some(1.));
+    }
 
     pub(crate) struct Rng(pub u64);
     impl Rng {

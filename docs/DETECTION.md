@@ -118,6 +118,9 @@ numerical comparisons are not reproduced here. Several qualifications matter:
   changes in `I/phi`. Comparisons of noisy SE estimates do not by themselves
   establish which covariance gives better tracking decisions.
 
+For a minimal filtering workflow using existing outputs, see the
+[localization-quality guide](LOCALIZATION_QUALITY.md).
+
 ## ROI and calibration
 
 A boolean ROI restricts the search; sources may fit outside it. Process its

@@ -12,8 +12,11 @@ background, derived from flux and fitted width.
 The linker uses position errors and optionally flux errors. Tables retain
 only marginal position errors, not the full joint-fit covariance.
 Aggregate flags preserve all rows; `filter_aggregates` returns a filtered
-table.
+table. `filter_quality` excludes unusable coordinates and optionally applies
+precision/flux-significance cuts without adding columns.
 """
+
+from numbers import Real
 
 import numpy as np
 import polars as pl
@@ -208,6 +211,48 @@ def concat(parts):
 def filter_aggregates(locs, keep_flagged=False):
     """Return rows without aggregate flags, or all rows if `keep_flagged`."""
     return locs if keep_flagged else locs.filter(~pl.col("is_aggregate"))
+
+
+def filter_quality(locs, *, max_se_pos=None, min_flux_snr=None):
+    """Keep usable coordinates, optionally requiring precision/flux support.
+
+    Always require finite x/y and finite, positive se_x/se_y. `max_se_pos`
+    limits hypot(se_y, se_x) in the table's coordinate units (pixels for
+    `frame_tables`). `min_flux_snr` optionally requires positive finite flux
+    and se_flux and a flux/se_flux ratio at least this large. Both cutoffs
+    must be positive and finite; neither has a calibrated universal default.
+
+    Derived values are computed from the base columns, so stale `se_pos` or
+    `flux_snr` columns cannot affect filtering. No columns are added or changed;
+    retained rows keep their order and IDs. Keep the original table to inspect
+    rejected detections, and filter before linking: removing a row may end a
+    trajectory. This is a usability filter, not a probability of being real.
+    """
+    for name, value in (("max_se_pos", max_se_pos), ("min_flux_snr", min_flux_snr)):
+        if value is not None:
+            try:
+                valid = (isinstance(value, Real) and not isinstance(value, (bool, np.bool_))
+                         and np.isfinite(float(value)) and value > 0)
+            except OverflowError:
+                valid = False
+            if not valid:
+                raise ValueError(f"{name} must be positive and finite")
+
+    keep = pl.all_horizontal(
+        *[pl.col(c).is_finite() for c in ("y", "x", "se_y", "se_x")],
+        pl.col("se_y") > 0, pl.col("se_x") > 0,
+    )
+    if max_se_pos is not None:
+        # hypot handles extreme finite values without overflow/underflow.
+        precision = pl.Series(np.hypot(locs["se_y"].to_numpy(), locs["se_x"].to_numpy()))
+        keep &= precision <= float(max_se_pos)
+    if min_flux_snr is not None:
+        keep &= pl.all_horizontal(
+            pl.col("flux").is_finite(), pl.col("se_flux").is_finite(),
+            pl.col("flux") > 0, pl.col("se_flux") > 0,
+            pl.col("flux") / pl.col("se_flux") >= float(min_flux_snr),
+        )
+    return locs.filter(keep.fill_null(False))
 
 
 def link_input(locs, units="um"):

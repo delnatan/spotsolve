@@ -52,13 +52,19 @@ scores are log likelihood ratios, which are invariant to the choice of units,
 so this produces the same links either way -- the conversion is a reporting
 convenience and never enters a decision.
 
-No dials
---------
-Every parameter is estimated from the data by `fit_link_params`, which `link`
+Motion parameters and acceptance
+--------------------------------
+Motion-model parameters are estimated from the data by `fit_link_params`, which `link`
 calls for you if you do not pass one. Fit once and reuse it when you are
 linking several movies of the same sample, or to read what was estimated:
 `params.trajectory` records the empirical-Bayes loop iterate by iterate, so a
 fit that goes wrong says so rather than quietly returning a worse answer.
+
+Acceptance is a separate choice: `min_link_margin` can end tracks at ambiguous
+assignments, and `min_track_length` flags segments with enough consecutive
+frames for analysis. Neither supplies D or changes the population fit. Short
+segments remain in the output. A margin is a score difference, not a calibrated
+probability of a correct link; `diagnostics=True` exposes it for inspection.
 """
 
 from dataclasses import dataclass, field
@@ -180,27 +186,80 @@ def _brightness(locs):
     return [float(v) for v in lf], [float(v) for v in var]
 
 
-def link(locs, params=None, brightness=False):
+def link(locs, params=None, brightness=False, *, min_link_margin=0.0,
+         min_track_length=None, diagnostics=False):
     """Link a localization table into trajectories. -> the table + `track_id`.
 
     `params` is fitted from `locs` when omitted. The returned frame is the
     input with one `UInt32` column added, in the input's row order; a
-    `track_id` column already present is replaced.
+    `track_id` column already present is replaced. Previous tracking
+    diagnostics and acceptance columns are removed or recomputed on re-linking.
 
     `brightness=True` also reads `flux` and `se_flux`, so that a particle's
     brightness helps keep its identity; its noise is estimated from the movie.
     See the module docstring for what that buys and costs.
+
+    `min_link_margin` is a finite non-negative cutoff in natural-log score
+    units (nats). Each proposed link is compared with the best whole-frame
+    assignment forbidding that link, including competitors and termination.
+    Links with a smaller margin are cut before updating the track's state;
+    no second-choice reassignment is made. Zero preserves the original
+    behavior, including ties. This is not a probability threshold.
+
+    `min_track_length=N` adds `track_length` (UInt32) and `track_accepted`
+    (Boolean). N must be a positive integer, counting consecutive detected
+    frames, not links. Acceptance is retrospective over each complete segment;
+    it never encourages extending a track to reach N, and no rows are dropped.
+    Omit it to preserve the original output schema.
+
+    `diagnostics=True` adds `link_margin` (nullable Float64) and `link_rejected`
+    (Boolean), describing the proposed incoming link at each detection. A
+    rejected proposal has its measured margin and starts a new track; a birth
+    with no proposal has a null margin and False. Margins are conditional on
+    track histories committed before this frame, not whole-movie confidence.
     """
     import polars as pl
+    from numbers import Integral
+
+    if isinstance(min_link_margin, (bool, np.bool_)):
+        raise ValueError("min_link_margin must be finite and non-negative")
+    try:
+        min_link_margin = float(min_link_margin)
+    except (TypeError, ValueError, OverflowError) as error:
+        raise ValueError("min_link_margin must be finite and non-negative") from error
+    if not np.isfinite(min_link_margin) or min_link_margin < 0:
+        raise ValueError("min_link_margin must be finite and non-negative")
+    if min_track_length is not None:
+        if (isinstance(min_track_length, (bool, np.bool_))
+                or not isinstance(min_track_length, Integral)
+                or min_track_length < 1):
+            raise ValueError("min_track_length must be a positive integer")
+        min_track_length = int(min_track_length)
 
     if params is None:
         params = fit_link_params(locs)
     frame, pos, se = _arrays(locs)
-    ids, _ = _rs.track_link(
+    ids, _, diag = _rs.track_link_scored(
         frame, pos, se,
         np.ascontiguousarray(params.d_grid, dtype=float),
         np.ascontiguousarray(params.d_logprior, dtype=float),
         float(params.p_cont), float(params.lam_birth),
         float(params.se_inflate),
-        brightness=_brightness(locs) if brightness else None)
-    return locs.with_columns(pl.Series("track_id", ids, dtype=pl.UInt32))
+        brightness=_brightness(locs) if brightness else None,
+        min_link_margin=min_link_margin, diagnostics=diagnostics)
+    metadata = {"track_length", "track_accepted", "link_margin", "link_rejected"}
+    out = locs.drop([c for c in locs.columns if c in metadata]).with_columns(
+        pl.Series("track_id", ids, dtype=pl.UInt32))
+    if min_track_length is not None:
+        out = out.with_columns(pl.len().over("track_id").cast(pl.UInt32).alias("track_length"))
+        # A requested N larger than the table cannot be met; this also avoids
+        # passing an arbitrary-size Python integer into a fixed-width literal.
+        accepted = (pl.col("track_length") >= min_track_length
+                    if min_track_length <= len(out) else pl.lit(False))
+        out = out.with_columns(accepted.alias("track_accepted"))
+    if diagnostics:
+        margin, rejected = diag
+        out = out.with_columns(
+            pl.Series("link_margin", margin, dtype=pl.Float64),
+            pl.Series("link_rejected", rejected, dtype=pl.Boolean))
+    return out
