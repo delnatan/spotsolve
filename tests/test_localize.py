@@ -1,10 +1,4 @@
-"""The native detector against simulation truth.
-
-The Python reference it was ported from was retired on 2026-09-11 (last
-present in commit `ea6b17f`). The gain-free search was prototyped on a copy
-of it and ported on 2026-09-14; the port matched the prototype's referee
-numbers within spike-in noise.
-"""
+"""Native localization against simulation truth and diagnostic contracts."""
 
 import numpy as np
 import pytest
@@ -25,25 +19,8 @@ def _sim(seed, density=0.034, spread=0.2, **kw):
                     sigma_spread=spread, seed=seed, **kw)
 
 
-# Recall / precision within 1 px of truth. Recall is low by design:
-# `sigma_spread` puts many true emitters outside the reporting band, and at
-# 0.055 px^-2 neighbours closer than the PSF are not separable.
-#
-# Re-measured 2026-09-14 when the detector stopped taking a gain and read
-# noise (seed 3.0, birth 2.5, significance-based width band). All three cells
-# are BRIGHT and dense, the side of the operating point that pays for the dim
-# recall the new cuts were chosen for; kept, not retuned, because they are
-# the arms that hold precision honest.
-#
-# Re-measured again the same day, twice: when the fitter stopped shrinking
-# the whole step for one coordinate near a bound (`lmcl::scale_into_box`), and
-# when the two LoG cuts (3.0 / 2.5) became one, `PEAK_Z` = 2.75. Single cells
-# move by about 2 points either way.
-#
-#   seed  density spread   true  found   recall  prec   (gain-free)  (2026-09-12)
-#    17    0.015   0.4      47     37     .723   .919   .745 / .921   .681 / .914
-#    18    0.034   0.2     107     92     .785   .913   .804 / .915   .710 / .950
-#    19    0.055   0.4     172    116     .512   .759   .488 / .792   .413 / .845
+# Historical simulation baselines, with five percentage points of tolerance.
+# Unresolved neighbors limit recovery in the denser fields.
 @pytest.mark.parametrize("seed,density,spread,recall,precision",
                          [(17, 0.015, 0.4, 0.723, 0.919),
                           (18, 0.034, 0.2, 0.785, 0.913),
@@ -67,7 +44,7 @@ def test_read_noise_needs_no_model():
     sim = simulate(shape=(64, 64), n_emitters=0, background=1.0, sigma=SIGMA,
                    seed=17)
     img = sim.image + 2.5 * np.random.default_rng(1017).standard_normal((64, 64))
-    res = L.localize(img, sigma=SIGMA, band=None)
+    res = L.localize(img, sigma=SIGMA)
     assert len(res) == 0
     np.testing.assert_allclose(res.residual, img - res.model_image, atol=1e-9)
     assert np.median(res.background) == pytest.approx(1.0, abs=0.3)
@@ -130,6 +107,7 @@ def test_stack_is_frame_by_frame_and_thread_count_free():
             np.testing.assert_array_equal(r.positions, single.positions)
             np.testing.assert_array_equal(r.amplitudes, single.amplitudes)
             np.testing.assert_array_equal(r.se, single.se)
+            np.testing.assert_array_equal(r.flags, single.flags)
             np.testing.assert_array_equal(r.info["fisher_fraction"],
                                           single.info["fisher_fraction"])
         assert a.model_image is None and a.residual is None
@@ -183,25 +161,68 @@ def test_an_empty_roi_asks_for_nothing():
     assert res.background.shape == img.shape
     assert res.info["candidates"] == 0 and res.info["boxes"] == 0
     assert res.info["fisher_fraction"].shape == (0, 4)
-    assert res.info["reject_fisher_fraction"].shape == (0, 4)
+    assert res.flags.shape == (0,)
 
 
 @pytest.mark.parametrize("selection", ["fixed", "bic"])
-def test_fisher_diagnostics_follow_the_reporting_partition(selection):
+def test_fisher_diagnostics_and_flags_follow_all_returned_rows(selection):
     image = _sim(17, density=0.015, spread=0.4).image
     raw = rs.box_localize(image, sigma=SIGMA, selection=selection)
     result = L.localize(image, sigma=SIGMA, selection=selection, images=False)
     fraction = raw[-1]["fisher_fraction"]
     assert fraction.shape == (len(raw[0]), 4)
     assert np.all((fraction > 0) & (fraction <= 1))
-    focus = raw[5] == 0
-    assert focus.any() and (~focus).any()
-    np.testing.assert_array_equal(result.info["fisher_fraction"], fraction[focus])
-    np.testing.assert_array_equal(result.info["reject_fisher_fraction"], fraction[~focus])
-    assert result.info["reject_fisher_fraction"].shape == (len(result.rejects), 4)
+    np.testing.assert_array_equal(result.info["fisher_fraction"], fraction)
+    np.testing.assert_array_equal(result.positions, raw[0])
+    np.testing.assert_array_equal(result.flags, raw[5])
+    assert len(result) == len(raw[0])
 
     # No covariance exists without the final fit; workspace reuse must not
     # accidentally attach another frame's diagnostic.
     unpolished = rs.box_localize(image, sigma=SIGMA, selection=selection, polish=False)
     assert len(unpolished[0]) > 0
     assert np.isnan(unpolished[-1]["fisher_fraction"]).all()
+    from spotsolve import FitFlag
+    assert np.all(unpolished[5] & int(FitFlag.NOT_CONVERGED))
+    assert np.all(unpolished[5] & int(FitFlag.COVARIANCE_UNAVAILABLE))
+
+
+@pytest.mark.parametrize("selection", ["fixed", "bic"])
+def test_narrow_broad_and_bright_sources_keep_their_measurements(selection):
+    from spotsolve import psf, FitFlag
+    yy, xx = np.mgrid[:96, :96]
+    truth = np.array([[24., 24.], [48., 48.], [72., 72.]])
+    widths = np.array([.73, 2.1, 1.0])
+    flux = np.array([10000., 20000., 1000000.])
+    theta = psf.pack_var_sigma(30., flux, truth[:, 0], truth[:, 1], widths)
+    mean = psf.model_var_sigma(theta, yy, xx)
+    image = np.random.default_rng(73).poisson(mean).astype(float)
+    result = L.localize(image, 1.0, selection=selection)
+    distance, found = cKDTree(result.positions).query(truth)
+    assert np.all(distance < .1)
+    np.testing.assert_allclose(result.amplitudes[found], flux, rtol=.05)
+    np.testing.assert_allclose(result.fit_sigma[found], widths, rtol=.05)
+    assert np.all(result.flags[found] == int(FitFlag.OK))
+    assert result.fit_sigma[found[0]] < .8
+    assert result.fit_sigma[found[1]] > 2.0
+    np.testing.assert_allclose(result.residual, image - result.model_image)
+
+
+def test_edge_flag_does_not_depend_on_a_width_reporting_band():
+    from spotsolve import psf, FitFlag
+    yy, xx = np.mgrid[:48, :48]
+    mean = psf.model(psf.pack(20., [15000.], [1.5], [24.]), yy, xx, 1.2)
+    image = np.random.default_rng(21).poisson(mean).astype(float)
+    result = L.localize(image, 1.2)
+    distance, found = cKDTree(result.positions).query([[1.5, 24.]])
+    assert distance[0] < .2
+    assert .8 < result.sigma_ratio[found[0]] < 2.0
+    assert result.flags[found[0]] & int(FitFlag.EDGE)
+
+
+@pytest.mark.parametrize("value", [0, -1, 1.5, True])
+def test_native_wrapper_requires_positive_integer_counts(value):
+    with pytest.raises(ValueError, match="k_max"):
+        L.localize(np.ones((16, 16)), 1.2, k_max=value)
+    with pytest.raises(ValueError, match="n_threads"):
+        L.localize_stack(np.ones((1, 16, 16)), 1.2, n_threads=value)

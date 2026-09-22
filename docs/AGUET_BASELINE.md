@@ -45,6 +45,12 @@ profile variance. A sampled-Gaussian fit therefore typically gives
 1.45). This is a moment-based approximation, not an exact fit correction:
 finite windows, background, subpixel position and noise can affect the fit.
 
+For an approximate detection width, inspect the `fit_sigma` histogram from
+an Aguet pass over the first frame or few frames. Prefer isolated spots or an
+isolated ROI; overlap can inflate independent-fit widths. This is a small
+analysis step using the existing outputs, not a separate calibration routine.
+See the [example](../README.md#choose-a-detection-width).
+
 ## Screening simplification
 
 For kernel pixel count `n`, significance `alpha`, and amplitude entry `C00`
@@ -109,7 +115,8 @@ Var(F) = (2*pi*sigma²)² Var(A)
 objectives/iterations, candidate counts, processed pixels and failures.
 Failures are `(seed_y, seed_x, status)`: -1 iteration limit, -2 covariance
 failure, -3 invalid fit, -4 post-fit bounds. There is no width band, so
-`rejects` is empty; dispersion is unavailable (NaN).
+Returned rows carry geometric `FitFlag.EDGE` diagnostics; dispersion is
+unavailable (NaN). Failed attempts remain in `info["failures"]`.
 
 `background` is the screening estimate, NaN outside the crop. Optional
 model/residual images use this diagnostic map and sampled PSFs truncated at

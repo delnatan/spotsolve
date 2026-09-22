@@ -1,10 +1,7 @@
 //! Bindings for the native box search, `spotsolve_core::boxsearch`.
 //!
-//! Inputs are copied once, the GIL is released for the whole search, and the
-//! answer comes back as owned arrays: every fitted emitter with its class
-//! (0 focus, 1 narrow, 2 wide, 3 edge), the background surface, and an
-//! `info` dict of the frame's measured dispersion and the work counts.
-//! Python only arranges these into a `Localizations`.
+//! Inputs are copied before releasing the GIL. Outputs contain every selected
+//! emitter, diagnostic flags, a background surface and frame metadata.
 
 use numpy::{
     IntoPyArray, PyArray1, PyArray2, PyArrayMethods, PyReadonlyArray1, PyReadonlyArray2,
@@ -17,7 +14,7 @@ use spotsolve_core::boxsearch as bs;
 
 type Arr1 = Py<PyArray1<f64>>;
 type Arr2 = Py<PyArray2<f64>>;
-/// `(positions, amplitudes, sigmas, se, sigma_se, classes, background, info)`.
+/// `(positions, amplitudes, sigmas, se, sigma_se, flags, background, info)`.
 type Frame<'py> = (Arr2, Arr1, Arr1, Arr2, Arr1, Py<PyArray1<u8>>, Arr2, Bound<'py, PyDict>);
 
 #[allow(clippy::too_many_arguments)]
@@ -30,7 +27,6 @@ fn settings(
     slack: (f64, f64),
     sweeps: usize,
     polish: bool,
-    band: Option<(f64, f64)>,
 ) -> PyResult<bs::Settings> {
     if !(sigma.is_finite() && sigma > 0.0) {
         return Err(PyValueError::new_err("`sigma` must be positive"));
@@ -62,7 +58,6 @@ fn settings(
         slack,
         sweeps,
         polish,
-        band,
     })
 }
 
@@ -94,6 +89,7 @@ fn roi_slice<'a>(
 fn give<'py>(py: Python<'py>, o: bs::Output, h: usize, w: usize) -> PyResult<Frame<'py>> {
     let n = o.amp.len();
     let info = PyDict::new(py);
+    info.set_item("fitted_background", o.fitted_background.into_pyarray(py))?;
     info.set_item("dispersion", o.dispersion)?;
     info.set_item("candidates", o.n_candidates)?;
     info.set_item("boxes", o.n_boxes)?;
@@ -101,14 +97,13 @@ fn give<'py>(py: Python<'py>, o: bs::Output, h: usize, w: usize) -> PyResult<Fra
     info.set_item("polish_fits", o.polish_fits)?;
     info.set_item("selection_fits", o.selection_fits)?;
     info.set_item("fisher_fraction", o.fisher_fraction.into_pyarray(py).reshape([n, 4])?)?;
-    let class: Vec<u8> = o.class.iter().map(|&c| c as u8).collect();
     Ok((
         o.pos.into_pyarray(py).reshape([n, 2])?.unbind(),
         o.amp.into_pyarray(py).unbind(),
         o.sig.into_pyarray(py).unbind(),
         o.se.into_pyarray(py).reshape([n, 3])?.unbind(),
         o.se_sig.into_pyarray(py).unbind(),
-        class.into_pyarray(py).unbind(),
+        o.flags.into_pyarray(py).unbind(),
         o.background.into_pyarray(py).reshape([h, w])?.unbind(),
         info,
     ))
@@ -117,7 +112,7 @@ fn give<'py>(py: Python<'py>, o: bs::Output, h: usize, w: usize) -> PyResult<Fra
 /// Localize one raw frame. Everything is in ADU above `offset`; the noise is
 /// measured from the frame.
 #[pyfunction]
-#[pyo3(signature = (raw, sigma, offset=0.0, *, roi=None, k_max=bs::K_MAX, threshold=None, selection="fixed", count_penalty=0.0, slack=bs::SLACK, band=Some(bs::BAND), sweeps=bs::SWEEPS, polish=true))]
+#[pyo3(signature = (raw, sigma, offset=0.0, *, roi=None, k_max=bs::K_MAX, threshold=None, selection="fixed", count_penalty=0.0, slack=bs::SLACK, sweeps=bs::SWEEPS, polish=true))]
 #[allow(clippy::too_many_arguments)]
 fn box_localize<'py>(
     py: Python<'py>,
@@ -130,7 +125,6 @@ fn box_localize<'py>(
     selection: &str,
     count_penalty: f64,
     slack: (f64, f64),
-    band: Option<(f64, f64)>,
     sweeps: usize,
     polish: bool,
 ) -> PyResult<Frame<'py>> {
@@ -144,7 +138,7 @@ fn box_localize<'py>(
     }
     check_offset(offset)?;
     let roi = roi_slice(&roi, h, w)?.map(|m| m.to_vec());
-    let s = settings(sigma, k_max, threshold, selection, count_penalty, slack, sweeps, polish, band)?;
+    let s = settings(sigma, k_max, threshold, selection, count_penalty, slack, sweeps, polish)?;
     let o = py.detach(|| {
         let (mut ws, mut d) = (bs::Workspace::new(), Vec::new());
         bs::localize_raw(&r, h, w, offset, roi.as_deref(), &s, &mut ws, &mut d)
@@ -156,7 +150,7 @@ fn box_localize<'py>(
 /// each frame exactly as `box_localize` would. Returns one tuple per frame,
 /// in frame order.
 #[pyfunction]
-#[pyo3(signature = (raw, sigma, offset=0.0, *, roi=None, k_max=bs::K_MAX, threshold=None, selection="fixed", count_penalty=0.0, slack=bs::SLACK, band=Some(bs::BAND), sweeps=bs::SWEEPS, polish=true, n_threads=1))]
+#[pyo3(signature = (raw, sigma, offset=0.0, *, roi=None, k_max=bs::K_MAX, threshold=None, selection="fixed", count_penalty=0.0, slack=bs::SLACK, sweeps=bs::SWEEPS, polish=true, n_threads=1))]
 #[allow(clippy::too_many_arguments)]
 fn box_localize_stack<'py>(
     py: Python<'py>,
@@ -169,7 +163,6 @@ fn box_localize_stack<'py>(
     selection: &str,
     count_penalty: f64,
     slack: (f64, f64),
-    band: Option<(f64, f64)>,
     sweeps: usize,
     polish: bool,
     n_threads: usize,
@@ -184,7 +177,7 @@ fn box_localize_stack<'py>(
     }
     check_offset(offset)?;
     let roi = roi_slice(&roi, h, w)?.map(|m| m.to_vec());
-    let s = settings(sigma, k_max, threshold, selection, count_penalty, slack, sweeps, polish, band)?;
+    let s = settings(sigma, k_max, threshold, selection, count_penalty, slack, sweeps, polish)?;
     let r = r.to_vec();
     let outs = py.detach(|| {
         bs::localize_stack(&r, n, h, w, offset, roi.as_deref(), &s, n_threads.max(1))
@@ -220,16 +213,15 @@ fn box_render(
 }
 
 pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add("BOX_OUTPUT_VERSION", 2)?;
     m.add_function(wrap_pyfunction!(box_localize, m)?)?;
     m.add_function(wrap_pyfunction!(box_localize_stack, m)?)?;
     m.add_function(wrap_pyfunction!(box_render, m)?)?;
     // The detector's defaults, read by `spotsolve.native` so Python states
     // no second copy of them.
     m.add("BOX_SLACK", bs::SLACK)?;
-    m.add("BOX_BAND", bs::BAND)?;
     m.add("BOX_K_MAX", bs::K_MAX)?;
     m.add("BOX_ADD_NATS", bs::ADD_NATS)?;
     m.add("BOX_PEAK_Z", bs::PEAK_Z)?;
-    m.add("BOX_BAND_Z", bs::BAND_Z)?;
     Ok(())
 }

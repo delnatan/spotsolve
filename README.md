@@ -1,6 +1,7 @@
 # spotsolve
 
-Spot detection, localization and tracking for fluorescence microscopy.
+Emitter localization for sparse to moderately crowded fluorescence images,
+with Brownian-motion trajectory linking through frame-to-frame LAP assignment.
 Fit overlapping emitters jointly, or use the Aguet / `spotfitlm` sparse
 baseline. Both return positions, fluxes, widths and uncertainties for linking.
 Detection and fitting run in Rust, with movie frames processed in parallel.
@@ -60,7 +61,7 @@ All return `Localizations` (one per frame for stacks):
 | `se` | `(N, 3)` standard errors of `(flux, y, x)` |
 | `fit_sigma`, `sigma_se` | Fitted width and its standard error, in pixels |
 | `sigma_ratio` | `fit_sigma / sigma` |
-| `rejects` | Multi-emitter fits outside the width-reporting band; empty for Aguet |
+| `flags` | `(N,)` bitmask of `FitFlag` diagnostics; rows are retained |
 | `background` | Background map; for Aguet, a screening estimate with NaNs outside the crop |
 | `dispersion` | Estimated variance per unit signal for the multi-emitter detector; NaN for Aguet |
 | `info` | Method-specific fit counts and diagnostics; Aguet includes failed fits |
@@ -73,16 +74,16 @@ amplitude-width covariance in its flux uncertainty.
 
 `peak` is derived from flux and fitted width. It helps compare a spot with
 the image background, but varies with width and can exceed the brightest
-observed pixel when the emitter lies between pixels. Localization and reject
-tables include `peak`; linking and aggregate flags use total flux.
+observed pixel when the emitter lies between pixels. Localization tables
+include `peak`; brightness-aware linking uses total flux.
 
 Multi-emitter uncertainties use the final, undamped expected Fisher matrix,
 scaled by local dispersion. If covariance cannot be computed, errors are NaN.
 `locs.info["fisher_fraction"]` contains one row per detection and columns
 `(flux, y, x, sigma)`: values near zero indicate strong coupling to other
 fitted parameters; 1 means no coupling. This diagnostic is independent of
-parameter units and does not change count selection. Rejected fits have a
-matching `info["reject_fisher_fraction"]` array. See
+parameter units and does not change count selection. All arrays stay aligned
+with the returned rows. See
 [curvature and uncertainty](docs/DETECTION.md#curvature-and-uncertainty).
 
 The detectors' fitted widths differ slightly by convention: pixel integration
@@ -105,7 +106,6 @@ estimate its background reference level.
 | `count_penalty` | 0 | Extra non-negative cost per emitter in either mode |
 | `k_max` | 12 | Maximum emitters fitted jointly in one box |
 | `slack` | `(0.7, 2.2)` | Allowed fitted widths, relative to `sigma` |
-| `band` | `(0.8, 2.0)` | Reported widths, with a two-SE allowance; `None` reports all fits |
 
 The fixed cost is `10 + count_penalty` in dispersion-scaled likelihood units.
 BIC minimizes `I/phi + K*(2*log(n_pixels) + count_penalty)` over a bounded
@@ -143,17 +143,29 @@ The original `spotfitlm` took 172.1 ms on the sparse full-frame benchmark:
 and [Aguet measurements](docs/AGUET_BASELINE.md#validation-and-speed) for conditions
 and reproduction commands.
 
-## Calibrate sigma
+## Choose a detection width
+
+`sigma` is an approximate search scale, not an exact width shared by every
+emitter. Each spot's width is fitted; the multi-emitter fit uses the bounds
+`slack * sigma`. Inspect a `fit_sigma` histogram from the first frame or a
+few frames to choose a representative scale. Aguet provides a cheap initial
+pass when spots are sufficiently isolated:
 
 ```python
-cal = spotsolve.calibrate_sigma(stack, sigma_guess=1.2, offset=100)
-cal.sigma, cal.ci    # fitted width and 95% bootstrap interval
-cal.widths          # individual fitted widths
+import numpy as np
+
+preview = spotsolve.localize_aguet_stack(stack[:3], sigma=1.2, offset=100)
+widths = np.concatenate([result.fit_sigma for result in preview])
+counts, bin_edges = np.histogram(widths, bins="auto")
+# Plot counts against bin_edges with your preferred plotting tool.
 ```
 
-Calibration uses the multi-emitter detector with the reporting band off and
-iterates the median width. A starting guess within about 25% worked in the
-validation; broad or out-of-focus populations can pull the estimate upward.
+Choose from the main isolated-spot population rather than automatically
+averaging broad objects and overlaps. In crowded images, use an isolated ROI
+or the joint detector for this inspection. Aguet's sampled-Gaussian widths
+differ slightly from integrated widths; an approximate starting scale does
+not need an exact conversion. If fitted widths reach the optimization bounds,
+reconsider `sigma` or `slack`. There is no separate width-calibration API.
 
 ## Link detections
 
@@ -166,28 +178,31 @@ from spotsolve import loctable
 
 parts, next_id = [], 0
 for t, result in enumerate(movie):
-    rows, _, _ = loctable.frame_tables(result, frame=t, loc_id0=next_id)
+    rows, _ = loctable.frame_tables(result, frame=t, loc_id0=next_id)
     parts.append(rows)
     next_id += len(rows)
 locs = loctable.concat(parts)
-locs = loctable.filter_aggregates(locs)  # optional: retain point emitters
-locs = loctable.filter_quality(locs)  # require usable coordinates and errors
+# Optional post-processing; the original table retains every measurement.
+usable = locs.filter(pl.col("flags") == 0)
+usable = loctable.filter_quality(usable)  # require usable coordinates and errors
 # Optional precision cut: max_se_pos=0.5 (pixels; calibrate for your data).
 
-tracks = spotsolve.link(locs)
+tracks = spotsolve.link(usable)
 tracks.select("track_id", "frame", "y", "x")
 
-params = spotsolve.fit_link_params(locs)  # inspect or reuse estimated parameters
-tracks = spotsolve.link(locs, params)
+params = spotsolve.fit_link_params(usable)  # inspect or reuse estimated parameters
+tracks = spotsolve.link(usable, params)
 
 # Optional conservative linking; 1 nat is an example, not a calibrated cutoff.
-tracks = spotsolve.link(locs, params, min_link_margin=1.0,
+tracks = spotsolve.link(usable, params, min_link_margin=1.0,
                        min_track_length=4, diagnostics=True)
 accepted = tracks.filter(pl.col("track_accepted"))
 ```
 
-Linking preserves rows and columns and adds `track_id`. Motion, continuation
-and error scaling are estimated from the movie. `brightness=True` optionally
+Linking uses the frame-to-frame LAP stage of Jaqaman-style tracking with
+Brownian-motion costs. It preserves rows and columns and adds `track_id`.
+Motion, continuation and error scaling are estimated from the movie.
+`brightness=True` optionally
 uses flux and flux uncertainty. A missed detection ends a track; there is no
 gap closing or merging/splitting. See [tracking](docs/TRACKING.md) for the
 motion model, parameters, benchmarks and limits.
@@ -199,11 +214,29 @@ python -m pytest -q
 cargo test --release --workspace --manifest-path rust/Cargo.toml
 ```
 
-The 2026-09-17 verification passed **75 Python and 47 Rust tests**, including
-singular-covariance handling, Fisher diagnostics and peak output. Existing
-fit, uncertainty, classification and background arrays were unchanged in six
-simulation frames covering fixed and BIC selection. Aguet is checked against
+Tests cover simulation recovery, singular-covariance handling, fit flags,
+Fisher diagnostics, tables and Brownian-motion linking. Aguet is checked against
 frozen original `spotfitlm` fits, including covariance, masks and worker counts.
 
 [Documentation index](docs/README.md) · [Source map and validation](docs/README.md#implementation)
 · [Historical experiments](docs/archive/README.md)
+
+## Measurement-first output
+
+Localization does not discard fitted spots for brightness or width. Use
+`fit_sigma`, `sigma_se`, `flux`, `se_flux` and fit flags to choose downstream
+criteria. Candidate screening and emitter-count selection still determine
+which sources are fitted; this is not an exhaustive list of image maxima.
+
+`FitFlag` reports edge support, non-convergence, stalling, unavailable
+covariance, active bounds and unsettled neighboring-light context. Zero flags
+does not prove a correct PSF or calibrated uncertainty. The three-sigma edge
+support and numerical tolerances are explicit conventions, not object classes.
+See [fit diagnostics](docs/LOCALIZATION_QUALITY.md).
+
+API changes: `band`, `BAND`, `BAND_Z`, aggregate helpers and columns,
+`REJECT_DTYPE`, `Localizations.rejects`, `loctable.reject_table`,
+`calibrate_sigma`, and `SigmaCalibration` have been removed. `frame_tables`
+now returns `(localizations, frame_summary)`.
+The movie script saves those two tables and metadata; it no longer writes
+aggregate or reject tables. Rebuild the Rust extension when updating.

@@ -27,9 +27,7 @@ CAMERA_OFFSET = 100.0
 def main(args):
     img = tifffile.imread(args.image)
     if img.ndim == 3:
-        # A stack: this tool reports ONE frame. Detection is per-frame, so
-        # picking a frame here is the honest thing rather than projecting,
-        # which would blur emitters across their own motion.
+        # Select a frame without mixing emitters across time.
         if not 0 <= args.frame < len(img):
             raise SystemExit(f"--frame {args.frame} out of range for a stack "
                              f"of {len(img)}")
@@ -61,43 +59,17 @@ def main(args):
     print(audit.format_report(a, label=args.image))
     if res.se is not None and len(res.se) and np.isfinite(res.se).any():
         sp = np.nanmedian(np.hypot(res.se[:, 1], res.se[:, 2]))
-        print(f"median position CRLB: {sp:.3f} px")
+        print(f"median position SE: {sp:.3f} px")
     if len(res.amplitudes):
         q = np.percentile(res.amplitudes, [5, 50, 95])
         print(f"amplitude ADU (5/50/95): {q[0]:.0f} / {q[1]:.0f} / {q[2]:.0f}")
-    rep = spotsolve.aggregate_report(res, ratio=args.agg_ratio)
-    if rep["n_aggregates"]:
-        print(f"\naggregates (post-hoc, flux > {args.agg_ratio:.0f}x the "
-              f"median detection of {rep['median_flux']:.0f} ADU): "
-              f"{rep['n_aggregates']} objects from "
-              f"{rep['n_detections_flagged']} detections, "
-              f"{100*rep['flux_fraction']:.1f}% of all detected flux")
-        print(f"{'y':>8} {'x':>8} {'flux ADU':>11} {'x median':>9} {'ndet':>5}")
-        for o in rep["objects"]:
-            print(f"{o['y']:8.2f} {o['x']:8.2f} {o['flux']:11.0f} "
-                  f"{o['ratio']:9.1f} {o['n']:5d}")
-
-    wide = res.rejects[res.rejects["reason"] == "too_wide"]
-    if len(wide):
-        print(f"\nwide objects (modelled, not reported as detections): "
-              f"{len(wide)}")
-        print(f"{'y':>8} {'x':>8} {'sigma':>7} {'flux ADU':>10}")
-        for g in np.sort(wide, order="flux")[::-1]:
-            print(f"{g['y']:8.2f} {g['x']:8.2f} {g['sigma']:7.2f} "
-                  f"{g['flux']:10.0f}")
+    print(f"fit diagnostics flagged {np.count_nonzero(res.flags)} of {len(res)} rows")
 
     fig, ax = plt.subplots(1, 4, figsize=(15, 4.0))
     ax[0].imshow(img, cmap="gray")
     if len(res.positions):
         ax[0].plot(res.positions[:, 1], res.positions[:, 0], "r+", ms=8, mew=1.3)
-    # Wide objects drawn at twice their fitted width, so what the model
-    # absorbed as a non-point-source is visible rather than merely tabulated.
-    for g in wide:
-        ax[0].add_patch(plt.Circle((g["x"], g["y"]), 2 * g["sigma"],
-                                   fill=False, ec="orange", lw=1.4, ls="--"))
     ttl = f"{args.image}\nN={len(res.positions)}"
-    if len(wide):
-        ttl += f"  (+{len(wide)} wide)"
     ax[0].set_title(ttl, fontsize=9)
     ax[1].imshow(res.model_image, cmap="gray")
     ax[1].set_title("model", fontsize=9)
@@ -135,8 +107,5 @@ if __name__ == "__main__":
                     help="which frame, if the file is a stack")
     ap.add_argument("--sigma", type=float, default=1.2)
     ap.add_argument("--k-max", type=int, default=12)
-    ap.add_argument("--agg-ratio", type=float, default=spotsolve.AGG_AMP_RATIO,
-                    help="post-hoc aggregate flag: flux as a multiple of the "
-                         "frame's median detection (reported, never removed)")
     ap.add_argument("--out", default="result.png")
     main(ap.parse_args())

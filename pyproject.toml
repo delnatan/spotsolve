@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "spotsolve"
 version = "0.1.0"
-description = "Multi-emitter spot detection and localization by Bayesian model selection"
+description = "Multi-emitter spot detection, localization and tracking"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
@@ -29,9 +29,6 @@ classifiers = [
 dependencies = [
     "numpy>=1.24",
     "scipy>=1.10",
-    # `loctable` is the table the detector writes and `tracking` reads, and
-    # linking is not optional the way plotting is -- the movie-level half of
-    # this package speaks DataFrames.
     "polars>=1.0",
 ]
 
@@ -41,11 +38,7 @@ scripts = [
     "tifffile>=2023.1.1",
     "matplotlib>=3.7",
 ]
-# The `spotsolve_rs` extension is NOT listed here: it is a local sibling crate
-# built from `rust/spotsolve-py`, not a published dependency. Build it with
-#     maturin develop --release -m rust/spotsolve-py/Cargo.toml
-# `spotsolve.localize`, `localize_stack` and `calibrate_sigma` require it.
-# `dev` carries the build tool itself (maturin), not the extension it builds.
+# Build the local Rust extension with maturin; it is not a published dependency.
 dev = ["maturin>=1.4"]
 test = ["pytest>=7.0"]
 

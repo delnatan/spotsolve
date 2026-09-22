@@ -116,6 +116,8 @@ def test_flux_uncertainty_uses_amplitude_width_covariance_and_tables_work():
         np.testing.assert_allclose(result.se[i,0]**2,gradient@cov[i]@gradient,rtol=1e-12)
     tables = loctable.frame_tables(result,frame=0)
     assert tables[0].height==len(result)
+    np.testing.assert_array_equal(tables[0]["bg"], theta[:, 4])
+    np.testing.assert_array_equal(tables[0]["sigma_se"], result.sigma_se)
     assert np.isfinite(result.se).all() and np.all(result.se>0)
     shifted=localize_aguet(image+100,1.45,offset=100)
     assert_same(result,shifted)

@@ -23,7 +23,6 @@ with reusable worker storage. There is no nested thread pool.
 | Multi-emitter detection | `src/spotsolve/native.py` | `boxsearch.rs`, `lmcl.rs`, `patches.rs` |
 | Aguet baseline | `src/spotsolve/aguet.py` | `aguet.rs` |
 | Shared filters/algebra | Native bindings | `filters.rs`, `linalg.rs` |
-| Sigma calibration | `src/spotsolve/calibration.py` | Uses multi-emitter detection |
 | Tables and results | `src/spotsolve/loctable.py`, `results.py` | — |
 | Tracking | `src/spotsolve/tracking.py` | `track.rs`, `lap.rs`, `trackparams.rs` |
 
@@ -43,13 +42,9 @@ python -m pytest -q
 cargo test --release --workspace --manifest-path rust/Cargo.toml
 ```
 
-The localization-quality update passed **102 Python tests** and all six guide
-examples. The preceding conservative-linking run passed **50 Rust tests**,
-including assignment margins, minimum-length semantics, collinear indexing,
-peak output, Fisher diagnostics and invalidation of stale uncertainties. Existing
-output arrays were unchanged in six simulation frames across both selection
-modes. The earlier scheduler cleanup preserved all fields in 134 regression
-cases, including 49 real frames in both modes.
+Tests cover assignment margins, minimum-length semantics, collinear indexing,
+peak output, fit flags, Fisher diagnostics and invalidation of stale
+uncertainties. See the [audit](AUDIT.md) for current validation results.
 
 Fixtures under `tests/fixtures` are frozen. Most came from the retired Python
 reference. `08_track.json` comes from `tracksolve`; `09_aguet.json` pins the
@@ -71,3 +66,5 @@ Benchmark runners:
 `scripts/localize_movie.py` exports multi-emitter results and accepts
 `--selection`, `--count-penalty` and `--threads`. Aguet is currently exposed
 through its Python API, not that script.
+
+- [Code audit and API migration](AUDIT.md): measurement output, fit diagnostics and numerical corrections.

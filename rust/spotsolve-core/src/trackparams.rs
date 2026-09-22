@@ -1,56 +1,13 @@
-//! Measuring the linker's parameters instead of asking for them.
+//! Estimate the diffusion population, continuation rate and birth intensity.
 //!
-//! Ported from `tracksolve`'s `params`. Every number in [`Params`] is a
-//! property of the dataset -- how far a particle moves between frames, how
-//! often the detector misses one, how many new particles appear -- so it is
-//! measured here and the linker ships with no dials.
+//! Initialization fits between-frame nearest-neighbor distances as a mixture
+//! of true successors and unrelated detections. Within-frame distances supply
+//! the unrelated-neighbor reference through a log-distance KDE.
 //!
-//! # The link-free initializer
-//!
-//! Estimating a step size by linking and looking at the steps is circular:
-//! the linking used a step size, and that is what comes back. So the first
-//! estimate uses a statistic that needs no association at all -- for every
-//! detection, the distance to the NEAREST detection in the following frame.
-//! That distance is a mixture of the true successor, when it was detected and
-//! happened to be nearest, and an unrelated particle when it was not.
-//!
-//! The true-successor half is itself a mixture over D: for diffusion `D` the
-//! per-axis displacement variance is `2*D*dt + se_a^2 + se_b^2`, so the
-//! displacement magnitude is Rayleigh with that scale. Fitting the weights of
-//! that mixture over the D grid therefore estimates the POPULATION
-//! DISTRIBUTION of D, which is the prior the linker needs most; the immobile
-//! population shows up as weight on `D = 0`, whose Rayleigh scale is pure
-//! localization jitter.
-//!
-//! The wrong-neighbour half is taken from the data, not from a Poisson
-//! model, and that is deliberate. tracksolve measured a real GEM dataset
-//! whose bounding box gives 0.229 detections/um^2 -- predicting a median
-//! nearest-neighbour distance of 0.98 um -- against an observed median of
-//! 0.69 um, an effective density twice the nominal one, because the box spans
-//! the nucleus and the space outside the cell where no particle can be.
-//! Assuming homogeneity would push that error into every score. So the
-//! reference is the observed distribution of WITHIN-frame nearest-neighbour
-//! distances, as a kernel density on log distance ([`LogKde`]), which absorbs
-//! clustering and exclusion zones automatically.
-//!
-//! # The refinement loop, and why it is soft
-//!
-//! Then three rounds of link, re-estimate, re-link. The failure mode is a
-//! feedback loop with a fixed point at zero: under-link, so the estimated D
-//! shrinks, so the gate tightens, so fewer links survive. Three guards, the
-//! first mattering most: re-estimation uses the POSTERIOR-weighted D of each
-//! track rather than its point estimate, which is what makes this a soft EM
-//! rather than the hard EM that collapses; each update is damped halfway
-//! toward the new value; and every iterate is clamped within `EM_CLAMP` of
-//! the link-free estimate, which cannot drift because it never saw a link.
-//!
-//! tracksolve has a fourth guard -- stop if the total evidence falls -- which
-//! is not ported. It fired in 0 of 27 fits across three densities and three
-//! detection/clutter settings, and it cannot fire honestly in this mode
-//! anyway: the evidence it compares moves with the clutter intensity, which
-//! in a single-scan linking is estimated from unlinked detections, of which
-//! there are none (every detection lands in some track). The clutter
-//! intensity itself cancels out of every linking decision; see `track`.
+//! Refinement alternates linking and posterior-weighted parameter updates.
+//! Damping and clamps around the link-free initializer limit feedback toward
+//! zero diffusion. Iteration history is returned for inspection.
+//! See docs/TRACKING.md for the assumptions and validation.
 
 use crate::track::{Buckets, CellIndex, Detections, Filter, Linking, Params};
 use crate::track::{D_GRID_DECADES, D_GRID_N, FluxModel, link};

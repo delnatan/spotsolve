@@ -1,70 +1,13 @@
-"""Linking localizations into trajectories: the table in, `track_id` out.
+"""Link localization tables frame to frame, preserving all input rows.
 
-`localize` answers a question about one image. This module answers the one
-question a MOVIE asks that a single frame cannot: which detections are the
-same particle. It reads the standard localization table (`loctable`) and
-returns it with one column added, so the result is a `polars` DataFrame with
-`frame` and `track_id` -- napari's convention for a Tracks layer -- and every
-detector column still beside it.
+The linker reads `frame`, `y`, `x`, `se_y`, `se_x` and, with `brightness=True`,
+`flux` and `se_flux`. Apply any localization filtering before calling it.
+Missing observations end tracks; there is no gap closing or merge/split model.
 
-    import polars as pl
-    import spotsolve
-    from spotsolve import loctable, tracking
-
-    locs = loctable.concat([...])                      # one row per detection
-    locs = loctable.filter_aggregates(locs)            # point emitters only
-    tracks = tracking.link(locs)
-    tracks.select("track_id", "frame", "y", "x")
-
-Frame-to-frame linking only -- stage 1 of Jaqaman et al. (2008, *Nat. Methods*
-5:695). A missed detection ENDS a track: fragmenting a trajectory is a safe
-failure and switching its identity is not, so gaps are left for a later stage
-to close rather than guessed at here. Every detection ends up in some track,
-and one that never links is a track of length 1.
-
-What it reads, and what it does not
------------------------------------
-`frame`, `y`, `x`, `se_y`, `se_x`, in pixels and frames. The errors are the
-point of it: they are spotsolve's per-detection CRLB, so the gate around a
-bright, precisely localized spot is genuinely tighter than the one around a
-dim one, and the cost of a link is a likelihood ratio rather than a distance.
-The measurements behind that choice sit in `rust/spotsolve-core/src/track.rs`.
-
-`flux` and `se_flux` are read only with `link(locs, brightness=True)`. Then
-each track also carries its log-flux level, and a link is scored on how well
-a detection's brightness matches it, so a bright particle keeps its identity
-among dimmer, faster ones: spiked into real GEM frames, a mobile bright spot
-was taken over by a dim neighbour half as often (56 -> 29 steals). It is not
-the default because real GEM flux flickers by a factor of about 2 per frame,
-and on that movie about 2% more tracks end as single detections, without
-truth to say whether those breaks are right. The measurement sits in
-`rust/spotsolve-core/src/track.rs` at `FluxModel`.
-
-`is_aggregate` is not read either: this links what it is given. Aggregates are
-flagged by `loctable`, not deleted, and whether to drop them is the caller's
-decision -- `loctable.filter_aggregates(locs)` before linking.
-
-Units
------
-Pixels and frames throughout, which is what the table holds. `D` therefore
-comes back in px^2/frame; multiply by `pixel_size**2 / dt` for um^2/s. The
-scores are log likelihood ratios, which are invariant to the choice of units,
-so this produces the same links either way -- the conversion is a reporting
-convenience and never enters a decision.
-
-Motion parameters and acceptance
---------------------------------
-Motion-model parameters are estimated from the data by `fit_link_params`, which `link`
-calls for you if you do not pass one. Fit once and reuse it when you are
-linking several movies of the same sample, or to read what was estimated:
-`params.trajectory` records the empirical-Bayes loop iterate by iterate, so a
-fit that goes wrong says so rather than quietly returning a worse answer.
-
-Acceptance is a separate choice: `min_link_margin` can end tracks at ambiguous
-assignments, and `min_track_length` flags segments with enough consecutive
-frames for analysis. Neither supplies D or changes the population fit. Short
-segments remain in the output. A margin is a score difference, not a calibrated
-probability of a correct link; `diagnostics=True` exposes it for inspection.
+Motion parameters come from `fit_link_params` unless supplied. Diffusion uses
+px²/frame; multiply by pixel_size²/frame_interval for µm²/s. Optional link
+margin and track-length criteria control association and analysis separately.
+See docs/TRACKING.md for the model, diagnostics and validation.
 """
 
 from dataclasses import dataclass, field
@@ -81,8 +24,7 @@ except ImportError as error:          # pragma: no cover - build problem
 __all__ = ["LinkParams", "fit_link_params", "link", "LINK_COLUMNS"]
 
 LINK_COLUMNS = ("frame", "y", "x", "se_y", "se_x")
-"""The only columns the linker reads. Kept deliberately narrow: a linker that
-reads nothing else cannot come to depend on a detector-internal column."""
+"""Required columns; brightness mode additionally reads flux and se_flux."""
 
 
 @dataclass(frozen=True)
@@ -90,7 +32,7 @@ class LinkParams:
     """What the linker needs, measured from the movie rather than supplied.
 
     `d_grid` is the grid of candidate diffusion coefficients (px^2/frame,
-    starting at an exact zero for genuinely immobile particles) and
+    including zero for immobile particles) and
     `d_logprior` the fitted population distribution over it. Every track
     carries its own posterior over that grid, which is why an immobile
     particle ends up with a tighter gate than a mobile one.

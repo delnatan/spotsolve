@@ -1,104 +1,15 @@
-//! Frame-to-frame linking: the motion model, the gate, and the assignment.
+//! Frame-to-frame assignment with per-track diffusion-mixture filtering.
 //!
-//! Ported from `tracksolve` (`motion`, `gate`, `score`, `linker` in
-//! `mode="lap"`), whose Python is the reference this was checked against.
-//! Stage 1 of Jaqaman et al. (2008, *Nat. Methods* 5:695) only: no gap
-//! closing, no merges or splits, and no multiple-hypothesis deferral.
+//! Each diffusion grid point carries a scalar Kalman filter per axis. Scores
+//! combine the predictive likelihood, survival and birth intensity. A sparse
+//! assignment resolves competition; there is no gap closing or merge/split model.
+//! Position errors are marginal measurement SEs, treated as independent axes.
+//! Optional flux filtering adds a log-flux likelihood to each candidate link.
 //!
-//! # Why this cost and not `d^2`
-//!
-//! A ladder of arms measured on tracksolve's simulator (10x10 um, 30%
-//! immobile and 70% at D = 0.3 um^2/s, dt = 22 ms, se ~ 29 nm with 30%
-//! spread, 95% detection, some clutter, 3 seeds), as switches per 100 links
-//! against the step/nearest-neighbour ratio that controls how ambiguous
-//! linking is:
-//!
-//! | step/NN | `d^2` | one-D Gaussian | D mixture | greedy | **this** |
-//! |---------|-------|----------------|-----------|--------|----------|
-//! | 0.22    | 1.81  | 1.55           | 1.69      | 1.60   | **1.43** |
-//! | 0.50    | 11.99 | 10.38          | 10.24     | 11.40  | **9.35** |
-//! | 0.80    | 29.90 | 23.56          | 22.99     | 23.73  | **22.04**|
-//! | 1.00    | 41.30 | 32.95          | 32.06     | 32.43  | **30.85**|
-//! | 1.20    | 50.23 | 40.88          | 40.20     | 39.70  | **39.20**|
-//!
-//! Reading the columns: replacing plain squared displacement with a log
-//! likelihood ratio that knows each detection's own localization error is
-//! worth about 20% of the switches once crowding matters; giving every track
-//! its own posterior over D (this module) takes another ~1 per 100; and
-//! solving the assignment exactly rather than greedily is worth 1-2 per 100
-//! on its own (`lap`).
-//!
-//! Deferring decisions is the one thing left, and it is not here: tracksolve
-//! implements it and measured it LOSING to this, even on well-separated
-//! particles, because its set-packing solver falls back to a heuristic on the
-//! components that matter. With a cost that depends only on the pair being
-//! linked, a whole-movie solver would add nothing either -- the movie
-//! decomposes into independent frame pairs -- so per-track memory, which is
-//! what the filter bank below carries, is the only thing that beats a
-//! one-frame-at-a-time exact assignment.
-//!
-//! # The model
-//!
-//! Position only: Brownian position is a martingale, so the one-step
-//! prediction is the current estimate and a velocity state would impose
-//! directed motion that free diffusion does not have. The measurement
-//! covariance is spotsolve's CRLB, which is diagonal, and the process noise
-//! `2*D*dt*I` is diagonal, so the 2-D filter is two independent scalar
-//! filters -- no matrix, no inverse, no Cholesky anywhere in this module.
-//!
-//! Filtering POSITIONS rather than scoring displacements is what makes the
-//! errors come out right: `d1 = x2 - x1` and `d2 = x3 - x2` share the error
-//! at `x2`, so `Cov(d1, d2) = -se^2`, and a cost built on per-step
-//! displacements (u-track's, trackpy's) treats them as independent.
-//!
-//! D is not fitted. There is no conjugate prior for it once localization
-//! error is nonzero, so it lives on a grid that includes an exact zero, and
-//! every track carries a posterior over that grid. The zero is not cosmetic:
-//! an immobile particle given a nonzero floor gets a gate of radius
-//! `sqrt(2*D*dt + 2*se^2)` instead of `sqrt(2*se^2)`, and over-wide gates on
-//! a dense immobile population are how identity switches get manufactured.
-//!
-//! # Units
-//!
-//! Pixels and frames, with `dt = 1` frame throughout, so `d_grid` is in
-//! px^2/frame and `lam_birth` in births per px^2 per frame. The scores are
-//! log likelihood RATIOS, which are invariant under a change of units, so
-//! this produces the same links as tracksolve's um and seconds.
-//!
-//! # Cost, and what the port reproduces
-//!
-//! On `data/hyp7gem_wt_crop.tif` (49 frames, 21,438 detections after the
-//! detector, ~438 per frame) this and tracksolve agree on **100% of links**
-//! and on every fitted parameter to the digits printed, with each side
-//! fitting its own parameters from scratch:
-//!
-//! | stage | tracksolve (Python) | here | speedup |
-//! |-------|---------------------|------|---------|
-//! | parameter fit (3 linkings) | 13.03 s | 0.13 s | 100x |
-//! | one linking | 2.17 s | 0.03 s | 72x |
-//!
-//! The gate is what keeps that near-linear in detections: without it every
-//! track would be scored against every detection in the next frame.
-//!
-//! # What the clutter intensity would do, and why it is absent
-//!
-//! tracksolve's score is `log(p_cont) + logL - log(lam_fa)` for a link,
-//! `log(lam_birth) - log(lam_fa)` for a birth and `log(1 - p_cont)` for a
-//! termination. In an assignment only the GAIN of linking over not linking
-//! matters, and `lam_fa` cancels out of it exactly:
-//!
-//! ```text
-//!   gain = [log p_cont + logL - log lam_fa]
-//!        - [log(1 - p_cont)] - [log lam_birth - log lam_fa]
-//!        =  log p_cont + logL - log(1 - p_cont) - log lam_birth
-//! ```
-//!
-//! Its only other use there is a "stop if total evidence fell" rule in the
-//! parameter fit, which fired in 0 of 27 fits across three densities and
-//! three detection/clutter settings -- and cannot fire honestly anyway, since
-//! in LAP mode every detection lands in some track, so the estimator that
-//! feeds it sees no unlinked detections at all. Both are left out. See
-//! `trackparams`.
+//! Units are pixels and frames: diffusion is px²/frame and birth intensity
+//! is tracks/px²/frame. Zero diffusion is an explicit grid point. Background
+//! clutter cancels from the link-versus-birth likelihood ratio.
+//! See docs/TRACKING.md for validation and model limitations.
 
 use crate::lap;
 

@@ -7,6 +7,10 @@ tables; see the [README example](../README.md#link-detections).
 
 ## Model and assignment
 
+This implements frame-to-frame LAP linking in the style of Jaqaman's first
+stage, with Brownian-motion likelihood costs. It does not implement the later
+gap-closing or merge/split stages.
+
 Each track keeps a position filter and a posterior over 16 diffusion values,
 including exact zero. Brownian motion predicts the current position as the
 next mean; localization uncertainty comes from each detection. Keeping an

@@ -21,7 +21,7 @@ def test_bic_keeps_real_sources_and_can_choose_background(kw):
     np.testing.assert_allclose(res.residual, sim.image - res.model_image)
     # K=0 is a real competitor, including when candidates have strong signal.
     empty = localize(sim.image, sigma=1.2, selection="bic", count_penalty=1e6)
-    assert len(empty) == 0 and len(empty.rejects) == 0
+    assert len(empty) == 0 and len(empty.flags) == 0
     assert empty.positions.shape == (0, 2)
     assert np.isfinite(empty.model_image).all()
 

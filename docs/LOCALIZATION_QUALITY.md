@@ -1,164 +1,108 @@
-# A simple localization-quality filter
+# Localization measurements and diagnostics
 
-Use **coordinate precision as the main filter**, and add a flux-significance
-cut only if weak detections remain a problem. Keep the original localization
-table for inspection. Neither detector needs a composite quality score or
-extra columns for this workflow.
+Both detectors return measured quantities without width or brightness cuts.
+The multi-emitter detector retains every source selected by its count model,
+including fits with diagnostic flags. Aguet omits failed attempts, recording
+seed coordinates and status in `result.info["failures"]`.
 
-## Start here: the same filter for both detectors
+## Preserve the measurements
 
 ```python
-import numpy as np
 import polars as pl
 import spotsolve
 from spotsolve import loctable
 
-# frame_img is a raw 2-D image; use your own sigma and camera offset.
 result = spotsolve.localize(frame_img, sigma=1.45, offset=100)
-# Or: result = spotsolve.localize_aguet(frame_img, sigma=1.45, offset=100)
+locs, summary = loctable.frame_tables(result, frame=0)
 
-locs, _, _ = loctable.frame_tables(result, frame=0)
-usable = loctable.filter_quality(locs, max_se_pos=0.5)
-rejected = locs.join(usable.select("loc_id"), on="loc_id", how="anti")
+# Optional downstream selection. Keep locs for inspection and alternate cuts.
+usable = locs.filter(pl.col("flags") == 0)
 ```
 
-`0.5` pixels is an **example to evaluate, not a calibrated default**.
-`filter_quality` always removes non-finite coordinates and non-positive or
-non-finite coordinate SEs. Without a cutoff it performs only that basic check.
-It preserves the columns, IDs, and order of retained rows.
+Tables preserve coordinates, total flux, fitted width, their marginal SEs,
+model peak, fitted background, flags and Fisher fractions. `bg` is the fitted
+background at the emitter's nearest pixel, excluding neighboring emitters.
+The full-frame `result.background` and rendered residual remain diagnostic:
+patches fit separate background levels, so there is no single shared fitted
+background surface. Aguet's map is its screening background, with NaNs outside
+the processed crop.
 
-| Optional argument | Meaning | When to use it |
-|---|---|---|
-| `max_se_pos` | Maximum `hypot(se_y, se_x)` | Coordinates must be precise enough for your analysis |
-| `min_flux_snr` | Minimum `flux / se_flux`, requiring valid positive flux and flux SE | Additional screening of weakly supported signal |
+Flux and background use ADU above offset; divide flux by gain for
+photoelectrons. Coordinates and widths use pixels. The `*_um` columns use
+`pixel_size` supplied to `frame_tables`. `se_pos = hypot(se_y, se_x)` is radial
+RMS uncertainty, not a 68% confidence-circle radius.
 
-For example, to also try a flux-significance cut:
+## Flags describe fit conditions
 
-```python
-usable = loctable.filter_quality(locs, max_se_pos=0.5, min_flux_snr=3.0)
+Flags can coexist. Test individual bits with `result.flags & int(spotsolve.FitFlag.EDGE)`.
+
+| Flag | Value | Meaning |
+|---|---:|---|
+| `OK` | 0 | No reported issue; does not certify the model or uncertainty |
+| `EDGE` | 1 | Three fitted sigmas extend beyond a physical image edge |
+| `NOT_CONVERGED` | 2 | Final refinement did not meet its projected-gradient tolerance, or refinement was disabled |
+| `STALLED` | 4 | Final optimizer stopped without an acceptable step; also not converged |
+| `COVARIANCE_UNAVAILABLE` | 8 | A positive finite variance could not be computed for every emitter parameter |
+| `AT_BOUND` | 16 | A fitted emitter parameter or shared background is within numerical tolerance of an optimization bound |
+| `CONTEXT_UNSETTLED` | 32 | Frozen neighboring light changed after the last fit beyond refinement tolerance |
+
+The edge flag uses pixel boundaries at -0.5 and size-0.5, independently of
+reference width or ROI boundaries. A Gaussian has infinite tails; three
+sigmas is the stated finite-support convention, not a proof of failure.
+Bound tolerance is `1e-6 * (1 + abs(bound))` plus twice the optimizer's
+strict-interiority margin (`1e-10` of the parameter range). A bound-limited fit is constrained
+by the allowed model; it is not evidence that an object is biologically too
+wide or bright. Refitting with appropriate bounds can resolve that condition.
+
+The multi-emitter optimizer checks stationarity at returned parameters.
+Non-convergence and missing covariance are separate: finite SEs do not imply
+convergence. Convergence flags apply to the joint patch; boundary flags also
+include its shared background. Frozen-neighbor changes above 0.001 pixels in
+position/width or 0.1% in flux trigger another refinement, up to four sweeps.
+At the limit, `CONTEXT_UNSETTLED` exposes the remaining inconsistency.
+
+Aguet's returned fits already passed optimizer, observed-Hessian covariance,
+parameter and patch-bound checks. They carry the same geometric edge flag.
+Its failed attempts do not have reliable localization rows.
+
+## Uncertainty and coupling
+
+The multi-emitter SEs use the undamped expected Fisher matrix at the returned
+fit, scaled by local dispersion. Aguet uses observed curvature and propagates
+amplitude-width covariance into total-flux uncertainty. These are local model
+approximations; bounds, low counts, overlap and model mismatch can invalidate
+coverage. Frozen neighbors and estimated background shape are treated as known.
+
+`result.info["fisher_fraction"]` and table columns `fisher_flux`, `fisher_y`,
+`fisher_x`, `fisher_sigma` report conditional/marginal variance:
+
+```text
+fraction[q] = 1 / (F[q,q] * inverse(F)[q,q])
 ```
 
-`se_pos` is a model-based radial RMS uncertainty, not a 68% confidence-circle
-radius. The cutoff uses the input coordinate units: **pixels** for
-`frame_tables`. A requested precision of 0.05 µm therefore corresponds to
-`max_se_pos=0.05 / pixel_size_um` on the standard table. Both optional cutoffs
-must be positive and finite.
+Small fractions mean strong coupling to jointly fitted parameters. They do
+not necessarily mean poor absolute precision, and are not rejection rules.
+Unavailable values are NaN, including all Fisher fractions for Aguet.
+Tables carry them with row IDs, so they stay aligned after sorting/filtering.
 
-The helper recomputes precision and flux significance from their base columns
-so stale derived columns cannot affect filtering. A small SE or `flux_snr >= 3`
-does not prove that an emitter is real or imply a calibrated false-positive rate.
+## Apply analysis-specific cuts afterwards
 
-## Multi-emitter: keep routine criteria small
+`loctable.filter_quality` is an optional post-processing helper. It always
+requires finite coordinates and positive finite position SEs. It does not
+inspect flags. Its optional `max_se_pos` and `min_flux_snr` arguments apply
+user-chosen precision and flux-significance cuts; neither has a default.
+Derived quantities are recomputed from base columns, preserving IDs and order.
 
-The detector already decides emitter count and applies a width-reporting band
-by default. Start with the precision filter. Add a flux cut only if inspection
-or simulations show it helps. Increasing `count_penalty` and re-detecting is
-another way to demand stronger count support; measure the loss of real
-emitters too.
+Width cuts can use `fit_sigma` or `sigma_ratio` directly. A sampled-Gaussian
+Aguet width differs from a pixel-integrated width; see [PSF conventions](AGUET_BASELINE.md).
+Brightness and width alone do not identify aggregates or failed fits.
 
-For difficult overlaps, inspect the **existing** Fisher fractions on demand:
+For Aguet patch diagnostics, `2 * result.info["objective"]` is Poisson
+deviance. Large residuals can reflect overlap, background or PSF mismatch;
+there is no universal cutoff. The whole-image residual uses a diagnostic
+background and should not replace the fitted patch objective.
 
-```python
-fraction = np.asarray(result.info["fisher_fraction"]).reshape(-1, 4)
-position_fraction = np.min(fraction[:, 1:3], axis=1)  # y and x
-```
-
-The array aligns with original `result` rows, before filtering or sorting.
-Parameter order is `(flux, y, x, sigma)`. Each fraction is
-`1 / (F[q,q] * inverse(F)[q,q])`: near one means little parameter coupling;
-near zero means substantial variance inflation from jointly fitted parameters.
-NaN means unavailable. Frozen neighbors and background shape are treated as
-known in this calculation.
-
-**Use small fractions to find cases to inspect, not as a default rejection
-rule.** SE already includes the fitted coupling. A bright crowded emitter can
-have a small fraction and still be precisely localized. That is why this is
-not another argument to `filter_quality`.
-
-Finite SEs do not certify convergence. Refinement convergence/stalling flags,
-final per-emitter removal scores, and group goodness-of-fit values are not
-exposed in the localization table. The simple filter does not claim to check
-them. A shared group's residual cannot be assigned unambiguously to one emitter.
-
-## Aguet: inspect patch fit when needed
-
-Aguet already excludes non-converged fits, failed observed-Hessian covariance
-estimates, invalid parameters, and invalid image bounds. They appear in
-`result.info['failures']`, not in localization rows. Start with the same
-precision/optional flux filter.
-
-If isolated-looking detections still seem questionable, inspect the
-**existing** per-spot objectives:
-
-```python
-result = spotsolve.localize_aguet(frame_img, sigma=1.45, offset=100)
-deviance = 2 * np.asarray(result.info["objective"], dtype=float)
-dof = result.info["boxsize"] ** 2 - 5  # x, y, width, peak, background
-reduced_deviance = deviance / dof
-```
-
-This is the patch's Poisson deviance, using the fitter's data-floor convention.
-Large values can indicate overlap, an unsuitable PSF, or a nonconstant
-background. An approximate reference value of one applies under suitable
-Poisson conditions; **greater than one is not a rejection rule**. Calibrate a
-limit using good isolated spots through the complete screening/fitting pipeline.
-Low counts, gain, read noise, and offset subtraction affect this reference.
-Aguet has no fitted dispersion correction.
-
-After choosing `deviance_limit`, apply it without adding result columns:
-
-```python
-locs, _, _ = loctable.frame_tables(result, frame=0)
-patch_ok = np.isfinite(reduced_deviance) & (reduced_deviance <= deviance_limit)
-usable = loctable.filter_quality(locs.filter(pl.Series(patch_ok)), max_se_pos=0.5)
-```
-
-Apply this mask while the table still matches `result` row order. Use the
-patch objective rather than the optional whole-image residual, which uses a
-diagnostic screening-background map.
-
-Aguet has no width-reporting band. If necessary, use a calibrated interval on
-the existing `sigma_ratio` column. Calibrate it for Aguet's sampled PSF; its
-width differs slightly from the dense detector's integrated PSF
-([conventions](AGUET_BASELINE.md#reference-and-method)). A background-only
-comparison could add emitter-support evidence later, but is not required for
-this first workflow and is not currently returned as a score.
-
-## Check what was lost, then link
-
-Inspect retained and rejected patches across brightness, background, width,
-and crowding. Sweep precision first; test whether flux or Aguet deviance adds
-useful separation. Validate the combined policy on different movies/seeds.
-`is_aggregate` describes object type, not fit quality; filter it separately
-only if your analysis requires point emitters.
-
-Measure false detections and real detections lost. For trajectories, measure
-incorrect links and recovery against the **original** available true links,
-so filtering cannot improve apparent recall by shrinking its denominator.
-Check whether retained emitters shift toward bright, slow, or in-focus objects.
-
-In an exploratory three-movie dense-detector simulation, a 0.5-pixel cutoff
-retained 98.9% of truth-matched detections and removed 31% of unmatched
-detections, but true-link recovery fell from 91.0% to 89.8%. Truth matching
-at unresolved overlaps is imperfect. This supports evaluating a loose cut;
-it does not calibrate one for experimental data or Aguet.
-
-For movies, give each frame's table the correct `frame` and unique `loc_id`
-values, concatenate the tables, and filter **before linking**:
-
-```python
-# locs_movie is the concatenation of per-frame tables.
-usable = loctable.filter_quality(locs_movie, max_se_pos=0.5)
-tracks = spotsolve.link(usable, min_track_length=4)
-accepted_tracks = tracks.filter(pl.col("track_accepted"))
-```
-
-Keep original frame numbers: removing a detection creates a missing
-observation and can end a trajectory. Re-link after changing cuts; filtering
-already linked rows can leave IDs spanning gaps. Minimum track length and the
-optional [link-margin cutoff](TRACKING.md#conservative-links-and-minimum-length)
-are separate association/trajectory criteria.
-
-Further reading: [pointwise precision](https://www.nature.com/articles/ncomms15115),
-[consistency with raw images](https://www.nature.com/articles/s41467-020-20056-9),
-and [Poisson goodness of fit at low counts](https://arxiv.org/abs/1707.09202).
+Validate optional cuts against representative images and simulations. Keep
+original frame numbers and filter before linking: removing a row can end a
+trajectory. Re-link after changing cuts. [Track length and link margin](TRACKING.md)
+are separate downstream decisions.

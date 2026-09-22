@@ -1,43 +1,12 @@
-//! Pixel-integrated 2-D Gaussian PSF, model and analytic Jacobian.
+//! Pixel-integrated Gaussian PSFs with separable factors and analytic Jacobians.
 //!
-//! Ports `psf.py`.
+//! `m[i,j] = b + sum_k A_k * ey_k[i] * ex_k[j]`, where each factor integrates
+//! a unit Gaussian over one pixel and `A_k` is total flux. Images are row-major.
 //!
-//! # Model
-//!
-//! ```text
-//! m[i,j] = b + sum_k A_k * ey_k[i] * ex_k[j]
-//! ey_k[i] = 0.5*(erf((i - cy_k + 0.5)/(sigma*sqrt2))
-//!              - erf((i - cy_k - 0.5)/(sigma*sqrt2)))
-//! ```
-//!
-//! `A_k` is TOTAL FLUX, not peak height: the pixel-integrated Gaussian sums to
-//! `A` over all pixels, so a peak-height guess must be divided by
-//! [`peak_factor`] to become an `A`.
-//!
-//! # Layouts
-//!
-//! The fit's `theta` is `[b, A_0, y_0, x_0, sigma_0, A_1, ...]`, length
-//! `4K+1`. The render-only [`model_ax`] takes one shared width and
-//! `[b, A_0, y_0, x_0, ...]`, length `3K+1`.
-//!
-//! Pixels are row-major: `m[r*w + c]`.
-//!
-//! The Jacobian is **parameter-major**, `j[q*n + i] = d m_i / d theta_q` --
-//! i.e. transposed relative to the Python's `(h, w, p)`. `J` is only ever
-//! consumed as `J^T (W r)` and `J^T (W J)`, and this layout makes both of those
-//! contiguous reductions and drops the transposes [P7]. The Python fills a
-//! `(h, w, p)` array through strided slices (`J[:, :, 2::3] = ...`), which is
-//! cache-hostile; do not reproduce that.
-//!
-//! The separable 1-D factors are emitter-major, `ey[k*h + r]` and
-//! `ex[k*w + c]`.
-//!
-//! # Why rendering has its own entry point
-//!
-//! A render needs only `ey` and `ex`; the fit also needs their position and
-//! width derivatives, two more `exp`s per element. So [`model_ax`] and
-//! [`model_var_sigma_ax`] emit the model alone rather than computing the
-//! derivatives and discarding them [P8].
+//! Free-width fits pack `[b, A, y, x, sigma, ...]`; shared-width rendering packs
+//! `[b, A, y, x, ...]`. Jacobians are parameter-major (`j[q*n + i]`) for
+//! contiguous weighted reductions. Factor arrays are emitter-major.
+//! Render-only entry points skip derivative evaluation.
 
 use libm::erf;
 

@@ -2,7 +2,8 @@
 //!
 //! Minimize Poisson I-divergence:
 //! `I(d, m) = sum(d * log(d/m) - (d - m))`, with `0 * log(0) = 0`.
-//! The step uses gradient `J^T ((m-d)/m)` and expected Fisher information
+//! For offset-subtracted data, negative observations contribute only `m-d`.
+//! The gradient is `J^T ((m-max(d,0))/m)`, with expected Fisher information
 //! `J^T diag(1/m) J`; this is Fisher scoring, not the observed Hessian.
 //!
 //! Parameters stay strictly inside their bounds because Coleman-Li scaling
@@ -19,7 +20,7 @@ use crate::psf;
 /// Fraction of each bound's own range kept as a margin.
 ///
 /// A relative margin accommodates different position and flux scales.
-const INTERIOR_FRAC: f64 = 1e-10;
+pub(crate) const INTERIOR_FRAC: f64 = 1e-10;
 
 /// Box constraints, with the interiority margin precomputed.
 pub struct Bounds {
@@ -348,7 +349,7 @@ pub fn fit_var_sigma(
         // grad = J^T (W (m - d)), F = J^T (W J), with W = 1/m held fixed within
         // the iteration -- Fisher scoring, so F is the expected information.
         for i in 0..n {
-            ws.resid[i] = (ws.m[i] - d[i]) / ws.m[i];
+            ws.resid[i] = (ws.m[i] - d[i].max(0.0)) / ws.m[i];
         }
         for q in 0..p {
             let col = &ws.j[q * n..q * n + n];
@@ -458,7 +459,7 @@ pub fn fit_var_sigma(
     // [`FitWorkspace::gradient`] never returns the previous fit's.
     for q in 0..p {
         ws.grad[q] = (0..n)
-            .map(|i| ws.j[q * n + i] * ((ws.m[i] - d[i]) / ws.m[i]))
+            .map(|i| ws.j[q * n + i] * ((ws.m[i] - d[i].max(0.0)) / ws.m[i]))
             .sum();
     }
     if opts.max_iter > 0 {
@@ -590,8 +591,12 @@ fn eval(
         &mut m[..n],
         &mut j[..p * n],
     );
-    for v in m[..n].iter_mut() {
-        *v = v.max(1e-9);
+    for i in 0..n {
+        if m[i] <= 1e-9 {
+            m[i] = 1e-9;
+            // The floored model is locally constant at this pixel.
+            for q in 0..p { j[q*n + i] = 0.0; }
+        }
     }
 }
 
@@ -654,6 +659,35 @@ fn scale_into_box(theta: &Interior, delta: &mut [f64], b: &Bounds) {
 #[cfg(test)]
 mod width_tests {
     use super::*;
+
+    #[test]
+    fn gradient_matches_objective_with_negative_data_and_clipped_means() {
+        let (h, w) = (5, 6);
+        let theta = [3.0, 200.0, 2.1, 2.4, 1.2];
+        let bounds = Bounds::new(&[0.0, 0.0, -0.5, -0.5, 0.5],
+                                 &[100.0, 10000.0, 4.5, 5.5, 3.0]);
+        let data: Vec<f64> = (0..h*w).map(|i| if i % 3 == 0 { -4.0 } else { 5.0 }).collect();
+        for clipped in [false, true] {
+            let mut halo = vec![0.0; h*w];
+            if clipped { halo[1] = -100.0; }
+            let mut ws = FitWorkspace::new();
+            let opts = FitOpts { max_iter: 0, ..Default::default() };
+            fit_var_sigma(&mut ws, &theta, h, w, &data, &bounds, Some(&halo), opts);
+            let gradient = ws.gradient(5).to_vec();
+            for q in 0..theta.len() {
+                let mut plus = theta;
+                let mut minus = theta;
+                let eps = 1e-5;
+                plus[q] += eps;
+                minus[q] -= eps;
+                let a = fit_var_sigma(&mut ws, &plus, h, w, &data, &bounds, Some(&halo), opts).i_div;
+                let b = fit_var_sigma(&mut ws, &minus, h, w, &data, &bounds, Some(&halo), opts).i_div;
+                let numerical = (a - b) / (2.0 * eps);
+                assert!((gradient[q] - numerical).abs() < 1e-6,
+                        "clipped={clipped}, q={q}: analytic {}, numerical {numerical}", gradient[q]);
+            }
+        }
+    }
 
     #[test]
     fn predicted_decrease_uses_the_feasible_step() {

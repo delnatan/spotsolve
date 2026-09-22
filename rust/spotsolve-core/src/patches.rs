@@ -1,39 +1,10 @@
-//! Decompose a set of emitters into small, jointly-fittable patches, and pick
-//! the window for a single proposal.
+//! Group emitters into bounded joint-fit patches with fixed neighboring light.
 //!
-//! Ported from the retired Python reference's `patches.py`. Its `cKDTree` +
-//! `connected_components` became an [`EmitterGrid`] query plus union-find
-//! [P9]; the answers are the same partition, and `05_geometry` asserts it.
-//!
-//! # The three radii, and why the halo must be wide
-//!
-//! * **free**, `LINK_FACTOR = 2.5 sigma` -- emitters close enough that adding a
-//!   candidate changes their estimates. Fitted jointly, capped at `k_max`.
-//! * **frozen**, `HALO_FACTOR = 5 sigma` -- near enough to contribute flux,
-//!   folded into the model as a constant.
-//! * **pad**, `BBOX_PAD = 3 sigma` -- pixel context around the group.
-//!
-//! An emitter that is neither free nor frozen is, from the patch's point of
-//! view, not in the model at all, and the patch's free `b` is the only
-//! parameter that can absorb it. So the halo radius has to make what it
-//! excludes negligible against the **background**, not merely small against a
-//! bead peak. Measured worst-case leak into a patch, on bead-matched fields
-//! (peaks 94-198 e-, background 4 e-):
-//!
-//! | halo factor | max leak | p99 leak | frozen per patch |
-//! |---|---|---|---|
-//! | 3.0 | 3.10 | 2.40 | 2.8 |
-//! | 4.0 | 0.155 | 0.086 | 3.7 |
-//! | 5.0 | 0.001 | 0.001 | 4.6 |
-//!
-//! At 3.0 a patch could be handed an unmodelled 3.1 e- pedestal on a 4 e-
-//! background. With the halo removed entirely the same patch fit drives `b` to
-//! 57 e- and precision/recall fall from 1.00/0.75 to 0.62/0.62. Frozen emitters
-//! cost one rendered constant each and do not enter the Hessian.
-//!
-//! `BBOX_PAD = 3 sigma` captures 100.00% of an isolated emitter's position
-//! Fisher information and ~90% of its amplitude information; widening it to 5
-//! changes no measured outcome and costs runtime linearly in window area.
+//! `LINK_FACTOR` sets connectivity, `K_MAX` caps free emitters, `HALO_FACTOR`
+//! includes frozen neighbors, and `BBOX_PAD` supplies pixel context. Frozen
+//! emitters contribute to the model but not to the fitted covariance.
+//! These radii use the reference sigma; wide sources can extend beyond them.
+//! Geometry fixtures verify the partition and coordinate conventions.
 
 use crate::grid::EmitterGrid;
 

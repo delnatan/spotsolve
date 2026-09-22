@@ -3,7 +3,7 @@
 //! 1. Estimate local noise and find LoG candidates.
 //! 2. Estimate a smooth background from pixels outside candidate support.
 //! 3. Group nearby candidates; fit each group against fixed neighboring light.
-//! 4. Refine the selected emitters jointly and classify their fitted widths.
+//! 4. Refine the selected emitters jointly and report fit diagnostics.
 //!
 //! `Selection::Fixed` accepts additions/removals by a fixed deviance cost.
 //! `Selection::Bic` scores counts along forward and backward paths, then
@@ -25,11 +25,8 @@ use crate::psf;
 use crate::render;
 use crate::statistics;
 
-/// Allowed fitted widths, as multiples of `sigma`. Wider-than-reportable
-/// sources remain in the model so their light does not become extra spots.
+/// Optimization bounds for fitted widths, as multiples of `sigma`.
 pub const SLACK: (f64, f64) = (0.70, 2.2);
-/// Reporting band for fitted widths, as multiples of `sigma`.
-pub const BAND: (f64, f64) = (0.80, 2.0);
 /// Most emitters one box fits jointly. `patches::K_MAX`.
 pub const K_MAX: usize = crate::patches::K_MAX;
 
@@ -52,8 +49,8 @@ pub const POLISH_SWEEPS: usize = 4;
 pub const POLISH_MAX_ITER: usize = 50;
 /// Refinement-fit objective tolerance, in nats.
 pub const POLISH_TOL_OBJ: f64 = 1e-6;
-/// px. An emitter that moved less than this in a polish sweep does not
-/// dirty the groups that read it.
+/// Position/width change tolerance in pixels between refinement sweeps.
+/// Flux changes also trigger another sweep at a relative tolerance of 1e-3.
 pub const POLISH_MOVE_TOL: f64 = 1e-3;
 /// Side, px, of the window [`background_map`] averages over.
 pub const BG_KERNEL: usize = 25;
@@ -72,8 +69,6 @@ pub const PEAK_Z: f64 = 2.75;
 /// at near-zero flux. This is a numerical guard, not a detection threshold.
 pub const A_MIN: f64 = 1e-4;
 pub const A_MIN_REL: f64 = 1e-6;
-/// Border distance in sigma within which out-of-band fits are `Edge`.
-pub const EDGE_MARGIN: f64 = 1.0;
 /// px. The window of [`noise_map`]'s two local medians, tied to the
 /// background's: both describe the frame at the scale haze varies on.
 pub const NOISE_WIN: usize = BG_KERNEL;
@@ -81,26 +76,16 @@ pub const NOISE_WIN: usize = BG_KERNEL;
 pub const NOISE_STRIDE: usize = 12;
 /// Noise-variance floor, ADU², based on unit-step quantization variance.
 pub const NOISE_VAR_FLOOR: f64 = 1.0 / 12.0;
-/// Width-reporting tolerance in standard errors. An out-of-band width at
-/// the upper fitting bound is too wide, regardless of its uncertainty.
-pub const BAND_Z: f64 = 2.0;
-/// Relative. A width within this fraction of `SLACK.1 * sigma` is on the bound.
-pub const BOUND_TOL: f64 = 1e-3;
+/// Relative tolerance for reporting an active optimization bound.
+pub const BOUND_TOL: f64 = 1e-6;
 
-/// What a fitted emitter is reported as, by [`classify`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[repr(u8)]
-pub enum Class {
-    /// Width inside the reporting band: a detection.
-    Focus = 0,
-    /// Narrower than the band, away from the border.
-    Narrow = 1,
-    /// Wider than the band, away from the border.
-    Wide = 2,
-    /// Out of band within `EDGE_MARGIN` sigma of the border, which cuts it:
-    /// not an interior width measurement at all.
-    Edge = 3,
-}
+/// Per-emitter diagnostics; flags never remove a fitted emitter.
+pub const FLAG_EDGE: u8 = 1;
+pub const FLAG_NOT_CONVERGED: u8 = 2;
+pub const FLAG_STALLED: u8 = 4;
+pub const FLAG_COVARIANCE: u8 = 8;
+pub const FLAG_BOUND: u8 = 16;
+pub const FLAG_CONTEXT: u8 = 32;
 
 /// Experimental count selection. BIC is a penalized, dispersion-scaled
 /// deviance score here, not a calibrated Bayes factor or false-positive rate.
@@ -127,13 +112,9 @@ pub struct Settings {
     pub slack: (f64, f64),
     pub sweeps: usize,
     pub polish: bool,
-    /// Widths reported as detections, as multiples of `sigma`; `None`
-    /// reports every fit.
-    pub band: Option<(f64, f64)>,
 }
 
-/// One frame's answer. Every fitted emitter, in or out of any reporting band
-/// -- the caller classifies. Positions are global `(y, x)`.
+/// All selected emitters with diagnostics. Positions are global `(y, x)`.
 #[derive(Clone, Debug, Default)]
 pub struct Output {
     /// `2N`, row-major `(y, x)`.
@@ -149,8 +130,10 @@ pub struct Output {
     /// `1 / (F_qq * (F^-1)_qq)`. Small values indicate parameter confounding.
     /// From the last polish fit, NaN if its covariance is unavailable.
     pub fisher_fraction: Vec<f64>,
-    /// `N`: each emitter's [`Class`].
-    pub class: Vec<Class>,
+    /// `N`: bitwise combination of `FLAG_*` diagnostics.
+    pub flags: Vec<u8>,
+    /// Fitted background at each emitter's nearest pixel, excluding neighbors.
+    pub fitted_background: Vec<f64>,
     /// The median of [`noise_map`]'s dispersion over the searched pixels:
     /// pixel variance per unit of signal, ADU. For a camera it is about the
     /// gain plus `gain^2 * read_noise^2 / background`.
@@ -303,50 +286,17 @@ pub fn noise_map(d: &[f64], h: usize, w: usize, oy: usize, ox: usize) -> (Vec<f6
     (sd, phi)
 }
 
-/// Each emitter's [`Class`]. In the band it is a detection, and so is a
-/// width out of it by no more than [`BAND_Z`] of its own SE `se_sig` (a NaN
-/// SE never flags), unless it sits on the upper `slack` bound. Otherwise,
-/// near the border it is `Edge`, else `Narrow` or `Wide` by which side it
-/// fell: a source the border cuts is not an interior width measurement, so a
-/// width flag always means an interior fit.
-#[allow(clippy::too_many_arguments)]
-pub fn classify(
-    pos: &[f64],
-    sig: &[f64],
-    se_sig: &[f64],
-    h: usize,
-    w: usize,
-    sigma: f64,
-    slack: (f64, f64),
-    band: Option<(f64, f64)>,
-) -> Vec<Class> {
-    (0..sig.len())
-        .map(|k| {
-            let Some((lo, hi)) = band else {
-                return Class::Focus;
-            };
-            let (s, e) = (sig[k], se_sig.get(k).copied().unwrap_or(f64::NAN));
-            let margin = if e.is_finite() { BAND_Z * e } else { f64::INFINITY };
-            let narrow = lo * sigma - s > margin;
-            let pinned = s >= slack.1 * sigma * (1.0 - BOUND_TOL);
-            let wide = s > hi * sigma && (s - hi * sigma > margin || pinned);
-            if !narrow && !wide {
-                return Class::Focus;
-            }
-            let (y, x) = (pos[2 * k], pos[2 * k + 1]);
-            let border = (y + 0.5)
-                .min(h as f64 - 0.5 - y)
-                .min(x + 0.5)
-                .min(w as f64 - 0.5 - x);
-            if border <= EDGE_MARGIN * sigma {
-                Class::Edge
-            } else if narrow {
-                Class::Narrow
-            } else {
-                Class::Wide
-            }
-        })
-        .collect()
+/// Whether the emitter's three-sigma support crosses a physical frame edge.
+fn edge_truncated(y: f64, x: f64, sigma: f64, h: usize, w: usize) -> bool {
+    let border = (y + 0.5).min(h as f64 - 0.5 - y)
+        .min(x + 0.5).min(w as f64 - 0.5 - x);
+    border < patches::BBOX_PAD * sigma
+}
+
+fn at_bound(value: f64, lo: f64, hi: f64) -> bool {
+    let margin = 2.0 * lmcl::INTERIOR_FRAC * (hi - lo).max(1e-12);
+    value - lo <= margin + BOUND_TOL * (1.0 + lo.abs())
+        || hi - value <= margin + BOUND_TOL * (1.0 + hi.abs())
 }
 
 fn median(v: &[f64]) -> f64 {
@@ -625,6 +575,7 @@ struct Fitted {
     i_div: f64,
     b: f64,
     em: Vec<Em>,
+    flags: Vec<u8>,
 }
 
 /// Bounded free-width ML fit, with a strictly interior starting point.
@@ -680,6 +631,16 @@ fn fit_window(
     Fitted {
         i_div: info.i_div,
         b: t[0],
+        flags: (0..k).map(|j| {
+            let mut flag = 0;
+            if !info.converged { flag |= FLAG_NOT_CONVERGED; }
+            if info.stalled { flag |= FLAG_STALLED; }
+            if at_bound(t[0], lo[0], hi[0])
+                || (1 + 4*j..5 + 4*j).any(|q| at_bound(t[q], lo[q], hi[q])) {
+                flag |= FLAG_BOUND;
+            }
+            flag
+        }).collect(),
         em: (0..k)
             .map(|j| [t[1 + 4 * j], t[2 + 4 * j], t[3 + 4 * j], t[4 + 4 * j]])
             .collect(),
@@ -1091,8 +1052,10 @@ pub fn localize(
     let mut sig: Vec<f64> = all.iter().map(|e| e[3]).collect();
     let mut se4 = vec![f64::NAN; 4 * n];
     let mut fisher_fraction = vec![f64::NAN; 4 * n];
+    let mut flags = vec![FLAG_NOT_CONVERGED | FLAG_COVARIANCE; n];
+    let mut fitted_background = vec![f64::NAN; n];
     let mut polish_fits = if s.polish && n > 0 {
-        polish(d, h, w, &bmap, &mut pos, &mut amp, &mut sig, &mut se4, &mut fisher_fraction, s, ws)
+        polish(d, h, w, &bmap, &mut pos, &mut amp, &mut sig, &mut se4, &mut fisher_fraction, &mut flags, &mut fitted_background, s, ws)
     } else {
         0
     };
@@ -1133,8 +1096,10 @@ pub fn localize(
         // bounded selection pass, not a claim of a global fixed point.
         se4 = vec![f64::NAN; 4 * n];
         fisher_fraction = vec![f64::NAN; 4 * n];
+        flags = vec![FLAG_NOT_CONVERGED | FLAG_COVARIANCE; n];
+        fitted_background = vec![f64::NAN; n];
         if n > 0 {
-            polish_fits += polish(d, h, w, &bmap, &mut pos, &mut amp, &mut sig, &mut se4, &mut fisher_fraction, s, ws);
+            polish_fits += polish(d, h, w, &bmap, &mut pos, &mut amp, &mut sig, &mut se4, &mut fisher_fraction, &mut flags, &mut fitted_background, s, ws);
         }
     }
     // The Fisher matrix treated the ADU as Poisson counts, whose variance is
@@ -1149,7 +1114,15 @@ pub fn localize(
         se.extend((0..3).map(|c| se4[4 * k + c] * scale));
         se_sig.push(se4[4 * k + 3] * scale);
     }
-    let class = classify(&pos, &sig, &se_sig, h, w, s.sigma, s.slack, s.band);
+    for k in 0..n {
+        if edge_truncated(pos[2*k], pos[2*k+1], sig[k], h, w) {
+            flags[k] |= FLAG_EDGE;
+        }
+        if se[3*k..3*k+3].iter().chain(std::iter::once(&se_sig[k]))
+            .any(|v| !v.is_finite() || *v <= 0.0) {
+            flags[k] |= FLAG_COVARIANCE;
+        }
+    }
     Output {
         pos,
         amp,
@@ -1157,7 +1130,8 @@ pub fn localize(
         se,
         se_sig,
         fisher_fraction,
-        class,
+        flags,
+        fitted_background,
         dispersion,
         background: bmap,
         n_candidates: nc,
@@ -1183,6 +1157,8 @@ fn polish(
     sig: &mut Vec<f64>,
     se: &mut [f64],
     fisher_fraction: &mut [f64],
+    flags: &mut [u8],
+    fitted_background: &mut [f64],
     s: &Settings,
     ws: &mut Workspace,
 ) -> usize {
@@ -1227,8 +1203,14 @@ fn polish(
                 opos[2 * i] = e[1] + y0;
                 opos[2 * i + 1] = e[2] + x0;
                 osig[i] = e[3];
+                flags[i] = r.flags[j];
+                let py = (e[1].round().max(0.0) as usize).min(win.h - 1);
+                let px = (e[2].round().max(0.0) as usize).min(win.w - 1);
+                fitted_background[i] = r.b + win.shape[py * win.w + px];
                 moved[i] = (opos[2 * i] - pos[2 * i]).hypot(opos[2 * i + 1] - pos[2 * i + 1])
-                    > POLISH_MOVE_TOL;
+                    > POLISH_MOVE_TOL
+                    || (oamp[i] - amp[i]).abs() > 1e-3 * amp[i].abs().max(A_MIN)
+                    || (osig[i] - sig[i]).abs() > POLISH_MOVE_TOL;
             }
             // Use the undamped Fisher matrix at the returned parameters.
             // A failed factorization must invalidate the previous fit's SEs.
@@ -1240,6 +1222,19 @@ fn polish(
                 ws.chol.inv_diag(&mut var, &mut ws.scratch);
             }
             store_uncertainties(ws.fit.fisher(pdim), &var, &p.indices, se, fisher_fraction);
+            for &i in &p.indices {
+                let i = i as usize;
+                if se[4*i..4*i+4].iter().any(|v| !v.is_finite()) {
+                    flags[i] |= FLAG_COVARIANCE;
+                }
+            }
+        }
+        // A changed frozen neighbor invalidates the context of this sweep's fit.
+        // A subsequent fit replaces the flag; at the sweep limit it stays visible.
+        for p in &pset {
+            if p.frozen.iter().any(|&i| moved[i as usize]) {
+                for &i in &p.indices { flags[i as usize] |= FLAG_CONTEXT; }
+            }
         }
         *pos = opos;
         *amp = oamp;
@@ -1410,7 +1405,7 @@ mod tests {
         let s = Settings {
             sigma: 1.2, k_max: 4, threshold: PEAK_Z,
             selection: Selection::Bic, count_penalty: 2.0,
-            slack: SLACK, sweeps: SWEEPS, polish: true, band: None,
+            slack: SLACK, sweeps: SWEEPS, polish: true,
         };
         let mut ws = Workspace::new();
         let mut best = fit_window(&mut ws, &win, 20.0, &[], &s, FIT_MAX_ITER, FIT_TOL_OBJ);
@@ -1484,14 +1479,84 @@ mod tests {
         let s = Settings {
             sigma: 1.2, k_max: 4, threshold: PEAK_Z,
             selection: Selection::Fixed, count_penalty: 0.0,
-            slack: SLACK, sweeps: SWEEPS, polish: true, band: None,
+            slack: SLACK, sweeps: SWEEPS, polish: true,
         };
         let mut se = vec![42.0; 8];
         let mut fraction = vec![0.5; 8];
+        let mut flags = vec![0; 2];
         polish(&data, h, w, &vec![20.0; h * w], &mut pos, &mut amp, &mut sig,
-               &mut se, &mut fraction, &s, &mut Workspace::new());
+               &mut se, &mut fraction, &mut flags, &mut vec![f64::NAN; 2], &s, &mut Workspace::new());
         // Coincident, identical emitters have duplicate Jacobian columns.
         assert!(se.iter().chain(&fraction).all(|v| v.is_nan()));
+        assert!(flags.iter().all(|f| f & FLAG_COVARIANCE != 0));
+    }
+
+    #[test]
+    fn fit_flags_distinguish_iteration_limits_and_active_bounds() {
+        let (h, w) = (17, 17);
+        let mut data = vec![0.0; h*w];
+        psf::model_var_sigma_ax(
+            &[20.0, 1500.0, 8.2, 8.4, 2.8], &psf::local_axis(h), &psf::local_axis(w),
+            None, &mut psf::Factors::new(h, w, 1), &mut data,
+        );
+        let win = Window::new(&data, w, &vec![20.0; h*w],
+            &patches::BBox { y0: 0, x0: 0, y1: h, x1: w });
+        let settings = Settings {
+            sigma: 1.0, k_max: 1, threshold: PEAK_Z,
+            selection: Selection::Fixed, count_penalty: 0.0,
+            slack: SLACK, sweeps: SWEEPS, polish: true,
+        };
+        let mut ws = Workspace::new();
+        let start = [[1200.0, 8.0, 8.0, 1.5]];
+        let unfinished = fit_window(&mut ws, &win, 20.0, &start, &settings, 0, FIT_TOL_OBJ);
+        assert_eq!(unfinished.flags, vec![FLAG_NOT_CONVERGED]);
+        let bounded = fit_window(&mut ws, &win, 20.0, &start, &settings, 200, FIT_TOL_OBJ);
+        assert!(bounded.flags[0] & FLAG_BOUND != 0);
+        assert!(bounded.flags[0] & FLAG_NOT_CONVERGED == 0);
+        assert!((bounded.em[0][3] - SLACK.1).abs() < 1e-5);
+        let wider = Settings { slack: (0.7, 3.5), ..settings };
+        let recovered = fit_window(&mut ws, &win, 20.0, &start, &wider, 200, FIT_TOL_OBJ);
+        assert_eq!(recovered.flags, vec![0]);
+        assert!((recovered.em[0][3] - 2.8).abs() < 1e-3);
+        assert!((recovered.em[0][0] - 1500.0).abs() < 1.0);
+    }
+
+    #[test]
+    fn active_bounds_include_the_optimizers_interior_margin() {
+        let bounds = Bounds::new(&[100.0], &[1e8]);
+        let theta = lmcl::Interior::new(&[0.0], &bounds);
+        assert!(at_bound(theta.as_slice()[0], 100.0, 1e8));
+        assert!(!at_bound(10000.0, 100.0, 1e8));
+    }
+
+    #[test]
+    fn reported_background_comes_from_the_refined_fit() {
+        let (h, w) = (25, 25);
+        let mut data = vec![0.0; h*w];
+        psf::model_var_sigma_ax(
+            &[35.0, 1500.0, 12.2, 12.4, 1.2], &psf::local_axis(h), &psf::local_axis(w),
+            None, &mut psf::Factors::new(h, w, 1), &mut data,
+        );
+        let settings = Settings {
+            sigma: 1.2, k_max: 1, threshold: PEAK_Z,
+            selection: Selection::Fixed, count_penalty: 0.0,
+            slack: SLACK, sweeps: SWEEPS, polish: true,
+        };
+        let (mut pos, mut amp, mut sig) = (vec![12.0, 12.0], vec![1200.0], vec![1.0]);
+        let mut bg = vec![f64::NAN];
+        polish(&data, h, w, &vec![20.0; h*w], &mut pos, &mut amp, &mut sig,
+               &mut vec![f64::NAN; 4], &mut vec![f64::NAN; 4], &mut vec![0],
+               &mut bg, &settings, &mut Workspace::new());
+        assert!((bg[0] - 35.0).abs() < 1e-3);
+        assert!((amp[0] - 1500.0).abs() < 1.0);
+    }
+
+    #[test]
+    fn edge_diagnostic_tracks_fitted_support_and_physical_pixel_edges() {
+        assert!(edge_truncated(2.0, 20.0, 1.0, 40, 40));
+        assert!(!edge_truncated(3.0, 20.0, 1.0, 40, 40));
+        assert!(edge_truncated(3.0, 20.0, 2.0, 40, 40));
+        assert!(edge_truncated(20.0, 37.0, 1.0, 40, 40));
     }
 
     #[test]
@@ -1518,7 +1583,6 @@ mod tests {
             slack: (0.7, 2.2),
             sweeps: SWEEPS,
             polish: true,
-            band: Some((0.8, 2.0)),
         };
         let o = localize(&d, h, w, None, &s, &mut Workspace::new());
         // Once near the truth. The noise may also buy a faint fit elsewhere:
@@ -1530,7 +1594,7 @@ mod tests {
         assert_eq!(near.len(), 1, "found {:?} amp {:?}", o.pos, o.amp);
         let k = near[0];
         assert!((0..o.amp.len()).all(|j| j == k || o.amp[j] < 0.05 * o.amp[k]), "amp {:?}", o.amp);
-        assert_eq!(o.class[k], Class::Focus);
+        assert_eq!(o.flags[k], 0);
         assert!(o.se.iter().chain(&o.se_sig).all(|v| v.is_finite() && *v > 0.0));
         assert!((o.dispersion - 1.0).abs() < 0.3, "dispersion {}", o.dispersion);
         let (se_a, se_y, se_x) = (o.se[3 * k], o.se[3 * k + 1], o.se[3 * k + 2]);

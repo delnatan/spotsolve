@@ -24,13 +24,18 @@ I(d,m) = sum_pixels [d*log(d/m) - (d-m)]
 
 The background shape is a 25-pixel local mean away from candidates; its level
 is refitted per region. Fits minimize Poisson I-divergence with bounded
-Levenberg–Marquardt/Fisher scoring. For Poisson photoelectron data, differences
+Levenberg–Marquardt/Fisher scoring. For non-positive offset-subtracted pixels,
+the log term is zero and the objective contribution is `m-d`; its derivative
+with respect to the mean is one. The gradient uses `max(d, 0)` consistently.
+Model means are floored at 1e-9, with zero derivatives below that floor. This
+extension to negative camera values is not a Poisson likelihood for read noise.
+For Poisson photoelectron data, differences
 in `I` are log-likelihood ratios. For camera data, comparisons use `I/phi` as
 a measured-noise approximation. No gain/read-noise calibration is required.
 Fluxes scale with gain; fitted geometry should remain stable, subject to
 roundoff and crowded-model search decisions.
 
-## Search and width reporting
+## Search and fit diagnostics
 
 1. Find LoG maxima exceeding `threshold` (default 2.75) in local noise units.
 2. Group candidates within 2.5 `sigma`, with at most `k_max=12` emitters per
@@ -40,28 +45,25 @@ roundoff and crowded-model search decisions.
    `(10 + count_penalty)*phi`. Remove sources whose removal costs less than
    that amount. Process boxes brightest first, holding neighboring light
    fixed; repeat against updated neighbors.
-4. Jointly refine nearby groups for up to four passes, stopping below 0.001
-   pixel movement. BIC additionally rechecks removals on the original group
+4. Jointly refine nearby groups for up to four passes, revisiting changes
+   above 0.001 pixels in position/width or 0.1% in flux. BIC additionally rechecks removals on the original group
    pixels and refits the retained sources; see its separate search description.
-5. Report positions, fluxes, widths and Fisher-based SEs scaled by local
-   dispersion, then apply the width-reporting rule.
+5. Report every selected emitter with position, flux, width, uncertainties,
+   fitted background and diagnostic flags. No width or brightness cut follows.
 
-Widths fit within `slack=(0.7, 2.2)` times the supplied `sigma`. The reporting
-band is `(0.8, 2.0)`, allowing an extra two width SEs (`BAND_Z`) to avoid
-rejecting dim sources merely because width is uncertain. `band=None` reports
-all fits. Rejected fits still contribute light to the model and appear in
-`rejects`:
+Widths fit within `slack=(0.7, 2.2)` times the supplied `sigma`. These are
+optimization bounds, not an acceptance interval. `AT_BOUND` identifies a fit
+limited by a parameter bound (including the shared background); widen `slack`
+and refit when appropriate. Changing the allowed model can change counts too.
 
-| Reason | Meaning |
-|---|---|
-| `too_narrow` | Significantly below 0.8 `sigma`; often noise or a fit distorted by neighbors |
-| `too_wide` | Significantly above 2.0 `sigma`, or at the 2.2 `sigma` fitting limit, away from an edge |
-| `edge` | Outside the band and within one `sigma` of the frame border |
+`EDGE` marks three fitted sigmas crossing the physical image boundary,
+independently of width relative to the reference sigma. ROI boundaries do not
+set this flag. Gaussian tails have infinite support; the flag describes this
+finite support convention and does not prove localization bias.
 
-Broad objects can be defocused sources, aggregates or haze. Fitting their
-width avoids explaining them as several narrow sources. Bright aggregates
-with ordinary width need a separate brightness flag (`flag_aggregates`);
-width alone does not identify them.
+Convergence, stalling, unavailable covariance and changing neighbor context
+are also reported. See [flag definitions](LOCALIZATION_QUALITY.md). Broad or
+bright objects retain their quantities for downstream analysis.
 
 ## Curvature and uncertainty
 
@@ -92,10 +94,9 @@ This is reciprocal variance inflation in the local quadratic model: 1 means
 no coupling to other fitted parameters; values near zero mean strong
 confounding. It is invariant to diagonal changes of parameter units,
 parameter ordering and a common dispersion scale. It reuses the inverse
-diagonal already needed for SEs. `info['reject_fisher_fraction']` aligns with
-`rejects`; both arrays are NaN where covariance is unavailable, including
-when native refinement is disabled. Neither array changes selection or
-reporting. Read it alongside SEs: a weak isolated source can be imprecise
+diagonal already needed for SEs. Entries are NaN where covariance is
+unavailable, including when native refinement is disabled. The fractions
+do not change selection or reporting. Read it alongside SEs: a weak isolated source can be imprecise
 without strong confounding, and a bright crowded source can have both small
 SEs and a small fraction. Frozen neighbors and estimated background shape
 are treated as known, so this is not a full uncertainty budget.
@@ -121,7 +122,7 @@ numerical comparisons are not reproduced here. Several qualifications matter:
 For a minimal filtering workflow using existing outputs, see the
 [localization-quality guide](LOCALIZATION_QUALITY.md).
 
-## ROI and calibration
+## ROI and reference width
 
 A boolean ROI restricts the search; sources may fit outside it. Process its
 bounding box plus context and estimate the reference background level from
@@ -129,11 +130,11 @@ masked pixels. Under a cell mask, that avoids using the dark field outside
 the cell as its background. Separate tile calls can duplicate sources at
 seams and omit neighboring light; use one mask for the requested area.
 
-`calibrate_sigma` disables the reporting band and repeatedly takes the median
-fitted width until stable. The validation recovered a common simulated width
-to about 3% from guesses within about 25%. Broad populations bias the median
-upward. Inspect `cal.widths`; on bright in-focus detections, the median
-`sigma_ratio` should be near one.
+Choose an approximate `sigma` from a histogram of fitted widths in one or a
+few representative frames. Aguet is a cheap starting point for isolated
+spots; use an isolated ROI or joint fits when overlap is substantial. Each
+emitter's width is fitted within `slack * sigma`, so the reference need not
+match every spot. See the [width inspection example](../README.md#choose-a-detection-width).
 
 ## Earlier measurements
 

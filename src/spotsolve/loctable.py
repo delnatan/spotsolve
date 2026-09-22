@@ -1,19 +1,7 @@
-"""Convert per-frame results to Polars localization and summary tables.
+"""Convert all fitted emitters to Polars tables without filtering rows.
 
-`LOCALIZATION_SCHEMA` has one row per detection; `FRAME_SCHEMA` one per
-frame; `AGGREGATE_SCHEMA` one per linked bright object; `REJECT_SCHEMA` one
-per fit outside the reporting band.
-
-Coordinates and errors use pixels, with derived micrometre columns for
-tracking. Flux is total signal in ADU above the camera offset; divide by
-gain for photoelectrons. `peak` is the model's central-pixel signal above
-background, derived from flux and fitted width.
-
-The linker uses position errors and optionally flux errors. Tables retain
-only marginal position errors, not the full joint-fit covariance.
-Aggregate flags preserve all rows; `filter_aggregates` returns a filtered
-table. `filter_quality` excludes unusable coordinates and optionally applies
-precision/flux-significance cuts without adding columns.
+Positions and errors use pixels, with derived micrometre columns. Flux and
+background use ADU above offset. Optional quality cuts are post-processing.
 """
 
 from numbers import Real
@@ -21,8 +9,6 @@ from numbers import Real
 import numpy as np
 import polars as pl
 
-from . import aggregates, psf
-from .results import REJECT_DTYPE
 
 LOCALIZATION_SCHEMA = {
     "loc_id": pl.UInt32,      # unique over the whole movie; a stable handle
@@ -32,7 +18,7 @@ LOCALIZATION_SCHEMA = {
     "x": pl.Float64,          # px, image coordinates (column)
     "y_um": pl.Float64,
     "x_um": pl.Float64,
-    "se_y": pl.Float64,       # px, CRLB standard error
+    "se_y": pl.Float64,       # px, model-based standard error
     "se_x": pl.Float64,
     "se_pos": pl.Float64,     # px, hypot(se_y, se_x); one number for reports
     "se_y_um": pl.Float64,
@@ -41,56 +27,35 @@ LOCALIZATION_SCHEMA = {
     "se_flux": pl.Float64,
     "flux_snr": pl.Float64,   # flux / se_flux
     "peak": pl.Float64,       # ADU, on-centre model pixel value; read vs `bg`
-    "bg": pl.Float64,         # ADU/px above offset, background surface here
-    "sigma": pl.Float64,      # px, the in-focus PSF sigma the search ran at
+    "bg": pl.Float64,         # ADU/px, fitted background at the emitter pixel
+    "sigma": pl.Float64,      # px, reference search width
     "fit_sigma": pl.Float64,  # px, this emitter's own fitted width
-    "sigma_ratio": pl.Float64,  # fit_sigma / sigma; a per-emitter defocus readout
-    "flux_ratio": pl.Float64,  # flux / this frame's median detection
-    "is_aggregate": pl.Boolean,
+    "sigma_se": pl.Float64,
+    "sigma_ratio": pl.Float64,  # fit_sigma / sigma
+    "flags": pl.UInt8,
+    "fisher_flux": pl.Float64,
+    "fisher_y": pl.Float64,
+    "fisher_x": pl.Float64,
+    "fisher_sigma": pl.Float64,
 }
 
 FRAME_SCHEMA = {
     "frame": pl.UInt32,
     "t": pl.Float64,
     "n_locs": pl.UInt32,
-    "n_too_narrow": pl.UInt32,
-    "n_too_wide": pl.UInt32,
-    "n_edge": pl.UInt32,
-    "n_aggregates": pl.UInt32,        # linked objects, not detections
-    "n_locs_flagged": pl.UInt32,      # detections inside those objects
+    "n_flagged": pl.UInt32,
     "median_flux": pl.Float64,
-    "agg_flux_fraction": pl.Float64,  # share of detected flux in aggregates
     "median_se_pos": pl.Float64,
     "background": pl.Float64,         # median of the background surface
     "dispersion": pl.Float64,         # measured variance per unit signal, ADU
     "seconds": pl.Float64,            # wall clock for this frame's search
 }
 
-REJECT_SCHEMA = {
-    "frame": pl.UInt32,
-    "t": pl.Float64,
-    "y": pl.Float64,
-    "x": pl.Float64,
-    "y_um": pl.Float64,
-    "x_um": pl.Float64,
-    "flux": pl.Float64,
-    "peak": pl.Float64,
-    "fit_sigma": pl.Float64,
-    "sigma_ratio": pl.Float64,
-    "reason": pl.String,
-}
 
-AGGREGATE_SCHEMA = {
-    "frame": pl.UInt32,
-    "t": pl.Float64,
-    "y": pl.Float64,          # flux-weighted centroid of the linked detections
-    "x": pl.Float64,
-    "y_um": pl.Float64,
-    "x_um": pl.Float64,
-    "flux": pl.Float64,       # summed over the object's detections
-    "ratio": pl.Float64,      # brightest member / the frame's median detection
-    "n_locs": pl.UInt32,      # detections this object absorbed
-}
+def _finite_median(values):
+    values = np.asarray(values)
+    finite = values[np.isfinite(values)]
+    return float(np.median(finite)) if finite.size else float("nan")
 
 
 def _sample_background(bmap, positions):
@@ -103,20 +68,21 @@ def _sample_background(bmap, positions):
     return bmap[yi, xi]
 
 
-def frame_tables(result, frame, t=0.0, pixel_size=1.0, agg_ratio=None,
+def frame_tables(result, frame, t=0.0, pixel_size=1.0,
                  seconds=float("nan"), loc_id0=0):
-    """Return (localizations, frame summary, aggregates) as DataFrames.
+    """Return (localizations, frame summary), retaining every result row.
 
-    `agg_ratio` is the flux threshold relative to the frame's median detection;
-    None uses `aggregates.AGG_AMP_RATIO`. `pixel_size` is micrometres per pixel,
-    `t` is seconds, and `loc_id0` starts the consecutive localization IDs.
+    `pixel_size` is micrometres per pixel, `t` is seconds, and `loc_id0`
+    starts consecutive localization IDs. Unavailable diagnostics are NaN.
     """
-    ratio = aggregates.AGG_AMP_RATIO if agg_ratio is None else float(agg_ratio)
     pos = np.asarray(result.positions, float).reshape(-1, 2)
     amp = np.asarray(result.amplitudes, float).ravel()
     se = np.asarray(result.se, float).reshape(-1, 3)
     n = len(amp)
-    mask, objs = aggregates.flag_aggregates(result, ratio=ratio)
+    fraction = np.asarray(result.info.get("fisher_fraction", np.full((n, 4), np.nan)))
+    background = result.info.get("fitted_background")
+    if background is None:
+        background = _sample_background(result.background, pos)
     med = float(np.median(amp)) if n else float("nan")
     ps = float(pixel_size)
 
@@ -135,70 +101,32 @@ def frame_tables(result, frame, t=0.0, pixel_size=1.0, agg_ratio=None,
                                   out=np.full(n, np.nan),
                                   where=np.isfinite(se[:, 0]) & (se[:, 0] > 0)),
             "peak": np.asarray(result.peak, float),
-            "bg": _sample_background(result.background, pos),
+            "bg": np.asarray(background, float),
             "sigma": np.full(n, float(result.sigma)),
             "fit_sigma": np.asarray(result.fit_sigma, float),
             "sigma_ratio": np.asarray(result.sigma_ratio, float),
-            "flux_ratio": amp / med if n else amp,
-            "is_aggregate": mask,
+            "sigma_se": np.asarray(result.sigma_se, float),
+            "flags": np.asarray(result.flags, np.uint8),
+            **{f"fisher_{name}": fraction[:, j]
+               for j, name in enumerate(("flux", "y", "x", "sigma"))},
         },
         schema=LOCALIZATION_SCHEMA,
     )
 
-    aggs = pl.DataFrame(
-        {
-            "frame": np.full(len(objs), frame),
-            "t": np.full(len(objs), t),
-            "y": objs["y"], "x": objs["x"],
-            "y_um": objs["y"] * ps, "x_um": objs["x"] * ps,
-            "flux": objs["flux"], "ratio": objs["ratio"],
-            "n_locs": objs["n"],
-        },
-        schema=AGGREGATE_SCHEMA,
-    )
-
-    flux_total = float(amp.sum())
-    reason = result.rejects["reason"]
     row = pl.DataFrame(
         {
             "frame": [frame], "t": [t], "n_locs": [n],
-            "n_too_narrow": [int(np.sum(reason == "too_narrow"))],
-            "n_too_wide": [int(np.sum(reason == "too_wide"))],
-            "n_edge": [int(np.sum(reason == "edge"))],
-            "n_aggregates": [len(objs)],
-            "n_locs_flagged": [int(mask.sum())],
+            "n_flagged": [int(np.count_nonzero(result.flags))],
             "median_flux": [med],
-            "agg_flux_fraction": [float(amp[mask].sum()) / flux_total
-                                  if flux_total > 0 and mask.any() else 0.0],
-            "median_se_pos": [float(np.nanmedian(np.hypot(se[:, 1], se[:, 2])))
+            "median_se_pos": [_finite_median(np.hypot(se[:, 1], se[:, 2]))
                               if n else float("nan")],
-            "background": [float(np.median(result.background))],
+            "background": [_finite_median(result.background)],
             "dispersion": [float(result.dispersion)],
             "seconds": [float(seconds)],
         },
         schema=FRAME_SCHEMA,
     )
-    return locs, row, aggs
-
-
-def reject_table(result, frame, t=0.0, pixel_size=1.0):
-    """The fits outside the reporting band, as a table."""
-    rec = result.rejects
-    ps = float(pixel_size)
-    return pl.DataFrame(
-        {
-            "frame": np.full(len(rec), frame),
-            "t": np.full(len(rec), t),
-            "y": rec["y"], "x": rec["x"],
-            "y_um": rec["y"] * ps, "x_um": rec["x"] * ps,
-            "flux": rec["flux"],
-            "peak": rec["flux"] * psf.peak_factor(rec["sigma"]),
-            "fit_sigma": rec["sigma"],
-            "sigma_ratio": rec["sigma_ratio"],
-            "reason": rec["reason"],
-        },
-        schema=REJECT_SCHEMA,
-    )
+    return locs, row
 
 
 def concat(parts):
@@ -208,14 +136,10 @@ def concat(parts):
     return pl.concat(parts, how="vertical")
 
 
-def filter_aggregates(locs, keep_flagged=False):
-    """Return rows without aggregate flags, or all rows if `keep_flagged`."""
-    return locs if keep_flagged else locs.filter(~pl.col("is_aggregate"))
-
-
 def filter_quality(locs, *, max_se_pos=None, min_flux_snr=None):
     """Keep usable coordinates, optionally requiring precision/flux support.
 
+    Flags are left for the caller to inspect or select explicitly.
     Always require finite x/y and finite, positive se_x/se_y. `max_se_pos`
     limits hypot(se_y, se_x) in the table's coordinate units (pixels for
     `frame_tables`). `min_flux_snr` optionally requires positive finite flux

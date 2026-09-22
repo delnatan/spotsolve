@@ -1,14 +1,13 @@
 """Sparse Aguet screening and spotfitlm-compatible single-source fitting."""
 
 from functools import lru_cache
-import operator
 import os
 
 import numpy as np
 from scipy import stats
 
-from .native import _roi, _rs
-from .results import Localizations, REJECT_DTYPE
+from .native import _positive_int, _roi, _rs
+from .results import Localizations, FitFlag
 
 
 @lru_cache(maxsize=32)
@@ -24,16 +23,6 @@ def _cutoff(sigma, significance):
     b = k * k / (2 * (n - 1))
     df = (n - 1) * (a + b) ** 2 / (a * a + b * b)
     return float(k + stats.t.isf(significance, df) * np.sqrt((a + b) / n))
-
-
-def _positive_int(value, name):
-    try:
-        value = operator.index(value)
-    except TypeError as error:
-        raise ValueError(f"{name} must be a positive integer") from error
-    if value < 1:
-        raise ValueError(f"{name} must be a positive integer")
-    return value
 
 
 def _settings(shape, sigma, roi, offset, significance, boxsize, itermax, n_threads):
@@ -72,11 +61,14 @@ def _result(output, raw, settings, significance, images):
                 fitted_background=params[:, 4].tolist(),
                 background_kind="local screening estimate; NaN outside ROI crop",
                 amplitude_convention="continuous sampled-Gaussian flux")
+    border = np.minimum.reduce((params[:, 1] + 0.5, raw.shape[0] - 0.5 - params[:, 1],
+                                params[:, 0] + 0.5, raw.shape[1] - 0.5 - params[:, 0]))
+    flags = np.where(border < 3 * width, int(FitFlag.EDGE), 0).astype(np.uint8)
     model = _rs.aguet_render(params, background) if images else None
     return Localizations(
         positions=np.ascontiguousarray(params[:, [1, 0]]), amplitudes=peak * d_peak,
         se=se, fit_sigma=width, sigma_se=np.sqrt(covariance[:, 2, 2]),
-        rejects=np.empty(0, dtype=REJECT_DTYPE), background=background,
+        flags=flags, background=background,
         sigma=settings["sigma"], dispersion=float("nan"), info=info,
         model_image=model, residual=raw-settings["offset"]-model if images else None,
     )
@@ -98,8 +90,8 @@ def localize_aguet(frame, sigma, *, roi=None, offset=0.0, significance=0.05,
 
     Amplitudes are continuous Gaussian fluxes, 2*pi*peak*sigma_fit**2.
     Flux SE includes width covariance. Failed fits are listed in
-    `info['failures']` as (seed_y, seed_x, status); `rejects` is empty because
-    this baseline has no width-reporting band. Dispersion is unavailable.
+    `info['failures']` as (seed_y, seed_x, status). Returned fits carry edge
+    flags; failed fits have no localization row. Dispersion is unavailable.
 
     The fit uses data above `offset`; observations are floored at
     1e-7 consistently in the likelihood and its derivatives. Offset is not a

@@ -9,6 +9,6 @@ def test_public_names_exist():
 
 
 def test_submodules_import():
-    for name in ("native", "results", "calibration", "aggregates", "loctable",
+    for name in ("native", "results", "loctable",
                  "audit", "metrics", "simulate", "psf"):
         __import__(f"spotsolve.{name}")
