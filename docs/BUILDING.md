@@ -41,7 +41,38 @@ The wheel filename must retain its original version, ABI and platform tags.
 Dependencies are resolved by pip. Artifact and release downloads require
 repository access while the repository is private.
 
+For a tagged release in this private repository, authenticate with `gh auth login`
+once, then download the wheel for your platform. For example, on Apple Silicon:
+
+```sh
+gh release download v0.1.0 --repo delnatan/spotsolve --pattern '*macosx_11_0_arm64.whl' --dir wheels
+python -m pip install wheels/spotsolve-0.1.0-cp39-abi3-macosx_11_0_arm64.whl
+```
+
+Alternatively, download all five wheels and let pip select the compatible one:
+
+```sh
+gh release download v0.1.0 --repo delnatan/spotsolve --pattern '*.whl' --dir wheels
+python -m pip install --find-links=./wheels --only-binary=spotsolve spotsolve==0.1.0
+```
+
+Pip still resolves dependencies from its configured package index. It does not
+reuse GitHub CLI or browser authentication. If the repository becomes public,
+you can install a wheel directly from its release asset URL:
+
+```sh
+python -m pip install "https://github.com/delnatan/spotsolve/releases/download/v0.1.0/spotsolve-0.1.0-cp39-abi3-macosx_11_0_arm64.whl"
+```
+
+Choose the asset matching your platform. A Git URL installs from source and
+requires Rust; an Actions artifact is a ZIP that must be downloaded and unpacked.
+
 ## Releases
+
+Release tags use `vMAJOR.MINOR.PATCH`, starting at `v0.1.0`. During the `0.x`
+series, increment the minor version for new features or incompatible API changes,
+and the patch version for compatible fixes. Record changes in `CHANGELOG.md`.
+Keep published tags fixed; ship corrections under a new version.
 
 1. Update the version in `pyproject.toml`, `rust/Cargo.toml` and
    `src/spotsolve/__init__.py`, and refresh `rust/Cargo.lock` and `uv.lock`.
