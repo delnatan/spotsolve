@@ -59,7 +59,7 @@ comparisons), `selection_fits` (post-refinement comparisons), and `polish_fits`
 ## Accuracy benchmark
 
 ```sh
-maturin develop --release -m rust/spotsolve-py/Cargo.toml
+maturin develop --release
 python scripts/benchmark_count_selection.py --out /tmp/count-selection.json
 ```
 

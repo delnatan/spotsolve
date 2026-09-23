@@ -5,6 +5,7 @@ API examples and linking.
 
 | Guide | Contents |
 |---|---|
+| [Building and distribution](BUILDING.md) | Platform wheels, CI checks, source builds and releases |
 | [Localization quality](LOCALIZATION_QUALITY.md) | A small common filter, on-demand diagnostics, and how to choose cuts |
 | [Multi-emitter detection](DETECTION.md) | Image/noise model, count search, widths, Fisher diagnostics, masks and validation |
 | [Experimental BIC selection](COUNT_SELECTION.md) | Count score, forward/backward search, error budgets and threading measurements |

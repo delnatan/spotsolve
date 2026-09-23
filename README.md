@@ -8,14 +8,21 @@ Detection and fitting run in Rust, with movie frames processed in parallel.
 
 ## Install
 
-Requires Python 3.10+ and a Rust toolchain. In an activated environment:
+Requires Python 3.10+. Download the wheel for your platform from a GitHub
+release or the **Build and test wheels** Actions artifacts, then install the
+`.whl` file with `python -m pip install path/to/filename.whl`. Wheels bundle
+the Rust extension; a Rust toolchain is only needed for source builds.
+
+For development, with Rust installed and an environment activated:
 
 ```sh
-pip install -e ".[dev]"
-maturin develop --release -m rust/spotsolve-py/Cargo.toml
+python -m pip install -e ".[dev,test]"
 ```
 
-Add `.[scripts]` for movie I/O and plotting, or `.[test]` for Python tests.
+After changing Rust code, run `maturin develop --release` from the repository
+root. Add `.[scripts]` for movie I/O and plotting. See the
+[build guide](docs/BUILDING.md) for supported platforms, release artifacts,
+and migration from the old separate `spotsolve-rs` installation.
 
 ## Choose a detector
 

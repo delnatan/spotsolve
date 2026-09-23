@@ -18,8 +18,8 @@ try:
     import spotsolve_rs as _rs
 except ImportError as error:          # pragma: no cover - build problem
     raise ImportError(
-        "spotsolve needs its Rust extension; build it with `maturin develop "
-        "--release -m rust/spotsolve-py/Cargo.toml`") from error
+        "spotsolve needs its bundled Rust extension; reinstall a compatible wheel "
+        "or run `maturin develop --release` from the repository root") from error
 
 __all__ = ["LinkParams", "fit_link_params", "link", "LINK_COLUMNS"]
 

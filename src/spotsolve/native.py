@@ -18,8 +18,8 @@ try:
         raise ImportError("incompatible localization output; rebuild spotsolve_rs")
 except ImportError as error:          # pragma: no cover - build problem
     raise ImportError(
-        "spotsolve needs its Rust extension; build it with `maturin develop "
-        "--release -m rust/spotsolve-py/Cargo.toml`") from error
+        "spotsolve needs its bundled Rust extension; reinstall a compatible wheel "
+        "or run `maturin develop --release` from the repository root") from error
 
 __all__ = ["localize", "localize_stack", "SLACK", "K_MAX",
            "PEAK_Z"]

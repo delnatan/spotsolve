@@ -1,0 +1,159 @@
+name: Build and test wheels
+
+on:
+  pull_request:
+  push:
+    branches: [main, 'codex/**']
+  workflow_dispatch:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: wheels-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name != 'release' }}
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  wheels:
+    name: ${{ matrix.platform }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux-x86_64
+            os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            manylinux: '2014'
+            container: quay.io/pypa/manylinux2014_x86_64
+            interpreter: python3.13
+          - platform: linux-aarch64
+            os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            manylinux: '2014'
+            container: quay.io/pypa/manylinux2014_aarch64
+            interpreter: python3.13
+          - platform: macos-x86_64
+            os: macos-15-intel
+            target: x86_64-apple-darwin
+            interpreter: python
+          - platform: macos-arm64
+            os: macos-14
+            target: aarch64-apple-darwin
+            interpreter: python
+          - platform: windows-x86_64
+            os: windows-2022
+            target: x86_64-pc-windows-msvc
+            interpreter: python
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.10'
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: stable
+      - name: Test Rust workspace
+        run: cargo test --release --locked --workspace --manifest-path rust/Cargo.toml
+      - name: Build wheel
+        uses: PyO3/maturin-action@423a6347767a8b16e65c2a7a7042e4a921528da8 # v1
+        with:
+          command: build
+          maturin-version: '1.15.0'
+          target: ${{ matrix.target }}
+          manylinux: ${{ matrix.manylinux || 'auto' }}
+          container: ${{ matrix.container || '' }}
+          args: --release --locked --out dist --interpreter ${{ matrix.interpreter }}
+      - name: Install and test wheel on Python 3.10
+        run: |
+          python -m pip install --only-binary=:all: dist/*.whl pytest
+          python -I -m pytest -q tests
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.14'
+      - name: Install and test the same wheel on Python 3.14
+        run: |
+          python -m pip install --only-binary=:all: dist/*.whl pytest
+          python -I -m pytest -q tests
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: wheels-${{ matrix.platform }}
+          path: dist/*.whl
+          if-no-files-found: error
+          retention-days: 14
+
+  sdist:
+    name: Source distribution
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.13'
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: stable
+      - name: Check release version
+        if: github.event_name == 'release'
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          python - <<'PY'
+          import os
+          import tomllib
+          from pathlib import Path
+          package = tomllib.loads(Path('pyproject.toml').read_text())['project']['version']
+          native = tomllib.loads(Path('rust/Cargo.toml').read_text())['workspace']['package']['version']
+          assert package == native, f'Python/Rust version mismatch: {package} vs {native}'
+          assert os.environ['RELEASE_TAG'] == f'v{package}', 'Release tag must be v<package version>'
+          PY
+      - name: Build source distribution
+        uses: PyO3/maturin-action@423a6347767a8b16e65c2a7a7042e4a921528da8 # v1
+        with:
+          command: sdist
+          maturin-version: '1.15.0'
+          args: --out dist
+      - name: Build and test from the source archive
+        run: |
+          python -m pip install --only-binary=:all: numpy scipy polars pytest
+          python -m pip install --no-deps dist/*.tar.gz
+          python -I -m pytest -q tests
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: sdist
+          path: dist/*.tar.gz
+          if-no-files-found: error
+          retention-days: 14
+
+  release-assets:
+    name: Attach tested packages to the release
+    if: github.event_name == 'release'
+    needs: [wheels, sdist]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Upload release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: gh release upload "$RELEASE_TAG" dist/* --repo "$GITHUB_REPOSITORY" --clobber

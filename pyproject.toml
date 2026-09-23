@@ -1,6 +1,6 @@
 [build-system]
-requires = ["hatchling"]
-build-backend = "hatchling.build"
+requires = ["maturin>=1.14,<2"]
+build-backend = "maturin"
 
 [project]
 name = "spotsolve"
@@ -38,32 +38,28 @@ scripts = [
     "tifffile>=2023.1.1",
     "matplotlib>=3.7",
 ]
-# Build the local Rust extension with maturin; it is not a published dependency.
-dev = ["maturin>=1.4"]
+# Build tooling for local development.
+dev = ["maturin>=1.14,<2"]
 test = ["pytest>=7.0"]
 
 [project.urls]
 Homepage = "https://github.com/delnatan/spotsolve"
 Repository = "https://github.com/delnatan/spotsolve"
 
-[tool.hatch.build.targets.wheel]
-packages = ["src/spotsolve"]
-
-[tool.hatch.build.targets.sdist]
-# The Rust crate and the golden fixtures travel with the sdist so that
-# `cargo test --workspace` works from an unpacked tarball.
+[tool.maturin]
+manifest-path = "rust/spotsolve-py/Cargo.toml"
+python-source = "src"
+python-packages = ["spotsolve", "spotsolve_rs"]
+module-name = "spotsolve_rs.spotsolve_rs"
+features = ["extension-module"]
+locked = true
 include = [
-    "src/spotsolve",
-    "rust/Cargo.toml",
-    "rust/spotsolve-core",
-    "rust/spotsolve-py",
-    "tests",
-    "scripts",
-    "docs",
-    "README.md",
-    "LICENSE",
+    { path = "tests/**/*", format = "sdist" },
+    { path = "scripts/**/*.py", format = "sdist" },
+    { path = "docs/**/*.md", format = "sdist" },
+    { path = "rust/Cargo.lock", format = "sdist" },
 ]
-exclude = ["rust/target", "rust/dist"]
+exclude = ["**/__pycache__/**", "**/*.pyc"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

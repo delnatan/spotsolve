@@ -10,7 +10,7 @@ crate-type = ["cdylib"]
 
 [features]
 default = []
-# Enabled by maturin (see pyproject.toml), NOT by default. With
+# Enabled by maturin in the root pyproject.toml, not by default. With
 # `pyo3/extension-module` always on, the Python symbols are left undefined for
 # the interpreter to resolve at load time -- correct for a wheel, but it makes a
 # plain `cargo build` / `cargo test --workspace` fail to link. Gating it keeps

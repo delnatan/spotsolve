@@ -1252,7 +1252,7 @@ test = [
 [package.metadata]
 requires-dist = [
     { name = "matplotlib", marker = "extra == 'scripts'", specifier = ">=3.7" },
-    { name = "maturin", marker = "extra == 'dev'", specifier = ">=1.4" },
+    { name = "maturin", marker = "extra == 'dev'", specifier = ">=1.14,<2" },
     { name = "numpy", specifier = ">=1.24" },
     { name = "polars", specifier = ">=1.0" },
     { name = "pytest", marker = "extra == 'test'", specifier = ">=7.0" },
