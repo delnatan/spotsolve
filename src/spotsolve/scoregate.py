@@ -18,15 +18,20 @@ pixels of pure noise; u is solved from it for the given sigma (`threshold`).
 Widths are estimated within
 `slack * sigma`; the score always uses the reference width.
 
-Background map and dispersion come from the production detector, so any
-difference from it is in the search and count rule alone. Fits use the
-production LM fitter (`lmcl_fit_var_sigma`).
+The background map is a BG_WIN median filter and phi a scalar
+fourth-difference estimate (`estimate_background`). Detection only needs
+them for the null variance and each window's background shape; the level
+is fitted per window. Fits use the production LM fitter
+(`lmcl_fit_var_sigma`).
 
 Pruned 2026-09-23 after ablation (output/scoregate/ablation.json): a
 backward removal pass (removed 3 of 4687 additions on GEM, 13 of 13892 on
 beads, for 26-35% of all fits), a second sweep over windows (doubled fits;
 synthetic results identical, real counts within 3%) and a final joint
-polish (position RMSE already matched production). The efficient
+polish (position RMSE already matched production). Production's masked
+background and noise maps were replaced (output/scoregate/preprocess.json):
+counts on GEM and beads moved under 2%, phi under 1%, and the median map
+had the fewest false positives on synthetic haze. The efficient
 projection is not optional: a level-only score resolved 1% of 2-sigma
 pairs against 64%.
 """
@@ -39,7 +44,6 @@ from scipy import ndimage as ndi
 import spotsolve_rs as _rs
 
 from . import psf
-from .native import localize as _production
 
 FP_PER_MPX = 16.0
 """Default target: false emitters per 10^6 noise pixels. At sigma 1.45 this
@@ -226,6 +230,30 @@ def search(win, sigma, u, slack, k_max, stats):
     return state
 
 
+CHI2_1_MEDIAN = 0.4549364231195728
+BG_WIN = 25
+"""px. Background and dispersion windows (production BG_KERNEL / NOISE_WIN)."""
+
+
+def estimate_dispersion(d):
+    """Scalar phi = pixel variance / mean from the separable fourth
+    difference, whose squared output has median var * 70^2 * CHI2_1_MEDIAN
+    for white noise. The median pixel is taken to be background."""
+    k = np.array([1.0, -4.0, 6.0, -4.0, 1.0])
+    f = ndi.correlate1d(ndi.correlate1d(d, k, axis=0, mode="reflect"), k, axis=1, mode="reflect")
+    var = np.median(f[2:-2, 2:-2] ** 2) / (CHI2_1_MEDIAN * 70.0 ** 2)
+    return float(var / max(np.median(d), 1e-6))
+
+
+def estimate_background(d):
+    """(BG_WIN median-filtered background, scalar phi) of an offset-free frame.
+
+    Masking this detector's own seeds out of a local mean did no better,
+    and a flat background did worse on haze (output/scoregate/preprocess.json).
+    """
+    return ndi.median_filter(d, size=BG_WIN, mode="reflect"), estimate_dispersion(d)
+
+
 def _render(ems, y0, x0, h, w):
     """Light of global emitters `(A, y, x, s)` on a window, no background."""
     if len(ems) == 0:
@@ -270,15 +298,16 @@ def localize(frame, sigma, *, offset=0.0, fp_per_mpx=FP_PER_MPX, u=None, slack=S
              background=None, dispersion=None):
     """Score-gated localization of one frame. Returns `Result`.
 
-    `u` overrides the threshold solved from `fp_per_mpx`.
+    `u` overrides the threshold solved from `fp_per_mpx`. `background`
+    (ADU above offset, frame-shaped) and `dispersion` override the
+    estimates of `estimate_background`.
     """
     u = threshold(sigma, fp_per_mpx) if u is None else float(u)
     d = np.ascontiguousarray(frame, dtype=float) - offset
     H, W = d.shape
-    if background is None or dispersion is None:
-        ref = _production(d, sigma, images=False)
-        background, dispersion = ref.background, ref.dispersion
-    phi = float(dispersion)
+    if background is None:
+        background = ndi.median_filter(d, size=BG_WIN, mode="reflect")
+    phi = estimate_dispersion(d) if dispersion is None else float(dispersion)
     var = phi * np.maximum(background, 1e-3)
     z0 = detection_map(d - background, var, sigma)
     seeds, seed_z = find_seeds(z0, sigma, u)
