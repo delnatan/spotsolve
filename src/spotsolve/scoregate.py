@@ -5,8 +5,8 @@ adding one reference-width emitter at a pixel, given everything already
 fitted in the window (level and emitters, with their parameters free).
 
 1. Detect: the K = 0 score over the frame (a zero-mean matched filter).
-   Local maxima with z > u seed groups; seeds within LINK * sigma share one.
-2. Add: in a group's window, place at the owned pixel of highest z, only
+   Each local maximum with z > u seeds its own window.
+2. Add: in a seed's window, place at the owned pixel of highest z, only
    if z > u, starting from the one-step amplitude S / I_eff. Keep the
    emitter only if the refit gains u^2 / 2 dispersion-scaled nats.
 3. Windows are decided once, brightest seed first; each sees the emitters
@@ -55,15 +55,19 @@ Euler-characteristic density of a Gaussian-smoothed field (Lambda =
 1 / (2 sigma^2)). 0.80 is measured: accepted noise emitters over 4 Mpx at
 sigma 1.45, u 4.0-4.47, fell 0.80x below the continuous formula."""
 SLACK = (0.70, 2.2)
-LINK = 2.5
-"""sigma. Seeds closer than this share one window (production LINK_FACTOR)."""
-PAD = 3.0
-"""sigma. Window context around the outermost seed (production BBOX_PAD)."""
-OWN = 3.0
-"""sigma. Placement radius around a group's own seeds (production OWN_RADIUS)."""
-REACH = 5.0
-"""Emitter widths. Neighbouring light within this of a window enters its halo."""
+OWN = 4.0
+"""sigma. A window places emitters within this of its seed, on pixels no
+nearer another seed. On a dense synthetic field (output/scoregate/
+geometry_tied.json) recall rose to 0.729 at 4 and only 0.733 at 6."""
+SUPPORT = 3.0
+"""sigma. Context beyond the placement radius, so an emitter placed at its
+edge keeps its 3-sigma support: window half-side = (OWN + SUPPORT) sigma.
+With the window edge at OWN instead, precision was 0.907 against 0.955."""
+REACH = 3.0
+"""Emitter widths. Neighbouring light within this of a window enters its
+halo; 5 widths gave identical results (output/scoregate/geometry.json)."""
 K_MAX = 12
+"""Safety cap per window; a cap of 4 changed GEM by 2%."""
 FIT_MAX_ITER = 100
 FIT_TOL = 1e-6
 
@@ -99,27 +103,6 @@ def find_seeds(z, sigma, u):
     idx = np.argwhere(peak)
     order = np.argsort(-z[peak])
     return idx[order].astype(float), z[peak][order]
-
-
-def link_seeds(seeds, radius):
-    """Union-find groups of seeds closer than `radius`, as index lists."""
-    n = len(seeds)
-    parent = list(range(n))
-
-    def find(i):
-        while parent[i] != i:
-            parent[i] = parent[parent[i]]
-            i = parent[i]
-        return i
-
-    for i in range(n):
-        d = np.hypot(*(seeds[i + 1:] - seeds[i]).T)
-        for j in np.nonzero(d < radius)[0] + i + 1:
-            parent[find(j)] = find(i)
-    groups = {}
-    for i in range(n):
-        groups.setdefault(find(i), []).append(i)
-    return list(groups.values())
 
 
 @dataclass
@@ -311,28 +294,23 @@ def localize(frame, sigma, *, offset=0.0, fp_per_mpx=FP_PER_MPX, u=None, slack=S
     var = phi * np.maximum(background, 1e-3)
     z0 = detection_map(d - background, var, sigma)
     seeds, seed_z = find_seeds(z0, sigma, u)
-    groups = link_seeds(seeds, LINK * sigma)
-    pad = int(np.ceil(PAD * sigma))
+    pad = int(np.ceil((OWN + SUPPORT) * sigma))
     wins = []
-    for gi, idx in enumerate(groups):
-        s = seeds[idx]
-        y0 = max(int(s[:, 0].min()) - pad, 0)
-        x0 = max(int(s[:, 1].min()) - pad, 0)
-        y1 = min(int(s[:, 0].max()) + pad + 1, H)
-        x1 = min(int(s[:, 1].max()) + pad + 1, W)
+    for i, (sy, sx) in enumerate(seeds.astype(int)):
+        y0, x0 = max(sy - pad, 0), max(sx - pad, 0)
+        y1, x1 = min(sy + pad + 1, H), min(sx + pad + 1, W)
         yy, xx = np.mgrid[y0:y1, x0:x1]
-        d_own = np.min(np.hypot(yy[..., None] - s[:, 0], xx[..., None] - s[:, 1]), -1)
-        others = np.delete(seeds, idx, axis=0)
-        near = others[(others[:, 0] > y0 - 2 * pad) & (others[:, 0] < y1 + 2 * pad)
-                      & (others[:, 1] > x0 - 2 * pad) & (others[:, 1] < x1 + 2 * pad)]
+        d_own = np.hypot(yy - sy, xx - sx)
+        others = np.delete(seeds, i, axis=0)
+        near = others[(np.abs(others[:, 0] - sy) <= 2 * pad) & (np.abs(others[:, 1] - sx) <= 2 * pad)]
         d_oth = (np.min(np.hypot(yy[..., None] - near[:, 0], xx[..., None] - near[:, 1]), -1)
                  if len(near) else np.full(yy.shape, np.inf))
         bg = background[y0:y1, x0:x1]
         level = float(np.median(bg))
         wins.append(Window(y0, x0, np.ascontiguousarray(d[y0:y1, x0:x1]), bg - level, level,
                            (d_own <= OWN * sigma) & (d_own <= d_oth), phi))
-    # Groups come out of `link_seeds` in order of their strongest seed, so
-    # bright light is fitted before the dim windows that read it as halo.
+    # Seeds come strongest first, so bright light is fitted before the dim
+    # windows that read it as halo.
     held = []
     stats = Stats()
     reach = REACH * slack[1] * sigma
