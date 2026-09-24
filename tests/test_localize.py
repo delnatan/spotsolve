@@ -93,8 +93,8 @@ def test_roi_confines_the_search():
     # just outside whose wing crosses the ROI settles where it really is
     # (measured: 2.3 px out, on a true source). Its reach is the placement's.
     assert np.all(part.positions[:, 1] < 24 + 3 * SIGMA)
-    # No box forms outside, so the work shrinks with the area searched.
-    assert part.info["search_fits"] < 0.6 * full.info["search_fits"]
+    # No window forms outside, so the work shrinks with the area searched.
+    assert part.info["fits"] < 0.6 * full.info["fits"]
 
 
 def test_stack_is_frame_by_frame_and_thread_count_free():
@@ -159,16 +159,15 @@ def test_an_empty_roi_asks_for_nothing():
                      roi=np.zeros(img.shape, dtype=bool))
     assert len(res) == 0
     assert res.background.shape == img.shape
-    assert res.info["candidates"] == 0 and res.info["boxes"] == 0
+    assert res.info["seeds"] == 0 and res.info["fits"] == 0
     assert res.info["fisher_fraction"].shape == (0, 4)
     assert res.flags.shape == (0,)
 
 
-@pytest.mark.parametrize("selection", ["fixed", "bic"])
-def test_fisher_diagnostics_and_flags_follow_all_returned_rows(selection):
+def test_fisher_diagnostics_and_flags_follow_all_returned_rows():
     image = _sim(17, density=0.015, spread=0.4).image
-    raw = rs.box_localize(image, sigma=SIGMA, selection=selection)
-    result = L.localize(image, sigma=SIGMA, selection=selection, images=False)
+    raw = rs.box_localize(image, sigma=SIGMA)
+    result = L.localize(image, sigma=SIGMA, images=False)
     fraction = raw[-1]["fisher_fraction"]
     assert fraction.shape == (len(raw[0]), 4)
     assert np.all((fraction > 0) & (fraction <= 1))
@@ -177,18 +176,8 @@ def test_fisher_diagnostics_and_flags_follow_all_returned_rows(selection):
     np.testing.assert_array_equal(result.flags, raw[5])
     assert len(result) == len(raw[0])
 
-    # No covariance exists without the final fit; workspace reuse must not
-    # accidentally attach another frame's diagnostic.
-    unpolished = rs.box_localize(image, sigma=SIGMA, selection=selection, polish=False)
-    assert len(unpolished[0]) > 0
-    assert np.isnan(unpolished[-1]["fisher_fraction"]).all()
-    from spotsolve import FitFlag
-    assert np.all(unpolished[5] & int(FitFlag.NOT_CONVERGED))
-    assert np.all(unpolished[5] & int(FitFlag.COVARIANCE_UNAVAILABLE))
 
-
-@pytest.mark.parametrize("selection", ["fixed", "bic"])
-def test_narrow_broad_and_bright_sources_keep_their_measurements(selection):
+def test_narrow_broad_and_bright_sources_keep_their_measurements():
     from spotsolve import psf, FitFlag
     yy, xx = np.mgrid[:96, :96]
     truth = np.array([[24., 24.], [48., 48.], [72., 72.]])
@@ -197,7 +186,7 @@ def test_narrow_broad_and_bright_sources_keep_their_measurements(selection):
     theta = psf.pack_var_sigma(30., flux, truth[:, 0], truth[:, 1], widths)
     mean = psf.model_var_sigma(theta, yy, xx)
     image = np.random.default_rng(73).poisson(mean).astype(float)
-    result = L.localize(image, 1.0, selection=selection)
+    result = L.localize(image, 1.0)
     distance, found = cKDTree(result.positions).query(truth)
     assert np.all(distance < .1)
     np.testing.assert_allclose(result.amplitudes[found], flux, rtol=.05)
@@ -222,7 +211,5 @@ def test_edge_flag_does_not_depend_on_a_width_reporting_band():
 
 @pytest.mark.parametrize("value", [0, -1, 1.5, True])
 def test_native_wrapper_requires_positive_integer_counts(value):
-    with pytest.raises(ValueError, match="k_max"):
-        L.localize(np.ones((16, 16)), 1.2, k_max=value)
     with pytest.raises(ValueError, match="n_threads"):
         L.localize_stack(np.ones((1, 16, 16)), 1.2, n_threads=value)

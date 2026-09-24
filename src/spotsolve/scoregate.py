@@ -228,13 +228,22 @@ def estimate_dispersion(d):
     return float(var / max(np.median(d), 1e-6))
 
 
+def median_background(d):
+    """BG_WIN median of `d` rounded to whole ADU, reflected at the edges.
+
+    Rounding (error <= 0.5 ADU, far below the noise) makes the median exact
+    for a sliding-histogram implementation, which the Rust port uses.
+    """
+    return ndi.median_filter(np.rint(d), size=BG_WIN, mode="reflect")
+
+
 def estimate_background(d):
     """(BG_WIN median-filtered background, scalar phi) of an offset-free frame.
 
     Masking this detector's own seeds out of a local mean did no better,
     and a flat background did worse on haze (output/scoregate/preprocess.json).
     """
-    return ndi.median_filter(d, size=BG_WIN, mode="reflect"), estimate_dispersion(d)
+    return median_background(d), estimate_dispersion(d)
 
 
 def _render(ems, y0, x0, h, w):
@@ -257,6 +266,7 @@ class Result:
     seed_z: np.ndarray
     z0: np.ndarray
     stats: Stats
+    u: float
 
 
 def threshold(sigma, fp_per_mpx=FP_PER_MPX):
@@ -289,7 +299,7 @@ def localize(frame, sigma, *, offset=0.0, fp_per_mpx=FP_PER_MPX, u=None, slack=S
     d = np.ascontiguousarray(frame, dtype=float) - offset
     H, W = d.shape
     if background is None:
-        background = ndi.median_filter(d, size=BG_WIN, mode="reflect")
+        background = median_background(d)
     phi = estimate_dispersion(d) if dispersion is None else float(dispersion)
     var = phi * np.maximum(background, 1e-3)
     z0 = detection_map(d - background, var, sigma)
@@ -328,4 +338,4 @@ def localize(frame, sigma, *, offset=0.0, fp_per_mpx=FP_PER_MPX, u=None, slack=S
         held.append(e)
     ems = np.concatenate(held) if held else np.zeros((0, 4))
     return Result(ems[:, 1:3], ems[:, 0], ems[:, 3], background, phi,
-                  seeds, seed_z, z0, stats)
+                  seeds, seed_z, z0, stats, u)

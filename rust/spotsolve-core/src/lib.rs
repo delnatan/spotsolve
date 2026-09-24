@@ -1,11 +1,15 @@
 //! `spotsolve` core: emitter detection and localization.
 //!
-//! The detector is [`boxsearch`]: in each box, an emitter exists iff it
-//! lowers the Poisson deviance by `ADD_NATS` in units of the frame's own
-//! measured noise, and a whole frame -- the noise map, FIND, the background
-//! surface, the search, the polish and the classification -- runs here, and
-//! the measurements behind its constants are recorded beside them. Its Python reference was retired on 2026-09-11;
-//! it is last present in commit `ea6b17f`, under `src/spotsolve/deprecated/`.
+//! The detector is [`boxsearch`]: every change of count is decided by one
+//! statistic, the efficient score for one more reference-width emitter,
+//! against a threshold set by an expected false-positive rate. Background,
+//! dispersion, seeds, per-seed windows and uncertainties all run here; the
+//! one-pass result is then refined as one joint model of the frame by
+//! [`joint`] (pinned by `tests/fixtures/11_joint.json`), and
+//! the measurements behind its constants are recorded beside them. It was
+//! prototyped in Python (`src/spotsolve/scoregate.py`, last present in
+//! commit 7b7dfe7's successors on branch `scoregate-prototype`) and is pinned
+//! to that prototype by `tests/fixtures/10_scoregate.json`.
 //!
 //! The rest are the layers it is built from: [`psf`] (the
 //! pixel-integrated Gaussian and its Jacobian), [`lmcl`] (the bounded Poisson
@@ -30,6 +34,7 @@ pub mod boxsearch;
 mod frames;
 pub mod filters;
 pub mod grid;
+pub mod joint;
 pub mod lap;
 pub mod linalg;
 pub mod lmcl;

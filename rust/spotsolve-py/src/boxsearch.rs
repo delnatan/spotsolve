@@ -17,48 +17,17 @@ type Arr2 = Py<PyArray2<f64>>;
 /// `(positions, amplitudes, sigmas, se, sigma_se, flags, background, info)`.
 type Frame<'py> = (Arr2, Arr1, Arr1, Arr2, Arr1, Py<PyArray1<u8>>, Arr2, Bound<'py, PyDict>);
 
-#[allow(clippy::too_many_arguments)]
-fn settings(
-    sigma: f64,
-    k_max: usize,
-    threshold: Option<f64>,
-    selection: &str,
-    count_penalty: f64,
-    slack: (f64, f64),
-    sweeps: usize,
-    polish: bool,
-) -> PyResult<bs::Settings> {
+fn settings(sigma: f64, fp_per_mpx: f64, slack: (f64, f64)) -> PyResult<bs::Settings> {
     if !(sigma.is_finite() && sigma > 0.0) {
         return Err(PyValueError::new_err("`sigma` must be positive"));
     }
     if !(slack.0 > 0.0 && slack.0 < slack.1 && slack.1.is_finite()) {
         return Err(PyValueError::new_err("`slack` must be 0 < lo < hi"));
     }
-    if k_max == 0 {
-        return Err(PyValueError::new_err("`k_max` must be at least 1"));
+    if !(fp_per_mpx.is_finite() && fp_per_mpx > 0.0) {
+        return Err(PyValueError::new_err("`fp_per_mpx` must be positive and finite"));
     }
-    let threshold = threshold.unwrap_or(bs::PEAK_Z);
-    if !threshold.is_finite() {
-        return Err(PyValueError::new_err("`threshold` must be finite"));
-    }
-    let selection = match selection {
-        "fixed" => bs::Selection::Fixed,
-        "bic" => bs::Selection::Bic,
-        _ => return Err(PyValueError::new_err("`selection` must be 'fixed' or 'bic'")),
-    };
-    if !count_penalty.is_finite() || count_penalty < 0.0 {
-        return Err(PyValueError::new_err("`count_penalty` must be finite and non-negative"));
-    }
-    Ok(bs::Settings {
-        sigma,
-        k_max,
-        threshold,
-        selection,
-        count_penalty,
-        slack,
-        sweeps,
-        polish,
-    })
+    Ok(bs::Settings { sigma, fp_per_mpx, slack })
 }
 
 fn check_offset(offset: f64) -> PyResult<()> {
@@ -91,11 +60,14 @@ fn give<'py>(py: Python<'py>, o: bs::Output, h: usize, w: usize) -> PyResult<Fra
     let info = PyDict::new(py);
     info.set_item("fitted_background", o.fitted_background.into_pyarray(py))?;
     info.set_item("dispersion", o.dispersion)?;
-    info.set_item("candidates", o.n_candidates)?;
-    info.set_item("boxes", o.n_boxes)?;
-    info.set_item("search_fits", o.search_fits)?;
-    info.set_item("polish_fits", o.polish_fits)?;
-    info.set_item("selection_fits", o.selection_fits)?;
+    info.set_item("u", o.u)?;
+    info.set_item("seeds", o.n_seeds)?;
+    info.set_item("fits", o.fits)?;
+    info.set_item("lr_fail", o.lr_fail)?;
+    info.set_item("adds", o.adds)?;
+    info.set_item("removed", o.removed)?;
+    info.set_item("outer", o.outer)?;
+    info.set_item("kappa", o.kappa)?;
     info.set_item("fisher_fraction", o.fisher_fraction.into_pyarray(py).reshape([n, 4])?)?;
     Ok((
         o.pos.into_pyarray(py).reshape([n, 2])?.unbind(),
@@ -109,10 +81,10 @@ fn give<'py>(py: Python<'py>, o: bs::Output, h: usize, w: usize) -> PyResult<Fra
     ))
 }
 
-/// Localize one raw frame. Everything is in ADU above `offset`; the noise is
-/// measured from the frame.
+/// Localize one raw frame. Everything is in ADU above `offset`; the
+/// background and dispersion are measured from the frame.
 #[pyfunction]
-#[pyo3(signature = (raw, sigma, offset=0.0, *, roi=None, k_max=bs::K_MAX, threshold=None, selection="fixed", count_penalty=0.0, slack=bs::SLACK, sweeps=bs::SWEEPS, polish=true))]
+#[pyo3(signature = (raw, sigma, offset=0.0, *, roi=None, fp_per_mpx=bs::FP_PER_MPX, slack=bs::SLACK))]
 #[allow(clippy::too_many_arguments)]
 fn box_localize<'py>(
     py: Python<'py>,
@@ -120,13 +92,8 @@ fn box_localize<'py>(
     sigma: f64,
     offset: f64,
     roi: Option<PyReadonlyArray2<'_, bool>>,
-    k_max: usize,
-    threshold: Option<f64>,
-    selection: &str,
-    count_penalty: f64,
+    fp_per_mpx: f64,
     slack: (f64, f64),
-    sweeps: usize,
-    polish: bool,
 ) -> PyResult<Frame<'py>> {
     let (h, w) = (raw.shape()[0], raw.shape()[1]);
     let r = raw
@@ -138,7 +105,7 @@ fn box_localize<'py>(
     }
     check_offset(offset)?;
     let roi = roi_slice(&roi, h, w)?.map(|m| m.to_vec());
-    let s = settings(sigma, k_max, threshold, selection, count_penalty, slack, sweeps, polish)?;
+    let s = settings(sigma, fp_per_mpx, slack)?;
     let o = py.detach(|| {
         let (mut ws, mut d) = (bs::Workspace::new(), Vec::new());
         bs::localize_raw(&r, h, w, offset, roi.as_deref(), &s, &mut ws, &mut d)
@@ -150,7 +117,7 @@ fn box_localize<'py>(
 /// each frame exactly as `box_localize` would. Returns one tuple per frame,
 /// in frame order.
 #[pyfunction]
-#[pyo3(signature = (raw, sigma, offset=0.0, *, roi=None, k_max=bs::K_MAX, threshold=None, selection="fixed", count_penalty=0.0, slack=bs::SLACK, sweeps=bs::SWEEPS, polish=true, n_threads=1))]
+#[pyo3(signature = (raw, sigma, offset=0.0, *, roi=None, fp_per_mpx=bs::FP_PER_MPX, slack=bs::SLACK, n_threads=1))]
 #[allow(clippy::too_many_arguments)]
 fn box_localize_stack<'py>(
     py: Python<'py>,
@@ -158,13 +125,8 @@ fn box_localize_stack<'py>(
     sigma: f64,
     offset: f64,
     roi: Option<PyReadonlyArray2<'_, bool>>,
-    k_max: usize,
-    threshold: Option<f64>,
-    selection: &str,
-    count_penalty: f64,
+    fp_per_mpx: f64,
     slack: (f64, f64),
-    sweeps: usize,
-    polish: bool,
     n_threads: usize,
 ) -> PyResult<Vec<Frame<'py>>> {
     let sh = raw.shape();
@@ -177,7 +139,7 @@ fn box_localize_stack<'py>(
     }
     check_offset(offset)?;
     let roi = roi_slice(&roi, h, w)?.map(|m| m.to_vec());
-    let s = settings(sigma, k_max, threshold, selection, count_penalty, slack, sweeps, polish)?;
+    let s = settings(sigma, fp_per_mpx, slack)?;
     let r = r.to_vec();
     let outs = py.detach(|| {
         bs::localize_stack(&r, n, h, w, offset, roi.as_deref(), &s, n_threads.max(1))
@@ -213,7 +175,7 @@ fn box_render(
 }
 
 pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
-    m.add("BOX_OUTPUT_VERSION", 2)?;
+    m.add("BOX_OUTPUT_VERSION", 4)?;
     m.add_function(wrap_pyfunction!(box_localize, m)?)?;
     m.add_function(wrap_pyfunction!(box_localize_stack, m)?)?;
     m.add_function(wrap_pyfunction!(box_render, m)?)?;
@@ -221,7 +183,6 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // no second copy of them.
     m.add("BOX_SLACK", bs::SLACK)?;
     m.add("BOX_K_MAX", bs::K_MAX)?;
-    m.add("BOX_ADD_NATS", bs::ADD_NATS)?;
-    m.add("BOX_PEAK_Z", bs::PEAK_Z)?;
+    m.add("BOX_FP_PER_MPX", bs::FP_PER_MPX)?;
     Ok(())
 }
