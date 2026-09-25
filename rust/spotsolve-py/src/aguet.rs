@@ -122,7 +122,7 @@ fn aguet_localize_stack<'py>(
     output.into_iter().map(|o| give(py, o, h, w)).collect()
 }
 
-/// Sampled-Gaussian diagnostic rendering, deliberately separate from box_render.
+/// Sampled-Gaussian diagnostic rendering, deliberately separate from detect_render.
 #[pyfunction]
 fn aguet_render<'py>(
     py: Python<'py>,

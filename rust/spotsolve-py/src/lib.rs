@@ -1,7 +1,7 @@
 //! PyO3 bindings for `spotsolve-core`, exposed to Python as `spotsolve_rs`.
 //!
-//! The boundary sits at the FRAME for detection: `box_localize` and
-//! `box_localize_stack` (see `spotsolve_core::detect`) run a whole frame natively with the
+//! The boundary sits at the FRAME for detection: `detect_localize` and
+//! `detect_localize_stack` (see `spotsolve_core::detect`) run whole frames natively with the
 //! GIL released. For linking it sits at the MOVIE: `track_fit` and
 //! `track_link` (see `track`) take a whole table of localizations.
 //!

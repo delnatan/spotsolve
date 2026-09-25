@@ -10,14 +10,14 @@ use numpy::{
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
-use spotsolve_core::detect as bs;
+use spotsolve_core::detect;
 
 type Arr1 = Py<PyArray1<f64>>;
 type Arr2 = Py<PyArray2<f64>>;
 /// `(positions, amplitudes, sigmas, se, sigma_se, flags, background, info)`.
 type Frame<'py> = (Arr2, Arr1, Arr1, Arr2, Arr1, Py<PyArray1<u8>>, Arr2, Bound<'py, PyDict>);
 
-fn settings(sigma: f64, fp_per_mpx: f64, slack: (f64, f64)) -> PyResult<bs::Settings> {
+fn settings(sigma: f64, fp_per_mpx: f64, slack: (f64, f64)) -> PyResult<detect::Settings> {
     if !(sigma.is_finite() && sigma > 0.0) {
         return Err(PyValueError::new_err("`sigma` must be positive"));
     }
@@ -27,7 +27,7 @@ fn settings(sigma: f64, fp_per_mpx: f64, slack: (f64, f64)) -> PyResult<bs::Sett
     if !(fp_per_mpx.is_finite() && fp_per_mpx > 0.0) {
         return Err(PyValueError::new_err("`fp_per_mpx` must be positive and finite"));
     }
-    Ok(bs::Settings { sigma, fp_per_mpx, slack })
+    Ok(detect::Settings { sigma, fp_per_mpx, slack })
 }
 
 fn check_offset(offset: f64) -> PyResult<()> {
@@ -55,7 +55,7 @@ fn roi_slice<'a>(
     }
 }
 
-fn give<'py>(py: Python<'py>, o: bs::Output, h: usize, w: usize) -> PyResult<Frame<'py>> {
+fn give<'py>(py: Python<'py>, o: detect::Output, h: usize, w: usize) -> PyResult<Frame<'py>> {
     let n = o.amp.len();
     let info = PyDict::new(py);
     info.set_item("fitted_background", o.fitted_background.into_pyarray(py))?;
@@ -84,9 +84,9 @@ fn give<'py>(py: Python<'py>, o: bs::Output, h: usize, w: usize) -> PyResult<Fra
 /// Localize one raw frame. Everything is in ADU above `offset`; the
 /// background and dispersion are measured from the frame.
 #[pyfunction]
-#[pyo3(signature = (raw, sigma, offset=0.0, *, roi=None, fp_per_mpx=bs::FP_PER_MPX, slack=bs::SLACK))]
+#[pyo3(signature = (raw, sigma, offset=0.0, *, roi=None, fp_per_mpx=detect::FP_PER_MPX, slack=detect::SLACK))]
 #[allow(clippy::too_many_arguments)]
-fn box_localize<'py>(
+fn detect_localize<'py>(
     py: Python<'py>,
     raw: PyReadonlyArray2<'_, f64>,
     sigma: f64,
@@ -106,17 +106,17 @@ fn box_localize<'py>(
     check_offset(offset)?;
     let roi = roi_slice(&roi, h, w)?.map(|m| m.to_vec());
     let s = settings(sigma, fp_per_mpx, slack)?;
-    let o = py.detach(|| bs::localize_raw(&r, h, w, offset, roi.as_deref(), &s));
+    let o = py.detach(|| detect::localize_raw(&r, h, w, offset, roi.as_deref(), &s));
     give(py, o, h, w)
 }
 
 /// Localize every frame of a raw `(T, H, W)` stack on `n_threads` workers,
-/// each frame exactly as `box_localize` would. Returns one tuple per frame,
+/// each frame exactly as `detect_localize` would. Returns one tuple per frame,
 /// in frame order.
 #[pyfunction]
-#[pyo3(signature = (raw, sigma, offset=0.0, *, roi=None, fp_per_mpx=bs::FP_PER_MPX, slack=bs::SLACK, n_threads=1))]
+#[pyo3(signature = (raw, sigma, offset=0.0, *, roi=None, fp_per_mpx=detect::FP_PER_MPX, slack=detect::SLACK, n_threads=1))]
 #[allow(clippy::too_many_arguments)]
-fn box_localize_stack<'py>(
+fn detect_localize_stack<'py>(
     py: Python<'py>,
     raw: PyReadonlyArray3<'_, f64>,
     sigma: f64,
@@ -139,7 +139,7 @@ fn box_localize_stack<'py>(
     let s = settings(sigma, fp_per_mpx, slack)?;
     let r = r.to_vec();
     let outs = py.detach(|| {
-        bs::localize_stack(&r, n, h, w, offset, roi.as_deref(), &s, n_threads.max(1))
+        detect::localize_stack(&r, n, h, w, offset, roi.as_deref(), &s, n_threads.max(1))
     });
     outs.into_iter().map(|o| give(py, o, h, w)).collect()
 }
@@ -148,7 +148,7 @@ fn box_localize_stack<'py>(
 /// `truncate` of its sigma.
 #[pyfunction]
 #[pyo3(signature = (positions, amplitudes, sigmas, background, truncate=4.0))]
-fn box_render(
+fn detect_render(
     py: Python<'_>,
     positions: PyReadonlyArray2<'_, f64>,
     amplitudes: PyReadonlyArray1<'_, f64>,
@@ -172,14 +172,13 @@ fn box_render(
 }
 
 pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
-    m.add("BOX_OUTPUT_VERSION", 4)?;
-    m.add_function(wrap_pyfunction!(box_localize, m)?)?;
-    m.add_function(wrap_pyfunction!(box_localize_stack, m)?)?;
-    m.add_function(wrap_pyfunction!(box_render, m)?)?;
+    m.add("DETECT_OUTPUT_VERSION", 5)?;
+    m.add_function(wrap_pyfunction!(detect_localize, m)?)?;
+    m.add_function(wrap_pyfunction!(detect_localize_stack, m)?)?;
+    m.add_function(wrap_pyfunction!(detect_render, m)?)?;
     // The detector's defaults, read by `spotsolve.native` so Python states
     // no second copy of them.
-    m.add("BOX_SLACK", bs::SLACK)?;
-    m.add("BOX_K_MAX", bs::K_MAX)?;
-    m.add("BOX_FP_PER_MPX", bs::FP_PER_MPX)?;
+    m.add("DETECT_SLACK", detect::SLACK)?;
+    m.add("DETECT_FP_PER_MPX", detect::FP_PER_MPX)?;
     Ok(())
 }

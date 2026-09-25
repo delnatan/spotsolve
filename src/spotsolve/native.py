@@ -1,4 +1,4 @@
-"""Multi-emitter localization using the native score-gated search.
+"""Multi-emitter localization with the native joint-model detector.
 
 Frames are independent. An ROI restricts seeds, placements and
 preprocessing; fitted centers may move outside it. Background and
@@ -15,20 +15,18 @@ from .results import Localizations
 
 try:
     import spotsolve_rs as _rs
-    if getattr(_rs, "BOX_OUTPUT_VERSION", 0) != 4:
+    if getattr(_rs, "DETECT_OUTPUT_VERSION", 0) != 5:
         raise ImportError("incompatible localization output; rebuild spotsolve_rs")
 except ImportError as error:          # pragma: no cover - build problem
     raise ImportError(
         "spotsolve needs its bundled Rust extension; reinstall a compatible wheel "
         "or run `maturin develop --release` from the repository root") from error
 
-__all__ = ["localize", "localize_stack", "SLACK", "K_MAX", "FP_PER_MPX"]
+__all__ = ["localize", "localize_stack", "SLACK", "FP_PER_MPX"]
 
-SLACK = tuple(_rs.BOX_SLACK)
+SLACK = tuple(_rs.DETECT_SLACK)
 """Widths a fit may take, as multiples of `sigma`: the model space."""
-K_MAX = int(_rs.BOX_K_MAX)
-"""Most emitters one seed's window fits; a safety cap."""
-FP_PER_MPX = float(_rs.BOX_FP_PER_MPX)
+FP_PER_MPX = float(_rs.DETECT_FP_PER_MPX)
 """Default expected false emitters per 10^6 pixels of pure noise."""
 
 
@@ -68,7 +66,7 @@ def _result(out, raw, kw, images):
     info.update(fp_per_mpx=kw["fp_per_mpx"])
     model = residual = None
     if images:
-        model = _rs.box_render(pos, amp, sig, bmap)
+        model = _rs.detect_render(pos, amp, sig, bmap)
         residual = raw - kw["offset"] - model
     return Localizations(
         positions=pos, amplitudes=amp, se=se,
@@ -115,7 +113,7 @@ def localize(frame, sigma, *, offset=0.0, roi=None, fp_per_mpx=FP_PER_MPX,
     if raw.ndim != 2:
         raise ValueError(f"expected a 2-D frame, got shape {raw.shape}")
     kw = _kw(sigma, offset, roi, raw.shape, fp_per_mpx, slack)
-    return _result(_rs.box_localize(raw, **kw), raw, kw, images)
+    return _result(_rs.detect_localize(raw, **kw), raw, kw, images)
 
 
 def localize_stack(stack, sigma, *, offset=0.0, roi=None, fp_per_mpx=FP_PER_MPX,
@@ -132,7 +130,7 @@ def localize_stack(stack, sigma, *, offset=0.0, roi=None, fp_per_mpx=FP_PER_MPX,
     if raw.ndim != 3:
         raise ValueError(f"expected a (T, H, W) stack, got shape {raw.shape}")
     kw = _kw(sigma, offset, roi, raw.shape[1:], fp_per_mpx, slack)
-    outs = _rs.box_localize_stack(
+    outs = _rs.detect_localize_stack(
         raw, **kw, n_threads=_positive_int((os.cpu_count() or 1) if n_threads is None else n_threads,
                                 "n_threads"))
     return [_result(o, raw[t], kw, images) for t, o in enumerate(outs)]

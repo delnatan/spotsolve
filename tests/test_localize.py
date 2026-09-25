@@ -166,7 +166,7 @@ def test_an_empty_roi_asks_for_nothing():
 
 def test_fisher_diagnostics_and_flags_follow_all_returned_rows():
     image = _sim(17, density=0.015, spread=0.4).image
-    raw = rs.box_localize(image, sigma=SIGMA)
+    raw = rs.detect_localize(image, sigma=SIGMA)
     result = L.localize(image, sigma=SIGMA, images=False)
     fraction = raw[-1]["fisher_fraction"]
     assert fraction.shape == (len(raw[0]), 4)

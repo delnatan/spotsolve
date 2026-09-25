@@ -1,6 +1,6 @@
 """Emitter localization and Brownian-motion LAP tracking for microscopy.
 
-`localize` / `localize_stack` fit emitters with a score-gated search whose
+`localize` / `localize_stack` fit each frame as one Poisson model whose
 one knob, `fp_per_mpx`, is the expected false positives per 10^6 noise
 pixels. `localize_aguet` /
 `localize_aguet_stack` provide the independent-fit spotfitlm sparse baseline.
@@ -20,7 +20,6 @@ on those tables using frame-to-frame linear assignment and Brownian motion.
 
 from .native import (  # noqa: F401
     FP_PER_MPX,
-    K_MAX,
     SLACK,
     localize,
     localize_stack,
@@ -42,7 +41,6 @@ __all__ = [
     "fit_link_params",
     "LinkParams",
     "SLACK",
-    "K_MAX",
     "FP_PER_MPX",
     "__version__",
 ]

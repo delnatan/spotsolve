@@ -135,6 +135,9 @@ Measured on the development Apple Silicon host:
 | Aguet, 24 simulated sparse 128x128 frames | 26.3 ms | 7.32 ms |
 | Aguet, same frames with a quarter-frame ROI | 8.81 ms | 2.68 ms |
 
+On all ten cores (four performance, six efficiency) the 49 GEM frames take
+13.3 s, 5.5x serial, with byte-identical results at every worker count.
+
 These are different workloads, not a detector accuracy/speed comparison.
 The original `spotfitlm` took 172.1 ms on the sparse full-frame benchmark:
 6.5× the native serial time. See [Aguet measurements](docs/AGUET_BASELINE.md#validation-and-speed) for conditions
