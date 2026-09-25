@@ -79,3 +79,20 @@ replaced `boxsearch.rs`, `joint.rs`, the general fitter `lmcl.rs` (with its
 Python binding, `layer3_lmcl.rs`, `test_fitter.py` and `02_lmga.json`), the
 dense Jacobian `psf::model_and_jac_var_sigma_ax`, and the unused
 `patches.rs` and `render::emitter_free_mask`; all are in `c870d6e`.
+
+## Retired on 2026-09-25
+
+The diffusion-model linker ported from `tracksolve`: per-track Kalman filters
+over a 16-point D grid, the parameter fit (`trackparams.rs`,
+`fit_link_params`, `LinkParams`), the brightness cue, exclusion margins with
+`min_link_margin` / `min_track_length` / `diagnostics`, the parity fixture
+`tests/fixtures/08_track.json` with `layer6_track.rs`, and
+`scripts/benchmark_tracking.py` with its conservative-linking experiment.
+All are in commit `e43f695`, and the old `docs/TRACKING.md` describes them.
+
+It was replaced by Crocker–Grier linking at a required `max_step`, on the
+same exact assignment. With one diffusion population the two gave nearly the
+same switch rates; with 30% immobile particles the old one had 12–17%
+fewer switches. On the beads and GEM movies they shared 95–97% of their
+links. The old linker also made 100–173 links per movie longer than 3 rms
+steps, mostly spurious. [TRACKING.md](../TRACKING.md) has the measurements.

@@ -13,8 +13,8 @@ Positions are (y, x) pixels, amplitudes are flux above the offset, and `se`
 columns are (flux, y, x). Noise models and diagnostics differ by detector;
 see docs/DETECTION.md and docs/AGUET_BASELINE.md.
 
-`loctable` converts results to tables; `link` and `fit_link_params` operate
-on those tables using frame-to-frame linear assignment and Brownian motion.
+`loctable` converts results to tables; `link` joins their rows into tracks
+frame to frame, by least squared displacement within a search radius.
 `FitFlag` describes numerical and geometric fit issues.
 """
 
@@ -26,7 +26,7 @@ from .native import (  # noqa: F401
 )
 from .results import FitFlag, Localizations  # noqa: F401
 from .aguet import localize_aguet, localize_aguet_stack  # noqa: F401
-from .tracking import LinkParams, fit_link_params, link  # noqa: F401
+from .tracking import link  # noqa: F401
 
 __version__ = "0.1.0"
 
@@ -38,8 +38,6 @@ __all__ = [
     "Localizations",
     "FitFlag",
     "link",
-    "fit_link_params",
-    "LinkParams",
     "SLACK",
     "FP_PER_MPX",
     "__version__",

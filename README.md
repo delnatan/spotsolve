@@ -1,7 +1,7 @@
 # spotsolve
 
 Emitter localization for sparse to moderately crowded fluorescence images,
-with Brownian-motion trajectory linking through frame-to-frame LAP assignment.
+with frame-to-frame trajectory linking by least squared displacement.
 Fit overlapping emitters jointly, or use the Aguet / `spotfitlm` sparse
 baseline. Both return positions, fluxes, widths and uncertainties for linking.
 Detection and fitting run in Rust, with movie frames processed in parallel.
@@ -77,7 +77,7 @@ amplitude-width covariance in its flux uncertainty.
 `peak` is derived from flux and fitted width. It helps compare a spot with
 the image background, but varies with width and can exceed the brightest
 observed pixel when the emitter lies between pixels. Localization tables
-include `peak`; brightness-aware linking uses total flux.
+include `peak`.
 
 Multi-emitter uncertainties use the final, undamped expected Fisher matrix,
 scaled by local dispersion. If covariance cannot be computed, errors are NaN.
@@ -187,25 +187,19 @@ usable = locs.filter(pl.col("flags") == 0)
 usable = loctable.filter_quality(usable)  # require usable coordinates and errors
 # Optional precision cut: max_se_pos=0.5 (pixels; calibrate for your data).
 
-tracks = spotsolve.link(usable)
+tracks = spotsolve.link(usable, max_step=6.5)  # pixels
 tracks.select("track_id", "frame", "y", "x")
 
-params = spotsolve.fit_link_params(usable)  # inspect or reuse estimated parameters
-tracks = spotsolve.link(usable, params)
-
-# Optional conservative linking; 1 nat is an example, not a calibrated cutoff.
-tracks = spotsolve.link(usable, params, min_link_margin=1.0,
-                       min_track_length=4, diagnostics=True)
-accepted = tracks.filter(pl.col("track_accepted"))
+# Tracks of at least four frames:
+long = tracks.filter(pl.len().over("track_id") >= 4)
 ```
 
-Linking uses the frame-to-frame LAP stage of Jaqaman-style tracking with
-Brownian-motion costs. It preserves rows and columns and adds `track_id`.
-Motion, continuation and error scaling are estimated from the movie.
-`brightness=True` optionally
-uses flux and flux uncertainty. A missed detection ends a track; there is no
-gap closing or merging/splitting. See [tracking](docs/TRACKING.md) for the
-motion model, parameters, benchmarks and limits.
+Between consecutive frames, links minimize the summed squared displacement,
+and ending a track costs `max_step`². No step longer than `max_step` is
+linked; about three times the rms step of the fastest particles of interest
+is a good start. The result is the input table plus `track_id`, in the same
+row order. A missed detection ends a track. See [tracking](docs/TRACKING.md)
+for the model, how to choose `max_step`, and validation.
 
 ## Development
 
@@ -215,7 +209,7 @@ cargo test --release --workspace --manifest-path rust/Cargo.toml
 ```
 
 Tests cover simulation recovery, singular-covariance handling, fit flags,
-Fisher diagnostics, tables and Brownian-motion linking. Aguet is checked against
+Fisher diagnostics, tables and linking. Aguet is checked against
 frozen original `spotfitlm` fits, including covariance, masks and worker counts.
 
 [Documentation index](docs/README.md) · [Source map and validation](docs/README.md#implementation)

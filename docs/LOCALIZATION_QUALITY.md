@@ -104,5 +104,5 @@ background and should not replace the fitted patch objective.
 
 Validate optional cuts against representative images and simulations. Keep
 original frame numbers and filter before linking: removing a row can end a
-trajectory. Re-link after changing cuts. [Track length and link margin](TRACKING.md)
-are separate downstream decisions.
+trajectory. Re-link after changing cuts. The linker's search radius and any
+minimum track length are separate downstream decisions; see [tracking](TRACKING.md).

@@ -102,6 +102,23 @@ retired; when migrating an existing environment, uninstall both `spotsolve`
 and `spotsolve-rs` before installing the unified distribution, because the old
 native distribution owns the same import path.
 
+On macOS with Xcode 27 (ld-27037), some Rust dylibs link with their symbol
+string pool on a 4-byte boundary, and dyld refuses to load them ("mis-aligned
+LINKEDIT string pool"). It depends on each binary's size, so it can hit the
+extension or a proc-macro crate such as `pyo3_macros` (then reported as
+"can't find crate"). Deployment targets and ld flags do not prevent it. Link
+with Rust's bundled lld against the 26.5 SDK instead (lld cannot read the 27.0
+SDK's library stubs):
+
+```sh
+export SDKROOT=/Library/Developer/CommandLineTools/SDKs/MacOSX26.5.sdk
+export RUSTFLAGS="-C link-arg=-fuse-ld=$(rustc --print sysroot)/lib/rustlib/aarch64-apple-darwin/bin/gcc-ld/ld64.lld"
+maturin develop --release
+```
+
+The linker does not change generated code (thin LTO runs inside rustc).
+Release wheels are built on CI with an older Xcode.
+
 `src/spotsolve_rs/__init__.py` preserves the native import API. The source
 archive includes the Rust workspace, lockfile, Python sources and test
 fixtures. Neither the wheel nor source archive includes `WORKING.md` or local

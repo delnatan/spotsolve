@@ -12,8 +12,7 @@
 //! pixel-integrated Gaussian and its derivatives), [`linalg`] (Cholesky,
 //! banded solves), [`filters`] (`scipy.ndimage`'s filters, matched exactly),
 //! [`grid`] (spatial grouping), [`render`] (model images) and
-//! [`statistics`]. The linker is [`track`], [`lap`]
-//! and [`trackparams`].
+//! [`statistics`]. The linker is [`track`], on the exact assignment in [`lap`].
 //!
 //! `PORTING_NOTES.md` records the implementation practices this port is
 //! built on; its section numbers are cited throughout as `[Pn]`.
@@ -38,4 +37,3 @@ pub mod psf;
 pub mod render;
 pub mod statistics;
 pub mod track;
-pub mod trackparams;

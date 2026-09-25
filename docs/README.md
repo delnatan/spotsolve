@@ -24,7 +24,7 @@ with reusable worker storage. There is no nested thread pool.
 | Aguet baseline | `src/spotsolve/aguet.py` | `aguet.rs` |
 | Shared filters/algebra | Native bindings | `filters.rs`, `linalg.rs` |
 | Tables and results | `src/spotsolve/loctable.py`, `results.py` | — |
-| Tracking | `src/spotsolve/tracking.py` | `track.rs`, `lap.rs`, `trackparams.rs` |
+| Tracking | `src/spotsolve/tracking.py` | `track.rs`, `lap.rs` |
 
 Core files live under `rust/spotsolve-core/src`; bindings are in
 `rust/spotsolve-py/src`. Rust retains current algorithm rules and numerical
@@ -42,14 +42,14 @@ python -m pytest -q
 cargo test --release --workspace --manifest-path rust/Cargo.toml
 ```
 
-Tests cover assignment margins, minimum-length semantics, collinear indexing,
+Tests cover each frame's assignment against enumeration,
 peak output, fit flags, Fisher diagnostics and invalidation of stale
 uncertainties. `layer7_localize.rs` holds the detector to recall, precision
 and position error on simulated fields and to its false-positive rate on
 pure noise.
 
 Fixtures under `tests/fixtures` are frozen. Most came from the retired Python
-reference. `08_track.json` comes from `tracksolve`; `09_aguet.json` pins the
+reference. `09_aguet.json` pins the
 original `spotfitlm` revision and source hashes. Its generator,
 `scripts/make_aguet_fixture.py`, remains available for audit, not routine
 regeneration to accommodate a failing test. Aguet checks cover candidate
@@ -58,8 +58,6 @@ mask context, thread determinism, output conversion and failures.
 
 Benchmark runners:
 
-- `scripts/benchmark_tracking.py`: exclusion-margin sweeps with nearby clutter,
-  detector output, and drift; reports false links, coverage, and selection bias.
 - `scripts/benchmark_detector_speed.py`: real-stack timing and output fingerprints.
 - `scripts/benchmark_aguet.py`: original `spotfitlm` comparison; requires its
   sibling checkout and a C compiler, neither needed at runtime.

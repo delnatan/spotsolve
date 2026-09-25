@@ -2,8 +2,8 @@
 //!
 //! The boundary sits at the FRAME for detection: `detect_localize` and
 //! `detect_localize_stack` (see `spotsolve_core::detect`) run whole frames natively with the
-//! GIL released. For linking it sits at the MOVIE: `track_fit` and
-//! `track_link` (see `track`) take a whole table of localizations.
+//! GIL released. For linking it sits at the MOVIE: `track_link`
+//! (see `track`) takes a whole table of localizations.
 //!
 //! Arrays must be C-contiguous f64; `as_slice()` fails loudly otherwise rather
 //! than silently transposing.
