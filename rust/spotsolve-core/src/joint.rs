@@ -98,6 +98,7 @@ pub const MAD_SCALE: f64 = 1.4826;
 /// + plain_tol 1e-3             2.42    3.64  0.85   0.822 / 0.935
 /// + plain_pad, regroup         2.07    3.04  0.69   0.821 / 0.932
 /// + active_tol 0.05            1.62    2.01  0.63   0.821 / 0.931
+/// + stamp 6 (joint stage only)  1.42 -> 0.66, 1.78 -> 0.94, 0.57 -> 0.28
 /// ```
 ///
 /// GEM and bead counts stayed within 0.4%. Tried and rejected: removal
@@ -127,11 +128,19 @@ pub struct Config {
     /// fraction, since the previous add round, or an emitter was added or
     /// removed inside its box. 0.02 and 0.1 gave the same counts.
     pub active_tol: f64,
+    /// Widths: the group LM's Fisher matrix uses each emitter's Jacobian
+    /// only within this of its centre ([`lmcl::FitOpts::stamp`]); 0 = dense.
+    /// The dense product was 62% of the joint stage's CPU. At 6 the answers
+    /// matched dense on 10 GEM, 4 bead and 12 cell frames (no count change,
+    /// worst p99 position shift 7e-4 px, objective equal) at 2.1x the speed;
+    /// 5 and 4 were 6-12% faster still but moved crowded cells (0.8 px, 6
+    /// nats). Stamping the gradient too saved 8% and was dropped.
+    pub stamp: f64,
 }
 
 impl Default for Config {
     fn default() -> Self {
-        Self { plain_tol: 1e-3, remove_iter: 3, plain_pad: true, regroup_on_change: true, active_tol: 0.05 }
+        Self { plain_tol: 1e-3, remove_iter: 3, plain_pad: true, regroup_on_change: true, active_tol: 0.05, stamp: 6.0 }
     }
 }
 
@@ -143,6 +152,7 @@ impl Config {
             plain_pad: false,
             regroup_on_change: false,
             active_tol: 0.0,
+            stamp: 0.0,
         }
     }
 }
@@ -704,7 +714,7 @@ impl<'a> Joint<'a> {
             &win.sub,
             &Bounds::new(&lo, &hi),
             Some(&win.halo),
-            FitOpts { max_iter, tol_obj, ..Default::default() },
+            FitOpts { max_iter, tol_obj, stamp: self.config.stamp, ..Default::default() },
         );
         let t = ws.fit.theta();
         Fitted {

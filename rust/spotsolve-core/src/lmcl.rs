@@ -163,6 +163,12 @@ pub struct FitOpts {
     /// running to ~2000 electrons, so this is near f64 noise.
     pub tol_grad: f64,
     pub lambda0: f64,
+    /// Widths. When positive, each emitter's Jacobian columns enter the
+    /// Fisher matrix only within this many widths of its centre, and pairs
+    /// whose stamps miss each other contribute nothing. The gradient and
+    /// objective stay exact, so the optimum is unchanged; only the step is
+    /// approximate. 0 (the default) is the dense, parity-pinned product.
+    pub stamp: f64,
 }
 
 impl Default for FitOpts {
@@ -172,6 +178,7 @@ impl Default for FitOpts {
             tol_obj: 1e-8,
             tol_grad: 1e-6,
             lambda0: 1e-2,
+            stamp: 0.0,
         }
     }
 }
@@ -359,7 +366,7 @@ pub fn fit_var_sigma(
             }
             ws.grad[q] = g;
         }
-        fisher(ws, p, n, false);
+        fisher(ws, p, n, false, h, w, opts.stamp);
 
         if projected_score(ws, bounds, p) <= opts.tol_grad.max((2.0 * opts.tol_obj).sqrt()) {
             converged = true;
@@ -451,7 +458,7 @@ pub fn fit_var_sigma(
     // Final Fisher information, from the accepted model. This is the matrix
     // whose parameters are reported, and the only one standard errors may come
     // from.
-    fisher(ws, p, n, true);
+    fisher(ws, p, n, true, h, w, opts.stamp);
     // A small damped step is not a stationarity certificate. Re-evaluate
     // the score at the returned parameters, including on the last allowed
     // iteration or when objective differences ran out of precision.
@@ -509,7 +516,10 @@ fn quadratic_decrease(grad: &[f64], fisher: &[f64], delta: &[f64]) -> f64 {
 
 /// Compute `F = J^T diag(1/m) J`. Mirror the upper triangle so the result
 /// is exactly symmetric despite floating-point rounding.
-fn fisher(ws: &mut FitWorkspace, p: usize, n: usize, clip: bool) {
+fn fisher(ws: &mut FitWorkspace, p: usize, n: usize, clip: bool, h: usize, w: usize, stamp: f64) {
+    if stamp > 0.0 {
+        return fisher_stamped(ws, p, n, clip, h, w, stamp);
+    }
     // `W` multiplies the SECOND factor, matching `J.T @ (W[:,None] * J)`.
     //
     // Branch outside the inner loops. `eval` already floors the model at 1e-9.
@@ -562,6 +572,84 @@ fn fisher(ws: &mut FitWorkspace, p: usize, n: usize, clip: bool) {
             f[q1 * p + q2] = s;
             f[q2 * p + q1] = s;
             q2 += 1;
+        }
+    }
+}
+
+/// Rows `[r0, r1)` and columns `[c0, c1)`.
+#[derive(Clone, Copy)]
+struct Rect {
+    r0: usize,
+    r1: usize,
+    c0: usize,
+    c1: usize,
+}
+
+impl Rect {
+    fn meet(&self, o: &Rect) -> Option<Rect> {
+        let r = Rect { r0: self.r0.max(o.r0), r1: self.r1.min(o.r1), c0: self.c0.max(o.c0), c1: self.c1.min(o.c1) };
+        (r.r0 < r.r1 && r.c0 < r.c1).then_some(r)
+    }
+}
+
+/// Block `b`'s columns: 0 (background) alone, or emitter `b - 1`'s four.
+fn cols(b: usize) -> std::ops::Range<usize> {
+    if b == 0 { 0..1 } else { 1 + 4 * (b - 1)..5 + 4 * (b - 1) }
+}
+
+/// Each column block's stamp at `theta`: the patch for the background,
+/// `stamp` widths around the centre for an emitter.
+fn stamp_rects(t: &[f64], p: usize, h: usize, w: usize, stamp: f64) -> Vec<Rect> {
+    let axis = |c: f64, r: f64, len: usize| {
+        let lo = (c - r).floor().max(0.0) as usize;
+        let hi = ((c + r).ceil() + 1.0).clamp(0.0, len as f64) as usize;
+        (lo.min(hi), hi)
+    };
+    let k = (p - 1) / 4;
+    let mut rects = Vec::with_capacity(k + 1);
+    rects.push(Rect { r0: 0, r1: h, c0: 0, c1: w });
+    for e in 0..k {
+        let r = stamp * t[4 + 4 * e];
+        let (r0, r1) = axis(t[2 + 4 * e], r, h);
+        let (c0, c1) = axis(t[3 + 4 * e], r, w);
+        rects.push(Rect { r0, r1, c0, c1 });
+    }
+    rects
+}
+
+/// `F = J^T diag(1/m) J` with emitter `k`'s columns `1 + 4k..5 + 4k` taken
+/// as zero outside its stamp: `stamp` widths around its current centre.
+/// Column 0 (background) spans the patch. Cost is the sum of stamp overlaps
+/// instead of `p^2 n / 2`.
+fn fisher_stamped(ws: &mut FitWorkspace, p: usize, n: usize, clip: bool, h: usize, w: usize, stamp: f64) {
+    let rects = stamp_rects(ws.theta.as_slice(), p, h, w, stamp);
+    for (b, rc) in rects.iter().enumerate() {
+        for q in cols(b) {
+            for r in rc.r0..rc.r1 {
+                for i in r * w + rc.c0..r * w + rc.c1 {
+                    let m = if clip { ws.m[i].max(1e-9) } else { ws.m[i] };
+                    ws.wj[q * n + i] = ws.j[q * n + i] / m;
+                }
+            }
+        }
+    }
+    let (j, wj, f) = (&ws.j, &ws.wj, &mut ws.f);
+    f[..p * p].fill(0.0);
+    for a in 0..rects.len() {
+        for b in a..rects.len() {
+            let Some(rc) = rects[a].meet(&rects[b]) else { continue };
+            for q1 in cols(a) {
+                for q2 in cols(b).filter(|&q2| q2 >= q1) {
+                    let (c1, c2) = (&j[q1 * n..q1 * n + n], &wj[q2 * n..q2 * n + n]);
+                    let mut s = 0.0;
+                    for r in rc.r0..rc.r1 {
+                        let seg = r * w + rc.c0..r * w + rc.c1;
+                        s += c1[seg.clone()].iter().zip(&c2[seg]).map(|(x, y)| x * y).sum::<f64>();
+                    }
+                    f[q1 * p + q2] = s;
+                    f[q2 * p + q1] = s;
+                }
+            }
         }
     }
 }
