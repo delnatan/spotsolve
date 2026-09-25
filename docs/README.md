@@ -20,7 +20,7 @@ with reusable worker storage. There is no nested thread pool.
 
 | Component | Python | Rust core |
 |---|---|---|
-| Multi-emitter detection | `src/spotsolve/native.py` | `boxsearch.rs`, `joint.rs`, `lmcl.rs` |
+| Multi-emitter detection | `src/spotsolve/native.py` | `detect.rs`, `model.rs` |
 | Aguet baseline | `src/spotsolve/aguet.py` | `aguet.rs` |
 | Shared filters/algebra | Native bindings | `filters.rs`, `linalg.rs` |
 | Tables and results | `src/spotsolve/loctable.py`, `results.py` | — |

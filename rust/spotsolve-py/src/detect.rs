@@ -1,4 +1,4 @@
-//! Bindings for the native box search, `spotsolve_core::boxsearch`.
+//! Bindings for the native detector, `spotsolve_core::detect`.
 //!
 //! Inputs are copied before releasing the GIL. Outputs contain every selected
 //! emitter, diagnostic flags, a background surface and frame metadata.
@@ -10,7 +10,7 @@ use numpy::{
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
-use spotsolve_core::boxsearch as bs;
+use spotsolve_core::detect as bs;
 
 type Arr1 = Py<PyArray1<f64>>;
 type Arr2 = Py<PyArray2<f64>>;
@@ -106,10 +106,7 @@ fn box_localize<'py>(
     check_offset(offset)?;
     let roi = roi_slice(&roi, h, w)?.map(|m| m.to_vec());
     let s = settings(sigma, fp_per_mpx, slack)?;
-    let o = py.detach(|| {
-        let (mut ws, mut d) = (bs::Workspace::new(), Vec::new());
-        bs::localize_raw(&r, h, w, offset, roi.as_deref(), &s, &mut ws, &mut d)
-    });
+    let o = py.detach(|| bs::localize_raw(&r, h, w, offset, roi.as_deref(), &s));
     give(py, o, h, w)
 }
 

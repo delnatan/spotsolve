@@ -1,21 +1,18 @@
 //! `spotsolve` core: emitter detection and localization.
 //!
-//! The detector is [`boxsearch`]: every change of count is proposed by one
-//! statistic, the efficient score for one more reference-width emitter, and
-//! decided by the likelihood ratio of the refit, against a threshold set by
-//! an expected false-positive rate. Background, dispersion, seeds and
-//! uncertainties run there; the seeds start one joint model of the frame,
-//! [`joint`], which fits, removes and adds. The measurements behind the
-//! constants are recorded beside them. The design was prototyped in Python
-//! (`src/spotsolve/scoregate.py`, `scripts/jointfit_prototype.py`); since
-//! 2026-09-24 the Rust is the reference, held by statistical tests on
-//! simulated fields and pure noise (`tests/layer7_localize.rs`).
+//! The detector is [`detect`]: seeds are local maxima of the efficient
+//! score for one more reference-width emitter, above a threshold set by an
+//! expected false-positive rate; each starts as an emitter of one Poisson
+//! model of the frame, [`model`], which fits, removes and adds by likelihood
+//! ratios. `tests/layer7_localize.rs` holds it to recall, precision and
+//! position error on simulated fields and to its false-positive rate on
+//! pure noise.
 //!
 //! The rest are the layers it is built from: [`psf`] (the
-//! pixel-integrated Gaussian and its Jacobian), [`lmcl`] (the bounded Poisson
-//! fitter), [`linalg`] (its Cholesky), [`filters`] (`scipy.ndimage`'s filters,
-//! matched exactly), [`grid`] and [`patches`] (spatial grouping), [`render`]
-//! (images and masks) and [`statistics`]. The linker is [`track`], [`lap`]
+//! pixel-integrated Gaussian and its derivatives), [`linalg`] (Cholesky,
+//! banded solves), [`filters`] (`scipy.ndimage`'s filters, matched exactly),
+//! [`grid`] (spatial grouping), [`render`] (model images) and
+//! [`statistics`]. The linker is [`track`], [`lap`]
 //! and [`trackparams`].
 //!
 //! `PORTING_NOTES.md` records the implementation practices this port is
@@ -30,15 +27,13 @@
 //! machines [P2].
 
 pub mod aguet;
-pub mod boxsearch;
+pub mod detect;
 mod frames;
 pub mod filters;
 pub mod grid;
-pub mod joint;
 pub mod lap;
 pub mod linalg;
-pub mod lmcl;
-pub mod patches;
+pub mod model;
 pub mod psf;
 pub mod render;
 pub mod statistics;

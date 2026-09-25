@@ -72,3 +72,10 @@ The Rust detector became its own reference. Removed, all present in commit
   and `output/hyp7gem_bic_*`), already gone from the API.
 
 `AUDIT_2026-09-22.md` is the code audit of the detector before the score gate.
+
+The same day the detector was rewritten around separable emitter stamps
+(`detect.rs`, `model.rs`) with its own bounded Levenberg-Marquardt. It
+replaced `boxsearch.rs`, `joint.rs`, the general fitter `lmcl.rs` (with its
+Python binding, `layer3_lmcl.rs`, `test_fitter.py` and `02_lmga.json`), the
+dense Jacobian `psf::model_and_jac_var_sigma_ax`, and the unused
+`patches.rs` and `render::emitter_free_mask`; all are in `c870d6e`.

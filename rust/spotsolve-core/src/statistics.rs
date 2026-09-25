@@ -1,11 +1,11 @@
 //! The one distributional constant the detector needs.
 //!
-//! [`crate::boxsearch::dispersion`] reads the pixel variance from the median
+//! [`crate::detect::dispersion`] reads the pixel variance from the median
 //! of a squared fourth difference.
 
 /// The median of chi-squared with one degree of freedom, `Phi^-1(0.75)^2`:
 /// what the local median of a squared unit-variance Gaussian filter output
-/// comes out at. [`crate::boxsearch::dispersion`] divides by it.
+/// comes out at. [`crate::detect::dispersion`] divides by it.
 pub const CHI2_1_MEDIAN: f64 = 0.454_936_423_119_572_8;
 
 #[cfg(test)]

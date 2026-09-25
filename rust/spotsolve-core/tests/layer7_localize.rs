@@ -6,7 +6,7 @@
 //! emitters, and the false-positive rate `fp_per_mpx` promises on noise.
 //! Floors sit a few points under the values measured when they were set.
 
-use spotsolve_core::boxsearch::{self as bs, Settings, Workspace};
+use spotsolve_core::detect::{self as bs, Settings};
 use spotsolve_core::psf;
 
 /// Uniform draws from an LCG (deterministic across platforms).
@@ -78,14 +78,13 @@ fn score(o: &bs::Output, truth: &[[f64; 2]]) -> (f64, f64, f64) {
 fn simulated_fields_are_recovered() {
     let (h, w, sigma) = (128, 128, 1.2);
     let s = Settings { sigma, fp_per_mpx: bs::FP_PER_MPX, slack: bs::SLACK };
-    let mut ws = Workspace::new();
     let mut rng = Rng(2026);
     // (emitters per px, recall, precision, rmse px) floors and ceiling;
     // measured 1.000/1.000/0.116, 0.890/0.991/0.200, 0.868/0.993/0.247.
     for (density, rec_min, prec_min, rmse_max) in [(0.005, 0.97, 0.98, 0.16), (0.015, 0.86, 0.97, 0.25), (0.03, 0.84, 0.97, 0.30)] {
         let n = (density * (h * w) as f64).round() as usize;
         let (d, truth) = field(&mut rng, h, w, n, sigma);
-        let o = bs::localize(&d, h, w, None, &s, &mut ws);
+        let o = bs::localize(&d, h, w, None, &s);
         let (rec, prec, rmse) = score(&o, &truth);
         println!("density {density}: N {} of {n}, recall {rec:.3} precision {prec:.3} rmse {rmse:.3}", o.amp.len());
         assert!(rec >= rec_min && prec >= prec_min && rmse <= rmse_max, "density {density}: {rec} {prec} {rmse}");
@@ -96,12 +95,11 @@ fn simulated_fields_are_recovered() {
 fn pure_noise_meets_the_false_positive_target() {
     let (h, w, sigma, frames) = (256, 256, 1.2, 16);
     let s = Settings { sigma, fp_per_mpx: bs::FP_PER_MPX, slack: bs::SLACK };
-    let mut ws = Workspace::new();
     let mut rng = Rng(7);
     let mut n = 0;
     for _ in 0..frames {
         let d: Vec<f64> = (0..h * w).map(|_| rng.poisson(20.0)).collect();
-        n += bs::localize(&d, h, w, None, &s, &mut ws).amp.len();
+        n += bs::localize(&d, h, w, None, &s).amp.len();
     }
     let expected = bs::FP_PER_MPX * (frames * h * w) as f64 / 1e6;
     println!("noise: {n} false emitters, {expected:.1} expected");

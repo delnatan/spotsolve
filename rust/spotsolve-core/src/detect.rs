@@ -1,24 +1,19 @@
-//! Score-gated spot detection in ADU above the camera offset.
-//!
-//! One statistic proposes every change of count: the efficient score z for
-//! adding one reference-width emitter at a pixel, given everything already
-//! fitted. The likelihood ratio of the refit decides it.
+//! Spot detection in ADU above the camera offset.
 //!
 //! 1. Background: a [`BG_WIN`] median of the frame rounded to whole ADU;
 //!    dispersion `phi`: one scalar from the fourth difference.
-//! 2. Seeds: local maxima of the score against that background with z > u.
-//!    u is solved from `fp_per_mpx`, the expected false emitters per 10^6
-//!    noise pixels ([`threshold`]). Each seed becomes one reference-width
-//!    emitter ([`start`]).
-//! 3. The joint model ([`joint::Joint`]) fits them together with a node
+//! 2. Seeds: local maxima of the efficient score for one reference-width
+//!    emitter against that background, with z > u. u is solved from
+//!    `fp_per_mpx`, the expected false emitters per 10^6 noise pixels
+//!    ([`threshold`]). Each seed becomes one emitter ([`start`]).
+//! 3. The joint model ([`Model`]) fits them together with a node
 //!    background, removes those not worth `u^2 / 2` nats and adds where the
-//!    residual score asks for more.
+//!    residual asks for more.
+//! 4. Uncertainties from each final group's Fisher information.
 
 use crate::filters::{self, Mode};
-use crate::joint;
 use crate::linalg::Chol;
-use crate::lmcl::{self, FitWorkspace};
-use crate::patches;
+use crate::model::{self, Em, Model, Rect};
 use crate::psf;
 use crate::statistics;
 
@@ -44,9 +39,6 @@ pub const K_MAX: usize = 12;
 pub const BG_WIN: usize = 25;
 /// ADU. `W = 1/m` is singular at `m = 0`; this is far below one count.
 pub const BG_FLOOR: f64 = 1e-3;
-/// Fit iteration budget and objective tolerance (nats).
-pub const FIT_MAX_ITER: usize = 100;
-pub const FIT_TOL_OBJ: f64 = 1e-6;
 /// Numerical amplitude floor: `max(A_MIN, A_MIN_REL * A_max)`.
 pub const A_MIN: f64 = 1e-4;
 pub const A_MIN_REL: f64 = 1e-6;
@@ -106,35 +98,6 @@ pub struct Output {
     pub removed: usize,
     pub outer: usize,
     pub kappa: f64,
-}
-
-/// Reusable per-thread storage: one per worker, never shared.
-pub struct Workspace {
-    pub(crate) fit: FitWorkspace,
-    pub(crate) f: psf::Factors,
-    pub(crate) chol: Chol,
-    pub(crate) scratch: Vec<f64>,
-    pub(crate) model: Vec<f64>,
-    pub(crate) jac: Vec<f64>,
-}
-
-impl Workspace {
-    pub fn new() -> Self {
-        Self {
-            fit: FitWorkspace::new(),
-            f: psf::Factors::new(1, 1, 1),
-            chol: Chol::new(1),
-            scratch: Vec::new(),
-            model: Vec::new(),
-            jac: Vec::new(),
-        }
-    }
-}
-
-impl Default for Workspace {
-    fn default() -> Self {
-        Self::new()
-    }
 }
 
 /// Score threshold u giving `fp_per_mpx` expected noise false emitters:
@@ -288,37 +251,6 @@ fn sep(src: &[f64], h: usize, w: usize, ky: &[f64], kx: &[f64], mode: Mode) -> V
     b
 }
 
-/// The same with zeros outside the array, into `out`.
-fn sep_zero(src: &[f64], h: usize, w: usize, k: &[f64], tmp: &mut Vec<f64>, out: &mut [f64]) {
-    let r = (k.len() / 2) as isize;
-    tmp.clear();
-    tmp.resize(h * w, 0.0);
-    for i in 0..h {
-        for j in 0..w {
-            let mut acc = 0.0;
-            for (t, &kv) in k.iter().enumerate() {
-                let y = i as isize + t as isize - r;
-                if y >= 0 && (y as usize) < h {
-                    acc += src[y as usize * w + j] * kv;
-                }
-            }
-            tmp[i * w + j] = acc;
-        }
-    }
-    for i in 0..h {
-        for j in 0..w {
-            let mut acc = 0.0;
-            for (t, &kv) in k.iter().enumerate() {
-                let x = j as isize + t as isize - r;
-                if x >= 0 && (x as usize) < w {
-                    acc += tmp[i * w + x as usize] * kv;
-                }
-            }
-            out[i * w + j] = acc;
-        }
-    }
-}
-
 /// Frame-wide K = 0 score z, blind to a local constant level: correlation
 /// of `r = d - background` with the zero-mean kernel `g - mean(g)`, over
 /// the square root of `var` correlated with its square. Both expand into
@@ -360,10 +292,11 @@ fn edge_truncated(y: f64, x: f64, sigma: f64, h: usize, w: usize) -> bool {
     border < SUPPORT * sigma
 }
 
+/// Whether `value` sits on a bound of `[lo, hi]`, allowing for the fit's
+/// interior margin.
 pub(crate) fn at_bound(value: f64, lo: f64, hi: f64) -> bool {
-    let margin = 2.0 * lmcl::INTERIOR_FRAC * (hi - lo).max(1e-12);
-    value - lo <= margin + BOUND_TOL * (1.0 + lo.abs())
-        || hi - value <= margin + BOUND_TOL * (1.0 + hi.abs())
+    let margin = 2.0 * model::INTERIOR_FRAC * (hi - lo).max(1e-12);
+    value - lo <= margin + BOUND_TOL * (1.0 + lo.abs()) || hi - value <= margin + BOUND_TOL * (1.0 + hi.abs())
 }
 
 /// Context needed around an ROI: an add-round box around any seed
@@ -390,7 +323,7 @@ fn widen(lo: usize, hi: usize, want: usize, n: usize) -> (usize, usize) {
 /// The ROI's bounding box plus [`crop_margin`], at least `3 * BG_WIN` a
 /// side where the frame allows, so the scalar dispersion has pixels to read.
 /// `None` when the ROI selects no pixel.
-fn roi_crop(roi: &[bool], h: usize, w: usize, sigma: f64) -> Option<patches::BBox> {
+fn roi_crop(roi: &[bool], h: usize, w: usize, sigma: f64) -> Option<Rect> {
     let (mut y0, mut y1) = (usize::MAX, 0usize);
     let (mut x0, mut x1) = (usize::MAX, 0usize);
     for r in 0..h {
@@ -410,131 +343,15 @@ fn roi_crop(roi: &[bool], h: usize, w: usize, sigma: f64) -> Option<patches::BBo
     let side = 3 * BG_WIN;
     let (y0, y1) = widen(y0.saturating_sub(m), (y1 + m).min(h), side, h);
     let (x0, x1) = widen(x0.saturating_sub(m), (x1 + m).min(w), side, w);
-    Some(patches::BBox { y0, x0, y1, x1 })
+    Some(Rect { r0: y0, r1: y1, c0: x0, c1: x1 })
 }
 
-fn crop<T: Copy>(v: &[T], w: usize, bb: &patches::BBox) -> Vec<T> {
-    let mut out = Vec::with_capacity(bb.n_pixels());
-    for r in bb.y0..bb.y1 {
-        out.extend_from_slice(&v[r * w + bb.x0..r * w + bb.x1]);
+fn crop<T: Copy>(v: &[T], w: usize, rc: &Rect) -> Vec<T> {
+    let mut out = Vec::with_capacity((rc.r1 - rc.r0) * (rc.c1 - rc.c0));
+    for r in rc.r0..rc.r1 {
+        out.extend_from_slice(&v[r * w + rc.c0..r * w + rc.c1]);
     }
     out
-}
-
-/// An emitter: `[A, y, x, sigma]`.
-pub type Em = [f64; 4];
-
-/// A group's pixels, everything else's light there, and where it may place.
-pub(crate) struct Window {
-    pub(crate) h: usize,
-    pub(crate) w: usize,
-    pub(crate) sub: Vec<f64>,
-    /// Background plus every other emitter's light.
-    pub(crate) halo: Vec<f64>,
-    pub(crate) owned: Vec<bool>,
-    pub(crate) phi: f64,
-}
-
-/// One group fit: data-only I-divergence and parameters in local coordinates.
-#[derive(Clone)]
-pub(crate) struct Fitted {
-    pub(crate) i_div: f64,
-    pub(crate) b: f64,
-    pub(crate) em: Vec<Em>,
-    pub(crate) flags: Vec<u8>,
-}
-
-impl Fitted {
-    fn theta(&self) -> Vec<f64> {
-        let mut t = Vec::with_capacity(4 * self.em.len() + 1);
-        t.push(self.b);
-        for e in &self.em {
-            t.extend_from_slice(e);
-        }
-        t
-    }
-}
-
-/// Model, Jacobian (parameter-major) and Poisson Fisher matrix
-/// `J^T diag(1/m) J` of `state` in `win`, into the workspace.
-pub(crate) fn information(ws: &mut Workspace, win: &Window, state: &Fitted) -> Vec<f64> {
-    let n = win.h * win.w;
-    let theta = state.theta();
-    let p = theta.len();
-    let (ay, ax) = (psf::local_axis(win.h), psf::local_axis(win.w));
-    ws.f.ensure(win.h, win.w, state.em.len().max(1));
-    ws.model.clear();
-    ws.model.resize(n, 0.0);
-    ws.jac.clear();
-    ws.jac.resize(p * n, 0.0);
-    psf::model_and_jac_var_sigma_ax(&theta, &ay, &ax, Some(&win.halo), &mut ws.f, &mut ws.model, &mut ws.jac);
-    let mut f = vec![0.0; p * p];
-    for q in 0..p {
-        for r in 0..=q {
-            let mut acc = 0.0;
-            for i in 0..n {
-                acc += ws.jac[q * n + i] * ws.jac[r * n + i] / ws.model[i].max(BG_FLOOR);
-            }
-            f[q * p + r] = acc;
-            f[r * p + q] = acc;
-        }
-    }
-    f
-}
-
-/// Best owned pixel for one more reference-width emitter:
-/// `(z, local index, one-step amplitude S / I_eff)`.
-///
-/// `S = sum g_p (d - m) / (phi m)`; `I_eff` is `sum g_p^2 / (phi m)` less
-/// its projection onto the current parameters' information, so a fitted
-/// neighbour's light cannot pass for a new emitter.
-pub(crate) fn efficient_score(ws: &mut Workspace, win: &Window, state: &Fitted, k1: &[f64]) -> Option<(f64, usize, f64)> {
-    let n = win.h * win.w;
-    let fp = information(ws, win, state);
-    let p = state.em.len() * 4 + 1;
-    let (h, w) = (win.h, win.w);
-    let wt: Vec<f64> = ws.model.iter().map(|m| 1.0 / (win.phi * m.max(BG_FLOOR))).collect();
-    let k2: Vec<f64> = k1.iter().map(|v| v * v).collect();
-    let mut tmp = Vec::new();
-    let mut s = vec![0.0; n];
-    let resid: Vec<f64> = (0..n).map(|i| (win.sub[i] - ws.model[i]) * wt[i]).collect();
-    sep_zero(&resid, h, w, k1, &mut tmp, &mut s);
-    let mut igg = vec![0.0; n];
-    sep_zero(&wt, h, w, &k2, &mut tmp, &mut igg);
-    // C[q][i] = sum_j g_i(j) J_q(j) wt(j); F = J^T diag(wt) J = Fisher / phi.
-    let mut c = vec![0.0; p * n];
-    let mut col = vec![0.0; n];
-    for q in 0..p {
-        for i in 0..n {
-            col[i] = ws.jac[q * n + i] * wt[i];
-        }
-        sep_zero(&col, h, w, k1, &mut tmp, &mut c[q * n..(q + 1) * n]);
-    }
-    let f: Vec<f64> = fp.iter().map(|v| v / win.phi).collect();
-    ws.chol.ensure(p);
-    let proj = ws.chol.factor(&f, p);
-    let mut best: Option<(f64, usize, f64)> = None;
-    let mut cq = vec![0.0; p];
-    let mut x = vec![0.0; p];
-    for i in 0..n {
-        if !win.owned[i] {
-            continue;
-        }
-        let mut ieff = igg[i];
-        if proj {
-            for q in 0..p {
-                cq[q] = c[q * n + i];
-            }
-            ws.chol.solve(&cq, &mut x);
-            ieff -= cq.iter().zip(&x).map(|(a, b)| a * b).sum::<f64>();
-        }
-        let ieff = ieff.max(1e-12);
-        let z = s[i] / ieff.sqrt();
-        if best.is_none_or(|(bz, _, _)| z > bz) {
-            best = Some((z, i, s[i] / ieff));
-        }
-    }
-    best
 }
 
 /// The joint model's starting point on a frame (or crop) `d`.
@@ -563,28 +380,20 @@ pub fn start(d: &[f64], h: usize, w: usize, roi: Option<&[bool]>, s: &Settings) 
     let ems = find_seeds(&z, h, w, s.sigma, u)
         .into_iter()
         .filter(|&i| roi.is_none_or(|m| m[i]))
-        .map(|i| [(resid[i] / peak).max(1.0), (i / w) as f64, (i % w) as f64, s.sigma])
+        .map(|i| Em { a: (resid[i] / peak).max(1.0), y: (i / w) as f64, x: (i % w) as f64, s: s.sigma })
         .collect();
     Start { ems, background: bmap, dispersion: phi, u }
 }
 
 /// Localize an offset-subtracted frame in ADU: [`start`], then the joint
-/// model ([`joint::Joint`]), then uncertainties from each final group's
-/// Fisher matrix. An ROI limits seeds and additions; everything runs on its
-/// bounding box plus enough context for every filter, window and group.
+/// model, then uncertainties. An ROI limits seeds and additions; everything
+/// runs on its bounding box plus enough context for every filter and group.
 /// Returns global coordinates and a full-frame background map (the fitted
 /// node surface). An empty ROI returns no detections.
-pub fn localize(
-    d: &[f64],
-    h: usize,
-    w: usize,
-    roi: Option<&[bool]>,
-    s: &Settings,
-    ws: &mut Workspace,
-) -> Output {
+pub fn localize(d: &[f64], h: usize, w: usize, roi: Option<&[bool]>, s: &Settings) -> Output {
     assert_eq!(d.len(), h * w);
     let bb = match roi {
-        None => patches::BBox { y0: 0, x0: 0, y1: h, x1: w },
+        None => Rect::frame(h, w),
         Some(m) => match roi_crop(m, h, w, s.sigma) {
             Some(bb) => bb,
             None => {
@@ -598,102 +407,83 @@ pub fn localize(
             }
         },
     };
-    let whole = bb.h() == h && bb.w() == w;
-    let (ch, cw) = (bb.h(), bb.w());
-    let (dsub, rsub) = if whole {
-        (Vec::new(), None)
-    } else {
-        (crop(d, w, &bb), roi.map(|m| crop(m, w, &bb)))
-    };
+    let (ch, cw) = (bb.r1 - bb.r0, bb.c1 - bb.c0);
+    let whole = ch == h && cw == w;
+    let (dsub, rsub) = if whole { (Vec::new(), None) } else { (crop(d, w, &bb), roi.map(|m| crop(m, w, &bb))) };
     let dc: &[f64] = if whole { d } else { &dsub };
     let rc: Option<&[bool]> = if whole { roi } else { rsub.as_deref() };
 
     let first = start(dc, ch, cw, rc, s);
-    let mut jm = joint::Joint::new(dc, ch, cw, &first.ems, &first.background, first.dispersion, first.u, s, rc, ws);
-    jm.run(ws);
-    let mut out = report(&jm, ws, bb.y0, bb.x0, h, w);
+    let mut md = Model::new(dc, ch, cw, &first.ems, &first.background, first.dispersion, first.u, s, rc);
+    md.run();
+    let mut out = report(&md, bb.r0, bb.c0, h, w);
     out.u = first.u;
     out.n_seeds = first.ems.len();
-    out.fits = jm.stats.fits;
-    out.lr_fail = jm.stats.lr_fail;
     // Outside the crop nothing was estimated: the map carries a fill there.
     out.background = if whole {
-        jm.bg
+        md.bg
     } else {
-        let fill = median(&jm.bg);
-        let mut full = vec![fill; h * w];
+        let mut full = vec![median(&md.bg); h * w];
         for r in 0..ch {
-            full[(bb.y0 + r) * w + bb.x0..(bb.y0 + r) * w + bb.x1].copy_from_slice(&jm.bg[r * cw..(r + 1) * cw]);
+            full[(bb.r0 + r) * w + bb.c0..(bb.r0 + r) * w + bb.c1].copy_from_slice(&md.bg[r * cw..(r + 1) * cw]);
         }
         full
     };
     out
 }
 
-/// Output rows for the joint model's emitters, in its order, shifted by
+/// Output rows for the model's emitters, in its order, shifted by
 /// `(oy, ox)` into an `h x w` frame. SEs come from each final group's
-/// Fisher matrix with a free local level: the group fit locks the level
-/// to the nodes, but the nodes are themselves estimated, and a free level
-/// is the conservative stand-in for that.
-fn report(jm: &joint::Joint, ws: &mut Workspace, oy: usize, ox: usize, h: usize, w: usize) -> Output {
-    let n = jm.ems.len();
+/// Fisher information with a free local level: the nodes are estimated
+/// too, and a free level is the conservative stand-in for that.
+fn report(md: &Model, oy: usize, ox: usize, h: usize, w: usize) -> Output {
+    let n = md.ems.len();
     let mut out = Output {
-        dispersion: jm.phi,
-        adds: jm.stats.adds,
-        removed: jm.stats.removed,
-        outer: jm.stats.outer,
-        kappa: jm.stats.kappa,
+        dispersion: md.phi,
+        fits: md.stats.fits,
+        lr_fail: md.stats.lr_fail,
+        adds: md.stats.adds,
+        removed: md.stats.removed,
+        outer: md.stats.outer,
+        kappa: md.stats.kappa,
         se: vec![f64::NAN; 3 * n],
         se_sig: vec![f64::NAN; n],
         fisher_fraction: vec![f64::NAN; 4 * n],
         ..Output::default()
     };
     let mut se4 = vec![f64::NAN; 4 * n];
-    let mut var_q = Vec::new();
-    for g in jm.groups(&jm.model(), ws) {
-        let bb = jm.group_box(&g);
-        let (win, _) = jm.window(&g, &bb, ws);
-        let state = Fitted {
-            i_div: f64::NAN,
-            b: 0.0,
-            em: g.iter().map(|&i| {
-                let e = jm.ems[i];
-                [e[0], e[1] - bb.y0 as f64, e[2] - bb.x0 as f64, e[3]]
-            }).collect(),
-            flags: Vec::new(),
-        };
-        let fisher = information(ws, &win, &state);
+    for (g, fisher) in md.group_information() {
         let p = fisher.len().isqrt();
-        var_q.clear();
-        var_q.resize(p, f64::NAN);
-        ws.chol.ensure(p);
-        if ws.chol.factor(&fisher, p) {
-            ws.chol.inv_diag(&mut var_q, &mut ws.scratch);
+        let mut var = vec![f64::NAN; p];
+        let mut chol = Chol::new(p);
+        if chol.factor(&fisher, p) {
+            chol.inv_diag(&mut var, &mut Vec::new());
         }
         let idx: Vec<u32> = g.iter().map(|&i| i as u32).collect();
-        store_uncertainties(&fisher, &var_q, &idx, &mut se4, &mut out.fisher_fraction);
+        store_uncertainties(&fisher, &var, &idx, &mut se4, &mut out.fisher_fraction);
     }
-    let scale = jm.phi.sqrt();
-    for (i, e) in jm.ems.iter().enumerate() {
-        let (gy, gx) = (e[1] + oy as f64, e[2] + ox as f64);
+    let scale = md.phi.sqrt();
+    for (i, em) in md.ems.iter().enumerate() {
+        let e = em.e;
+        let (gy, gx) = (e.y + oy as f64, e.x + ox as f64);
         out.pos.extend_from_slice(&[gy, gx]);
-        out.amp.push(e[0]);
-        out.sig.push(e[3]);
+        out.amp.push(e.a);
+        out.sig.push(e.s);
         for c in 0..3 {
             out.se[3 * i + c] = se4[4 * i + c] * scale;
         }
         out.se_sig[i] = se4[4 * i + 3] * scale;
-        let mut flag = jm.flags[i];
-        if edge_truncated(gy, gx, e[3], h, w) {
+        let mut flag = em.flags;
+        if edge_truncated(gy, gx, e.s, h, w) {
             flag |= FLAG_EDGE;
         }
         if se4[4 * i..4 * i + 4].iter().any(|v| !v.is_finite() || *v <= 0.0) {
             flag |= FLAG_COVARIANCE;
         }
         out.flags.push(flag);
-        let py = (e[1].round().max(0.0) as usize).min(jm.h - 1);
-        let px = (e[2].round().max(0.0) as usize).min(jm.w - 1);
-        out.fitted_background.push(jm.bg[py * jm.w + px]);
+        let py = (e.y.round().max(0.0) as usize).min(md.h - 1);
+        let px = (e.x.round().max(0.0) as usize).min(md.w - 1);
+        out.fitted_background.push(md.bg[py * md.w + px]);
     }
     out
 }
@@ -728,27 +518,13 @@ fn store_uncertainties(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 /// Localize one raw frame using `d = raw - offset` in ADU.
-pub fn localize_raw(
-    raw: &[f64],
-    h: usize,
-    w: usize,
-    offset: f64,
-    roi: Option<&[bool]>,
-    s: &Settings,
-    ws: &mut Workspace,
-    d: &mut Vec<f64>,
-) -> Output {
-    d.clear();
-    d.extend(raw.iter().map(|&r| r - offset));
-    localize(d, h, w, roi, s, ws)
+pub fn localize_raw(raw: &[f64], h: usize, w: usize, offset: f64, roi: Option<&[bool]>, s: &Settings) -> Output {
+    let d: Vec<f64> = raw.iter().map(|&r| r - offset).collect();
+    localize(&d, h, w, roi, s)
 }
 
-/// Localize every frame of a stack on `n_threads` workers. Frames are
-/// independent, so each worker takes the next undone frame and keeps its own
-/// [`Workspace`]; the output is in frame order whatever the scheduling.
-///
+/// Localize every frame of a stack on `n_threads` workers, in frame order.
 /// `raw` is `n*H*W`; each frame goes through [`localize_raw`].
 #[allow(clippy::too_many_arguments)]
 pub fn localize_stack(
@@ -762,13 +538,7 @@ pub fn localize_stack(
     n_threads: usize,
 ) -> Vec<Output> {
     assert_eq!(raw.len(), n * h * w);
-    crate::frames::map(n, n_threads,
-        || (Workspace::new(), Vec::with_capacity(h * w)),
-        |t, (ws, d)| {
-            let frame = &raw[t * h * w..(t + 1) * h * w];
-            localize_raw(frame, h, w, offset, roi, s, ws, d)
-        },
-    )
+    crate::frames::map(n, n_threads, || (), |t, _| localize_raw(&raw[t * h * w..(t + 1) * h * w], h, w, offset, roi, s))
 }
 
 #[cfg(test)]
@@ -869,14 +639,6 @@ mod tests {
     }
 
     #[test]
-    fn active_bounds_include_the_optimizers_interior_margin() {
-        let bounds = lmcl::Bounds::new(&[100.0], &[1e8]);
-        let theta = lmcl::Interior::new(&[0.0], &bounds);
-        assert!(at_bound(theta.as_slice()[0], 100.0, 1e8));
-        assert!(!at_bound(10000.0, 100.0, 1e8));
-    }
-
-    #[test]
     fn edge_diagnostic_tracks_fitted_support_and_physical_pixel_edges() {
         assert!(edge_truncated(2.0, 20.0, 1.0, 40, 40));
         assert!(!edge_truncated(3.0, 20.0, 1.0, 40, 40));
@@ -897,7 +659,7 @@ mod tests {
             *v += 10.0;
             *v += v.sqrt() * z;
         }
-        let o = localize(&d, h, w, None, &settings(sigma), &mut Workspace::new());
+        let o = localize(&d, h, w, None, &settings(sigma));
         assert_eq!(o.amp.len(), 1, "found {:?} amp {:?}", o.pos, o.amp);
         assert_eq!(o.flags[0], 0);
         assert!(o.se.iter().chain(&o.se_sig).all(|v| v.is_finite() && *v > 0.0));

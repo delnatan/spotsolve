@@ -130,8 +130,8 @@ Measured on the development Apple Silicon host:
 
 | Workload | Serial | Five workers |
 |---|---:|---:|
-| Multi-emitter, first five real 256x256 GEM frames | 12.07 s | 3.12 s |
-| Multi-emitter, all 49 frames of that crop | 111.3 s | 27.4 s |
+| Multi-emitter, first five real 256x256 GEM frames | 8.26 s | 2.15 s |
+| Multi-emitter, all 49 frames of that crop | 74.1 s | 18.8 s |
 | Aguet, 24 simulated sparse 128x128 frames | 26.3 ms | 7.32 ms |
 | Aguet, same frames with a quarter-frame ROI | 8.81 ms | 2.68 ms |
 

@@ -15,9 +15,3 @@ libm = "0.2"
 [dev-dependencies]
 # Test-only: reads tests/fixtures/*.json. Never linked into the extension.
 serde_json = "1"
-
-[[example]]
-name = "lmcl_report"
-
-
-
