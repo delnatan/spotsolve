@@ -18,7 +18,7 @@ from time import perf_counter
 import numpy as np
 import tifffile
 
-from spotsolve import localize_stack
+from spotsolve import FP_PER_MPX, localize_stack
 
 
 def fingerprint(results):
@@ -42,8 +42,7 @@ def main():
     parser.add_argument("image", type=Path)
     parser.add_argument("--sigma", type=float, required=True)
     parser.add_argument("--offset", type=float, default=0.0)
-    parser.add_argument("--selection", choices=["fixed", "bic"], default="bic")
-    parser.add_argument("--count-penalty", type=float, default=2.0)
+    parser.add_argument("--fp-per-mpx", type=float, default=FP_PER_MPX)
     parser.add_argument("--frames", type=int, default=5)
     parser.add_argument("--threads", type=int, default=1)
     parser.add_argument("--repeats", type=int, default=5)
@@ -59,7 +58,7 @@ def main():
         parser.error("expected a grayscale stack with at least --frames frames")
     stack = np.ascontiguousarray(stack[:args.frames])
     settings = dict(sigma=args.sigma, offset=args.offset,
-                    selection=args.selection, count_penalty=args.count_penalty,
+                    fp_per_mpx=args.fp_per_mpx,
                     images=True)
     localize_stack(stack[:1], n_threads=args.threads, **settings)
     elapsed = []

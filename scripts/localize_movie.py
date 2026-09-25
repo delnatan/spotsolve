@@ -1,7 +1,7 @@
 """Localize a movie and save all measurements and diagnostic flags.
 
     python localize_movie.py --frames 0 50 --out hyp7_all
-    python localize_movie.py --selection bic --count-penalty 2 --threads 5
+    python localize_movie.py --fp-per-mpx 4 --threads 5
 """
 
 import argparse
@@ -49,9 +49,7 @@ def main(args):
     t0 = time.time()
     results = spotsolve.localize_stack(stack, sigma=args.sigma,
                                        offset=CAMERA_OFFSET,
-                                       k_max=args.k_max,
-                                       selection=args.selection,
-                                       count_penalty=args.count_penalty,
+                                       fp_per_mpx=args.fp_per_mpx,
                                        n_threads=args.threads)
     dt = (time.time() - t0) / len(stack)
     print(f"  {len(stack)} frames in {dt * len(stack):.2f} s "
@@ -97,9 +95,7 @@ def main(args):
         "sigma_px": args.sigma,
         "camera_offset_adu": CAMERA_OFFSET,
         "pixel_size_um": args.pixel_size, "frame_interval_s": args.interval,
-        "k_max": args.k_max,
-        "selection": args.selection,
-        "count_penalty": args.count_penalty,
+        "fp_per_mpx": args.fp_per_mpx,
         "threads": args.threads,
         "fit_flags": {flag.name: int(flag) for flag in spotsolve.FitFlag},
         "flux_units": "ADU above offset", "position_units": "px (y, x)",
@@ -121,10 +117,8 @@ if __name__ == "__main__":
                     help="um per px, for the derived physical columns")
     ap.add_argument("--interval", type=float, default=DEFAULT_INTERVAL,
                     help="seconds per frame")
-    ap.add_argument("--k-max", type=int, default=spotsolve.K_MAX)
-    ap.add_argument("--selection", choices=("fixed", "bic"), default="fixed")
-    ap.add_argument("--count-penalty", type=float, default=0.0,
-                    help="extra cost per emitter (default: 0)")
+    ap.add_argument("--fp-per-mpx", type=float, default=spotsolve.FP_PER_MPX,
+                    help="expected false emitters per 10^6 noise pixels")
     ap.add_argument("--threads", type=int, default=None,
                     help="parallel frame workers (default: machine's cores)")
     ap.add_argument("--out",

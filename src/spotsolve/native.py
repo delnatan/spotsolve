@@ -85,23 +85,21 @@ def localize(frame, sigma, *, offset=0.0, roi=None, fp_per_mpx=FP_PER_MPX,
     is the in-focus PSF width in pixels; `slack` bounds fitted widths as
     multiples of `sigma`. Boundary solutions are flagged.
 
-    One statistic decides every emitter: the efficient score z for one more
+    One statistic proposes every emitter: the efficient score z for one more
     emitter of width `sigma`, given everything already fitted nearby. Seeds
-    are local maxima of z over the frame; each seed's window adds emitters
-    where z exceeds a threshold u, keeping each only if the refit gains
-    u^2 / 2 dispersion-scaled nats. `fp_per_mpx` sets u: the expected number
-    of false emitters per 10^6 pixels of pure noise (calibrated; see
-    docs/DETECTION.md). Lower it for fewer false positives, raise it for dim
-    data. `info["u"]` reports the threshold used.
-
-    That one pass is then refined as one joint model of the frame: every
-    emitter plus a bilinear background on 16-px nodes (the returned
-    background map), fitted to convergence in small coupled groups. Only
-    then do counts change again: an emitter is removed if dropping it costs
-    less than u^2 / 2 nats, and emitters are added at u * kappa, where
-    `info["kappa"]` >= 1 is the residual score's spread far from any
-    emitter (an empirical null that absorbs PSF and background misfit).
-    `info` also reports `adds`, `removed` and `outer` (rounds).
+    are local maxima of z over the frame above a threshold u; each starts as
+    one emitter of one joint model of the frame: every emitter plus a
+    bilinear background on 16-px nodes (the returned background map), fitted
+    to convergence in small coupled groups. Then counts change: an emitter
+    is removed if dropping it costs less than u^2 / 2 dispersion-scaled
+    nats, and one is added where the residual's z exceeds u * kappa and the
+    refit gains (u * kappa)^2 / 2, until nothing changes. `info["kappa"]`
+    >= 1 is the residual score's spread far from any emitter (an empirical
+    null that absorbs PSF and background misfit; 1 in the first add round).
+    `fp_per_mpx` sets u: the expected number of false emitters per 10^6
+    pixels of pure noise (calibrated on simulated noise). Lower it for fewer
+    false positives, raise it for dim data. `info` reports `u`, `adds`,
+    `removed` and `outer` (rounds).
 
     Every emitter is returned with `FitFlag` diagnostics; there are no
     brightness or width cuts after fitting. Wide fits are kept as fitted,

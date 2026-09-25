@@ -1,209 +1,99 @@
 # Multi-emitter detection
 
-`localize` and `localize_stack` fit overlapping sources jointly. The default
-is `selection="fixed"`; [experimental BIC](COUNT_SELECTION.md) changes count
-selection. The separate [Aguet baseline](AGUET_BASELINE.md) uses independent
-sampled-Gaussian fits. This page describes the multi-emitter model and records
-its earlier validation measurements.
+`localize` and `localize_stack` describe each frame as one Poisson model and
+decide every emitter by a likelihood ratio. The separate
+[Aguet baseline](AGUET_BASELINE.md) fits candidates independently.
 
-## Model and noise
+## Model
 
-Work in camera units: `d = frame - offset`. In 25-pixel windows, estimate
-pixel noise from a local median of a fourth-difference filter, then estimate
-local dispersion `phi` as variance divided by local median intensity. The
-noise maps are evaluated on a 12-pixel grid and interpolated.
-
-Each emitter has flux `A`, position `(y, x)` and width `s`. Integrate its
-Gaussian over each pixel:
+Work in camera units: `d = frame - offset`. Each emitter has flux `A`,
+position `(y, x)` and width `s`; its Gaussian is integrated over each pixel.
+The background `B` is bilinear on a lattice of nodes 16 px apart:
 
 ```text
-m[i,j] = background[i,j] + sum_k A_k * E(i; y_k, s_k) * E(j; x_k, s_k)
+m[i,j] = B[i,j] + sum_k A_k * E(i; y_k, s_k) * E(j; x_k, s_k)
 E(i; c, s) = 0.5 * [erf((i-c+0.5)/(s*sqrt(2))) - erf((i-c-0.5)/(s*sqrt(2)))]
 I(d,m) = sum_pixels [d*log(d/m) - (d-m)]
 ```
 
-The background shape is a 25-pixel local mean away from candidates; its level
-is refitted per region. Fits minimize Poisson I-divergence with bounded
-Levenberg–Marquardt/Fisher scoring. For non-positive offset-subtracted pixels,
-the log term is zero and the objective contribution is `m-d`; its derivative
-with respect to the mean is one. The gradient uses `max(d, 0)` consistently.
-Model means are floored at 1e-9, with zero derivatives below that floor. This
-extension to negative camera values is not a Poisson likelihood for read noise.
-For Poisson photoelectron data, differences
-in `I` are log-likelihood ratios. For camera data, comparisons use `I/phi` as
-a measured-noise approximation. No gain/read-noise calibration is required.
-Fluxes scale with gain; fitted geometry should remain stable, subject to
-roundoff and crowded-model search decisions.
+Camera pixels are not Poisson in ADU. One scalar dispersion `phi` (variance
+per unit mean, from the median squared fourth difference of the frame)
+converts: `I/phi` is the log-likelihood in nats. No gain or read-noise
+calibration is needed; fluxes scale with gain, geometry does not.
 
-## Search and fit diagnostics
+## Algorithm
 
-1. Find LoG maxima exceeding `threshold` (default 2.75) in local noise units.
-2. Group candidates within 2.5 `sigma`, with at most `k_max=12` emitters per
-   box and 3 `sigma` of padding.
-3. In fixed mode, start from background-only and add the strongest eligible
-   residual peak, jointly refitting the box. Require an improvement exceeding
-   `(10 + count_penalty)*phi`. Remove sources whose removal costs less than
-   that amount. Process boxes brightest first, holding neighboring light
-   fixed; repeat against updated neighbors.
-4. Jointly refine nearby groups for up to four passes, revisiting changes
-   above 0.001 pixels in position/width or 0.1% in flux. BIC additionally rechecks removals on the original group
-   pixels and refits the retained sources; see its separate search description.
-5. Report every selected emitter with position, flux, width, uncertainties,
-   fitted background and diagnostic flags. No width or brightness cut follows.
+1. **Seeds.** Against a 25-px median background, compute the efficient score
+   `z` for one emitter of width `sigma` at every pixel. Local maxima with
+   `z > u` become emitters. `u` is solved from `fp_per_mpx`, the expected
+   number of false emitters per 10^6 pixels of pure noise.
+2. **Fit.** Emitters and background are fitted together by block coordinate
+   descent. Emitters are fitted in groups by bounded Levenberg-Marquardt,
+   with every other emitter and the background held fixed; groups join the
+   most strongly coupled pairs (the canonical correlation of their
+   parameters under the Fisher information), at most 12 emitters each. The
+   background nodes are fitted by Poisson IRLS with emitters held fixed.
+3. **Count.** Once the model has converged, each group is tested:
+   - an emitter is removed if removing it costs less than `u^2/2` nats;
+   - an emitter is added at the pixel of highest residual score if that
+     score exceeds `u * kappa` and the refit gains `(u * kappa)^2 / 2` nats.
 
-Widths fit within `slack=(0.7, 2.2)` times the supplied `sigma`. These are
-optimization bounds, not an acceptance interval. `AT_BOUND` identifies a fit
-limited by a parameter bound (including the shared background); widen `slack`
-and refit when appropriate. Changing the allowed model can change counts too.
+   `kappa >= 1` is the spread of the residual score far from every emitter,
+   an empirical null. It is 1 where the model describes the data, and grows
+   where it does not (PSF wings, haze), raising the bar for additions there.
+   The model is re-converged and tested again until nothing changes.
 
-`EDGE` marks three fitted sigmas crossing the physical image boundary,
-independently of width relative to the reference sigma. ROI boundaries do not
-set this flag. Gaussian tails have infinite support; the flag describes this
-finite support convention and does not prove localization bias.
+Widths are fitted within `slack * sigma` (default 0.7-2.2). These are
+optimization bounds, not an acceptance interval; a fit at a bound is flagged.
 
-Convergence, stalling, unavailable covariance and changing neighbor context
-are also reported. See [flag definitions](LOCALIZATION_QUALITY.md). Broad or
-bright objects retain their quantities for downstream analysis.
+## Uncertainties
 
-## Curvature and uncertainty
+Standard errors come from the undamped expected Fisher information
+`F = J.T @ diag(1/m) @ J` of each final group, with a free local level,
+scaled by `phi`. If `F` cannot be factored, the errors are NaN.
 
-The fixed 10-nat cost is an empirical complexity penalty. A Fisher
-log-determinant alone is not Bayesian evidence: its value depends on parameter
-units, and a Bayes factor also requires specified, normalized priors. When
-two mixture components coincide, the model is non-identifiable and the usual
-isolated quadratic-mode Laplace approximation fails. This is a general
-[singular-model limitation](https://www.jmlr.org/papers/v14/watanabe13a.html),
-also relevant to interpreting the experimental BIC score.
-
-The optimizer factors a **damped** Fisher matrix to choose steps. Uncertainties
-use a separate factorization of the **undamped** expected information
-`F = J.T @ diag(1/m) @ J` at the returned parameters, including fitted
-background. Reported variances are multiplied by local dispersion. If that
-factorization fails, uncertainties become NaN; they cannot be carried over
-from a previous fit. No diagonal jitter hides this failure.
-
-`result.info['fisher_fraction']` has shape `(N, 4)`, aligned with detections,
-in `(flux, y, x, sigma)` order. For each parameter `q` it reports
+`result.info['fisher_fraction']` has shape `(N, 4)` in `(flux, y, x, sigma)`
+order:
 
 ```text
-fraction[q] = 1 / (F[q,q] * inverse(F)[q,q])
-           = conditional variance / marginal variance
+fraction[q] = 1 / (F[q,q] * inverse(F)[q,q]) = conditional / marginal variance
 ```
 
-This is reciprocal variance inflation in the local quadratic model: 1 means
-no coupling to other fitted parameters; values near zero mean strong
-confounding. It is invariant to diagonal changes of parameter units,
-parameter ordering and a common dispersion scale. It reuses the inverse
-diagonal already needed for SEs. Entries are NaN where covariance is
-unavailable, including when native refinement is disabled. The fractions
-do not change selection or reporting. Read it alongside SEs: a weak isolated source can be imprecise
-without strong confounding, and a bright crowded source can have both small
-SEs and a small fraction. Frozen neighbors and estimated background shape
-are treated as known, so this is not a full uncertainty budget.
-
-The 2026-09-17 working note supports retaining expected Fisher information
-and the fixed penalty, but its scratch simulations were not supplied and its
-numerical comparisons are not reproduced here. Several qualifications matter:
-
-- Raw condition numbers and Cholesky pivots depend on units; a large value
-  alone does not establish failure of Laplace. Coincident components provide
-  the structural reason. Adding a flat prior's normalization does not cure a
-  singular local Gaussian approximation, and a flat prior has no interior
-  curvature. A fixed penalty is not generally equivalent to a Bayes factor.
-- Expected Fisher information is positive semidefinite, not guaranteed
-  invertible. The observed Hessian also must be positive semidefinite at an
-  exact interior minimum; an indefinite result calls for checking convergence,
-  bounds and numerical differentiation. Neither curvature gives reliable
-  asymptotic coverage automatically at low signal or active bounds.
-- Here `I` is half the conventional Poisson deviance; count comparisons use
-  changes in `I/phi`. Comparisons of noisy SE estimates do not by themselves
-  establish which covariance gives better tracking decisions.
-
-For a minimal filtering workflow using existing outputs, see the
-[localization-quality guide](LOCALIZATION_QUALITY.md).
+1 means no coupling to other fitted parameters; values near zero mean strong
+confounding. It is invariant to parameter units and order. Neighbours
+outside the group and the background nodes are treated as known, so this is
+not a full uncertainty budget.
 
 ## ROI and reference width
 
-A boolean ROI restricts the search; sources may fit outside it. Process its
-bounding box plus context and estimate the reference background level from
-masked pixels. Under a cell mask, that avoids using the dark field outside
-the cell as its background. Separate tile calls can duplicate sources at
-seams and omit neighboring light; use one mask for the requested area.
+A boolean ROI limits where emitters are seeded and added; fitted positions
+may lie outside it. The frame is cropped to the ROI's bounding box plus the
+context the filters and fits need. Use one mask for the requested area, not
+separate tile calls, which would duplicate sources at seams.
 
-Choose an approximate `sigma` from a histogram of fitted widths in one or a
-few representative frames. Aguet is a cheap starting point for isolated
-spots; use an isolated ROI or joint fits when overlap is substantial. Each
-emitter's width is fitted within `slack * sigma`, so the reference need not
-match every spot. See the [width inspection example](../README.md#choose-a-detection-width).
+Choose `sigma` from a histogram of fitted widths in a few representative
+frames; see the [width inspection example](../README.md#choose-a-detection-width).
 
-## Earlier measurements
+## Validation
 
-These measurements describe the default detector and the versions recorded
-in [design history](archive/DETECTOR_DESIGN_NOTES.md). They are not new Aguet
-or BIC evaluations. Use their own [BIC](COUNT_SELECTION.md) and
-[Aguet](AGUET_BASELINE.md) benchmarks for those modes.
+`rust/spotsolve-core/tests/layer7_localize.rs` holds the detector to recall,
+precision and position error on simulated fields (flux 150-3000 ADU on a
+background of 20, width `sigma` +-20%) and to its false-positive rate on pure
+Poisson noise. Measured when the tests were set (sigma 1.2, 128x128):
 
-### Proposal threshold
+| Emitters / px | Recall | Precision | RMS error, px |
+|---:|---:|---:|---:|
+| 0.005 | 1.000 | 1.000 | 0.12 |
+| 0.015 | 0.890 | 0.991 | 0.20 |
+| 0.03 | 0.868 | 0.993 | 0.25 |
 
-Real GEM frames with known-brightness simulated particles added; unmatched
-spots counted on two matched simulations. Recall entries correspond to
-D = 0 / 0.43 / 2 px² per frame. Counts/recall use 128x128 images; serial
-timing uses 256x256 frames.
+On noise the false-positive rate is within 3% of `fp_per_mpx` for `sigma`
+1.0-1.45 at the default of 16; wide PSFs at strict targets overshoot (1.5x
+at `sigma` 1.8 and `fp_per_mpx` 4).
 
-| Threshold | Unmatched/frame | Recall, 150 e− | Recall, 300 e− | Spots/frame | ms/frame |
-|---|---:|---|---|---:|---:|
-| 2.5 | 24.9 | .51 / .41 / .33 | .78 / .73 / .60 | 241 | 327 |
-| 2.75 | 22.5 | .50 / .39 / .32 | .77 / .73 / .59 | 232 | 280 |
-| 3.0 | 20.0 | .50 / .36 / .31 | .77 / .71 / .59 | 224 | 237 |
+## Limits
 
-The default 2.75 replaced separate 3.0 frame / 2.5 residual cuts with recall
-within about one percentage point. Raising it toward 3.0 reduced unmatched
-spots and runtime in this dataset. Relative to the preceding detector,
-default unmatched counts rose 13 → 22.5, while recall rose .39/.27/.24 →
-.50/.39/.32 at 150 e− and .67/.63/.53 → .77/.73/.59 at 300 e−, at about
-1.5× runtime. These tradeoffs are why count selection is evaluated separately.
-
-### Width, masks and camera noise
-
-- Variable-width/hazy simulations: fixed widths gave 8–33 false spots per
-  64x64 frame versus 0.7–7 with fitted widths. On glycerol/GEM data, fixing
-  width put 136–211 detections/frame inside objects otherwise labeled too wide.
-  Fixed width helped only when sources shared one width in those tests.
-- A 32x32 ROI on a 512x512 image reduced runtime from 25.4 to 3.4 ms.
-- At three simulated densities, true-camera-calibration recall/precision was
-  .850/.981, .682/.917, .511/.842; estimated-noise results were .855/.963,
-  .683/.913, .510/.839 (128x128, gain 2.4, read noise 1.6 e−).
-- Empty frames with background 1–20 e− and read noise 1.6–2.5 e− produced
-  0–0.7 spots/frame with estimated noise, versus up to 13 using plain Poisson.
-- Measured dispersion was 2.42–2.61 on four GEM crops (calibration implied
-  2.55–2.85), and 2.41 on glycerol beads (2.23 expected). Tiny crowded 39x39
-  bead images were less reliable: 1.90 versus 2.15.
-- Rescaling a frame rescaled its fluxes; crowded decompositions differed by
-  up to two detections through numerical sensitivity.
-
-### Limits
-
-Haze and defocused structure beyond the smooth background remain model
-mismatch. On glycerol beads, residuals had a positive ring 2–4 pixels from
-sources, about 0.3 noise SD. Sources closer than roughly one `sigma` can be
-reported as one brighter source.
-
-Shifting the image changes the noise-grid sampling and crowded search. On
-ten crowded 256x256 GEM frames, a 12-pixel shift changed counts by 2.4% and
-recovered 84% of interior detections within 0.5 pixels; a five-pixel shift
-changed counts by 2.1% and recovered 76%. Most sensitivity came from the
-crowded search, but grid alignment also matters.
-
-### Original native port
-
-At the 2026-09-11 port validation:
-
-| Frame | Python reference | Native, one thread | Native stack, ten threads |
-|---|---:|---:|---:|
-| Glycerol f0, 256x256, 489 emitters | 815 ms | 107 ms | 24 ms/frame |
-| GEM f0, 256x256, 440 emitters | 1042 ms | 104 ms | 24 ms/frame |
-
-Recall, precision and invented counts matched on ten flat/hazy 64x64
-simulation cases; counts and search-fit counts matched on both real frames.
-About 87% of native time was in fitting. These are historical port timings,
-not the recent BIC or Aguet benchmarks.
+The PSF model is a Gaussian. Real PSFs have wings and defocused structure the
+model cannot absorb; the residual then carries structure, `kappa` rises, and
+dim sources near bright ones are harder to add. Sources closer than about one
+`sigma` can be reported as one brighter source.

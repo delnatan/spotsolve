@@ -1,60 +1,50 @@
 //! Score-gated spot detection in ADU above the camera offset.
 //!
-//! One statistic decides every change of count: the efficient score z for
+//! One statistic proposes every change of count: the efficient score z for
 //! adding one reference-width emitter at a pixel, given everything already
-//! fitted in the window (level and emitters, all parameters free).
+//! fitted. The likelihood ratio of the refit decides it.
 //!
 //! 1. Background: a [`BG_WIN`] median of the frame rounded to whole ADU;
 //!    dispersion `phi`: one scalar from the fourth difference.
-//! 2. Seeds: local maxima of the K = 0 score (a zero-mean matched filter)
-//!    with z > u, strongest first. u is solved from `fp_per_mpx`, the
-//!    expected false emitters per 10^6 noise pixels ([`threshold`]).
-//! 3. Each seed owns a window, visited strongest first; emitters of earlier
-//!    windows are fixed light (halo). A window adds an emitter at the owned
-//!    pixel of highest z, only if z > u, and keeps it only if the refit
-//!    gains u^2 / 2 dispersion-scaled nats. Widths float within `slack`.
-//!
-//! The design and every constant were measured on the Python prototype
-//! (commit 7b7dfe7, `src/spotsolve/scoregate.py`); the numbers are in
-//! `output/scoregate/*.json` and `tests/fixtures/10_scoregate.json` pins its
-//! outputs. The LoG/10-nat search this replaced is in git history.
+//! 2. Seeds: local maxima of the score against that background with z > u.
+//!    u is solved from `fp_per_mpx`, the expected false emitters per 10^6
+//!    noise pixels ([`threshold`]). Each seed becomes one reference-width
+//!    emitter ([`start`]).
+//! 3. The joint model ([`joint::Joint`]) fits them together with a node
+//!    background, removes those not worth `u^2 / 2` nats and adds where the
+//!    residual score asks for more.
 
 use crate::filters::{self, Mode};
 use crate::joint;
 use crate::linalg::Chol;
-use crate::lmcl::{self, Bounds, FitOpts, FitWorkspace};
+use crate::lmcl::{self, FitWorkspace};
 use crate::patches;
 use crate::psf;
 use crate::statistics;
 
 /// Optimization bounds for fitted widths, as multiples of `sigma`.
 pub const SLACK: (f64, f64) = (0.70, 2.2);
-/// Default count knob: expected false emitters per 10^6 pixels of pure
-/// noise. At sigma 1.45 this is u = 4.0, which had the best isolated recall
-/// at matched false positives (output/scoregate/u_sweep.json).
+/// Default count knob: expected false emitters per 10^6 pixels of pure noise.
 pub const FP_PER_MPX: f64 = 16.0;
-/// Per Mpx: false emitters = RFT_C * u * exp(-u^2/2) / sigma^2, the
-/// Euler-characteristic density of a Gaussian-smoothed field (Lambda =
-/// 1 / (2 sigma^2)). 0.80 is measured: accepted noise emitters over 4 Mpx at
-/// sigma 1.45, u 4.0-4.47, fell 0.80x below the continuous formula.
-pub const RFT_C: f64 = 0.80 * 1e6 / (2.0 * 15.749_609_945_722_419);
-/// sigma. A window places emitters within this of its seed, on pixels no
-/// nearer another seed. Dense-field recall was 0.729 at 4, 0.733 at 6.
+/// Noise false emitters per Mpx = RFT_C * u * exp(-u^2/2) / sigma. The seeds
+/// follow the Euler-characteristic density of the smoothed field (1/sigma^2);
+/// the fit then lets each one choose position and width, and what survives
+/// falls as 1/sigma. The constant is measured on Poisson noise; the rate
+/// holds within 3% for sigma 1.0-1.45 at the default target and overshoots
+/// for wide PSFs at strict targets.
+pub const RFT_C: f64 = 0.98 * 1e6 / (2.0 * 15.749_609_945_722_419);
+/// sigma. An add round places emitters within this of a group member.
 pub const OWN: f64 = 4.0;
 /// sigma. Context beyond the placement radius, so an emitter placed at its
-/// edge keeps its support; also the edge-diagnostic distance. With the
-/// window edge at OWN instead, dense-field precision was 0.907 vs 0.955.
+/// edge keeps its support; also the edge-diagnostic distance.
 pub const SUPPORT: f64 = 3.0;
-/// Emitter widths. Light of earlier windows' emitters within this of a
-/// window enters its halo; 5 widths gave identical results.
-pub const REACH: f64 = 3.0;
-/// Safety cap on emitters per window; a cap of 4 changed GEM counts by 2%.
+/// Safety cap on additions per group and add round.
 pub const K_MAX: usize = 12;
 /// px. Side of the median background window.
 pub const BG_WIN: usize = 25;
 /// ADU. `W = 1/m` is singular at `m = 0`; this is far below one count.
 pub const BG_FLOOR: f64 = 1e-3;
-/// Search-fit iteration budget and objective tolerance (nats).
+/// Fit iteration budget and objective tolerance (nats).
 pub const FIT_MAX_ITER: usize = 100;
 pub const FIT_TOL_OBJ: f64 = 1e-6;
 /// Numerical amplitude floor: `max(A_MIN, A_MIN_REL * A_max)`.
@@ -107,7 +97,6 @@ pub struct Output {
     /// The score threshold used.
     pub u: f64,
     pub n_seeds: usize,
-    /// All fits, one-pass and joint.
     pub fits: usize,
     /// Additions that passed the score test but failed the LR confirmation.
     pub lr_fail: usize,
@@ -149,10 +138,10 @@ impl Default for Workspace {
 }
 
 /// Score threshold u giving `fp_per_mpx` expected noise false emitters:
-/// solves `RFT_C * u * exp(-u^2/2) / sigma^2 = fp_per_mpx` on `u >= 1`,
+/// solves `RFT_C * u * exp(-u^2/2) / sigma = fp_per_mpx` on `u >= 1`,
 /// where the left side decreases, by bisection.
 pub fn threshold(sigma: f64, fp_per_mpx: f64) -> f64 {
-    let rate = |u: f64| RFT_C * u * (-0.5 * u * u).exp() / (sigma * sigma);
+    let rate = |u: f64| RFT_C * u * (-0.5 * u * u).exp() / sigma;
     let (mut lo, mut hi) = (1.0, 40.0);
     if rate(lo) <= fp_per_mpx {
         return lo;
@@ -377,16 +366,13 @@ pub(crate) fn at_bound(value: f64, lo: f64, hi: f64) -> bool {
         || hi - value <= margin + BOUND_TOL * (1.0 + hi.abs())
 }
 
-/// Window half-side, px.
-fn half_side(sigma: f64) -> usize {
-    ((OWN + SUPPORT) * sigma).ceil() as usize
-}
-
-/// Context needed around an ROI: a window around any seed, plus the median
-/// window and score kernel that seed's background and z read.
+/// Context needed around an ROI: an add-round box around any seed
+/// (`(OWN + SUPPORT) sigma`), plus the median window and score kernel that
+/// seed's background and z read.
 fn crop_margin(sigma: f64) -> usize {
     let kernel = (4.0 * sigma).ceil() as usize + sigma.ceil() as usize;
-    half_side(sigma).max(kernel) + 1 + BG_WIN / 2 + 2
+    let pad = ((OWN + SUPPORT) * sigma).ceil() as usize;
+    pad.max(kernel) + 1 + BG_WIN / 2 + 2
 }
 
 /// Widen `[lo, hi)` to at least `want` pixels without leaving `[0, n)`, and
@@ -438,56 +424,18 @@ fn crop<T: Copy>(v: &[T], w: usize, bb: &patches::BBox) -> Vec<T> {
 /// An emitter: `[A, y, x, sigma]`.
 pub type Em = [f64; 4];
 
-/// A window's pixels, its fixed light, and where it may place.
+/// A group's pixels, everything else's light there, and where it may place.
 pub(crate) struct Window {
-    pub(crate) y0: usize,
-    pub(crate) x0: usize,
     pub(crate) h: usize,
     pub(crate) w: usize,
     pub(crate) sub: Vec<f64>,
-    /// Earlier windows' emitters plus the background's shape.
+    /// Background plus every other emitter's light.
     pub(crate) halo: Vec<f64>,
-    /// Background median here; where the free level starts.
-    pub(crate) level: f64,
-    /// Background minus `level`.
-    pub(crate) shape: Vec<f64>,
     pub(crate) owned: Vec<bool>,
     pub(crate) phi: f64,
 }
 
-impl Window {
-    /// Pixels of `bb` in an `fw`-wide frame `d` and background `bmap`.
-    fn new(d: &[f64], fw: usize, bmap: &[f64], bb: &patches::BBox, owned: Vec<bool>, phi: f64) -> Self {
-        let (h, w) = (bb.h(), bb.w());
-        let sub = crop(d, fw, bb);
-        let bg = crop(bmap, fw, bb);
-        let level = median(&bg);
-        let shape: Vec<f64> = bg.iter().map(|v| v - level).collect();
-        Self { y0: bb.y0, x0: bb.x0, h, w, sub, halo: shape.clone(), level, shape, owned, phi }
-    }
-
-    /// `halo <- (emitters, rendered here) + shape`. `ems` are global.
-    fn set_halo(&mut self, ems: &[Em], f: &mut psf::Factors) {
-        let n = self.h * self.w;
-        self.halo.clear();
-        self.halo.resize(n, 0.0);
-        if !ems.is_empty() {
-            let mut theta = Vec::with_capacity(4 * ems.len() + 1);
-            theta.push(0.0);
-            for e in ems {
-                theta.extend_from_slice(&[e[0], e[1] - self.y0 as f64, e[2] - self.x0 as f64, e[3]]);
-            }
-            let (ay, ax) = (psf::local_axis(self.h), psf::local_axis(self.w));
-            f.ensure(self.h, self.w, ems.len());
-            psf::model_var_sigma_ax(&theta, &ay, &ax, None, f, &mut self.halo);
-        }
-        for (v, s) in self.halo.iter_mut().zip(&self.shape) {
-            *v += s;
-        }
-    }
-}
-
-/// One window fit: data-only I-divergence and parameters in local coordinates.
+/// One group fit: data-only I-divergence and parameters in local coordinates.
 #[derive(Clone)]
 pub(crate) struct Fitted {
     pub(crate) i_div: f64,
@@ -504,75 +452,6 @@ impl Fitted {
             t.extend_from_slice(e);
         }
         t
-    }
-}
-
-/// Bounded free-width ML fit, with a strictly interior starting point.
-/// Scale the peak-derived flux bound by `slack.1^2` to allow broad sources.
-/// Positions remain inside the window.
-fn fit_window(
-    ws: &mut Workspace,
-    win: &Window,
-    b: f64,
-    em: &[Em],
-    s: &Settings,
-    max_iter: usize,
-    tol_obj: f64,
-) -> Fitted {
-    let k = em.len();
-    let smax = win.sub.iter().fold(f64::NEG_INFINITY, |a, &v| a.max(v)).max(1.0);
-    let b_max = (4.0 * smax).max(10.0);
-    let a_max = 8.0 * smax / psf::peak_factor(s.sigma) * s.slack.1 * s.slack.1;
-    let a_min = A_MIN.max(A_MIN_REL * a_max);
-    let (s_lo, s_hi) = (s.slack.0 * s.sigma, s.slack.1 * s.sigma);
-    let mut lo = Vec::with_capacity(4 * k + 1);
-    let mut hi = Vec::with_capacity(4 * k + 1);
-    lo.push(0.0);
-    hi.push(b_max);
-    for _ in 0..k {
-        lo.extend_from_slice(&[a_min, -0.5, -0.5, s_lo]);
-        hi.extend_from_slice(&[a_max, win.h as f64 - 0.5, win.w as f64 - 0.5, s_hi]);
-    }
-    let mut th0 = Vec::with_capacity(4 * k + 1);
-    th0.push(b);
-    for e in em {
-        th0.extend_from_slice(&[e[0], e[1], e[2], e[3].clamp(s_lo, s_hi)]);
-    }
-    for q in 0..th0.len() {
-        th0[q] = th0[q].clamp(lo[q] + 1e-9, hi[q] - 1e-9);
-    }
-    let bounds = Bounds::new(&lo, &hi);
-    let info = lmcl::fit_var_sigma(
-        &mut ws.fit,
-        &th0,
-        win.h,
-        win.w,
-        &win.sub,
-        &bounds,
-        Some(&win.halo),
-        FitOpts {
-            max_iter,
-            tol_obj,
-            ..Default::default()
-        },
-    );
-    let t = ws.fit.theta();
-    Fitted {
-        i_div: info.i_div,
-        b: t[0],
-        flags: (0..k).map(|j| {
-            let mut flag = 0;
-            if !info.converged { flag |= FLAG_NOT_CONVERGED; }
-            if info.stalled { flag |= FLAG_STALLED; }
-            if at_bound(t[0], lo[0], hi[0])
-                || (1 + 4*j..5 + 4*j).any(|q| at_bound(t[q], lo[q], hi[q])) {
-                flag |= FLAG_BOUND;
-            }
-            flag
-        }).collect(),
-        em: (0..k)
-            .map(|j| [t[1 + 4 * j], t[2 + 4 * j], t[3 + 4 * j], t[4 + 4 * j]])
-            .collect(),
     }
 }
 
@@ -607,9 +486,8 @@ pub(crate) fn information(ws: &mut Workspace, win: &Window, state: &Fitted) -> V
 /// `(z, local index, one-step amplitude S / I_eff)`.
 ///
 /// `S = sum g_p (d - m) / (phi m)`; `I_eff` is `sum g_p^2 / (phi m)` less
-/// its projection onto the current parameters' information. Without that
-/// projection a fitted neighbour's light leaks into the test: a level-only
-/// score resolved 1% of 2-sigma pairs against 64%.
+/// its projection onto the current parameters' information, so a fitted
+/// neighbour's light cannot pass for a new emitter.
 pub(crate) fn efficient_score(ws: &mut Workspace, win: &Window, state: &Fitted, k1: &[f64]) -> Option<(f64, usize, f64)> {
     let n = win.h * win.w;
     let fp = information(ws, win, state);
@@ -659,48 +537,21 @@ pub(crate) fn efficient_score(ws: &mut Workspace, win: &Window, state: &Fitted, 
     best
 }
 
-/// Score-gated additions from K = 0, each confirmed by the LR.
-/// Returns the accepted state, the fits spent and LR failures.
-#[allow(clippy::neg_cmp_op_on_partial_ord)]
-fn search(ws: &mut Workspace, win: &Window, s: &Settings, u: f64, k1: &[f64]) -> (Fitted, usize, usize) {
-    let gain = 0.5 * u * u * win.phi;
-    let mut state = fit_window(ws, win, win.level, &[], s, FIT_MAX_ITER, FIT_TOL_OBJ);
-    let (mut fits, mut lr_fail) = (1, 0);
-    while state.em.len() < K_MAX {
-        let Some((z, i, a)) = efficient_score(ws, win, &state, k1) else { break };
-        if !(z > u) {
-            break;
-        }
-        let mut em = state.em.clone();
-        em.push([a, (i / win.w) as f64, (i % win.w) as f64, s.sigma]);
-        let trial = fit_window(ws, win, state.b, &em, s, FIT_MAX_ITER, FIT_TOL_OBJ);
-        fits += 1;
-        if !(state.i_div - trial.i_div > gain) {
-            lr_fail += 1;
-            break;
-        }
-        state = trial;
-    }
-    (state, fits, lr_fail)
-}
-
-/// The one-pass search on a frame (or crop) `d`: its emitters in `d`'s
-/// coordinates, the median background it used, and its counters.
+/// The joint model's starting point on a frame (or crop) `d`.
 #[derive(Clone, Debug, Default)]
-pub struct OnePass {
+pub struct Start {
+    /// One reference-width emitter per seed, flux from the seed pixel's
+    /// excess over the background.
     pub ems: Vec<Em>,
     pub background: Vec<f64>,
     pub dispersion: f64,
     pub u: f64,
-    pub n_seeds: usize,
-    pub fits: usize,
-    pub lr_fail: usize,
 }
 
-/// Seeds, then each seed's window decided once, strongest first, against
-/// the emitters of earlier windows as fixed light. `roi` (same shape as `d`)
-/// limits seeds and placements. This is the joint model's starting point.
-pub fn one_pass(d: &[f64], h: usize, w: usize, roi: Option<&[bool]>, s: &Settings, ws: &mut Workspace) -> OnePass {
+/// Seeds as emitters: local maxima of the score against the median
+/// background with z > u, strongest first. `roi` (same shape as `d`) limits
+/// seeds. Seeds are proposals; the joint model's removal test decides them.
+pub fn start(d: &[f64], h: usize, w: usize, roi: Option<&[bool]>, s: &Settings) -> Start {
     assert_eq!(d.len(), h * w);
     let u = threshold(s.sigma, s.fp_per_mpx);
     let bmap = median_background(d, h, w);
@@ -708,58 +559,16 @@ pub fn one_pass(d: &[f64], h: usize, w: usize, roi: Option<&[bool]>, s: &Setting
     let resid: Vec<f64> = d.iter().zip(&bmap).map(|(a, b)| a - b).collect();
     let var: Vec<f64> = bmap.iter().map(|b| phi * b.max(BG_FLOOR)).collect();
     let z = detection_map(&resid, &var, h, w, s.sigma);
-    let seeds: Vec<(usize, usize)> = find_seeds(&z, h, w, s.sigma, u)
+    let peak = psf::peak_factor(s.sigma);
+    let ems = find_seeds(&z, h, w, s.sigma, u)
         .into_iter()
-        .map(|i| (i / w, i % w))
-        .filter(|&(y, x)| roi.is_none_or(|m| m[y * w + x]))
+        .filter(|&i| roi.is_none_or(|m| m[i]))
+        .map(|i| [(resid[i] / peak).max(1.0), (i / w) as f64, (i % w) as f64, s.sigma])
         .collect();
-
-    let pad = half_side(s.sigma);
-    let own = OWN * s.sigma;
-    let reach = REACH * s.slack.1 * s.sigma;
-    let k1 = psf_kernel1d(s.sigma);
-    let mut out = OnePass { dispersion: phi, u, n_seeds: seeds.len(), ..OnePass::default() };
-    let mut ems: Vec<Em> = Vec::new();
-    for (i, &(sy, sx)) in seeds.iter().enumerate() {
-        let wb = patches::BBox {
-            y0: sy.saturating_sub(pad),
-            x0: sx.saturating_sub(pad),
-            y1: (sy + pad + 1).min(h),
-            x1: (sx + pad + 1).min(w),
-        };
-        let near: Vec<(f64, f64)> = seeds
-            .iter()
-            .enumerate()
-            .filter(|&(j, &(y, x))| j != i && y.abs_diff(sy) <= 2 * pad && x.abs_diff(sx) <= 2 * pad)
-            .map(|(_, &(y, x))| (y as f64, x as f64))
-            .collect();
-        let mut owned = Vec::with_capacity(wb.n_pixels());
-        for py in wb.y0..wb.y1 {
-            for px in wb.x0..wb.x1 {
-                let (fy, fx) = (py as f64, px as f64);
-                let d_own = (fy - sy as f64).hypot(fx - sx as f64);
-                let d_oth = near.iter().map(|&(y, x)| (fy - y).hypot(fx - x)).fold(f64::INFINITY, f64::min);
-                owned.push(d_own <= own && d_own <= d_oth && roi.is_none_or(|m| m[py * w + px]));
-            }
-        }
-        let mut win = Window::new(d, w, &bmap, &wb, owned, phi);
-        let (y0, y1) = (wb.y0 as f64, (wb.y1 - 1) as f64);
-        let (x0, x1) = (wb.x0 as f64, (wb.x1 - 1) as f64);
-        ems.clear();
-        ems.extend(out.ems.iter().filter(|e| {
-            (e[1] - e[1].clamp(y0, y1)).hypot(e[2] - e[2].clamp(x0, x1)) <= reach
-        }));
-        win.set_halo(&ems, &mut ws.f);
-        let (state, fits, lr_fail) = search(ws, &win, s, u, &k1);
-        out.fits += fits;
-        out.lr_fail += lr_fail;
-        out.ems.extend(state.em.iter().map(|e| [e[0], e[1] + y0, e[2] + x0, e[3]]));
-    }
-    out.background = bmap;
-    out
+    Start { ems, background: bmap, dispersion: phi, u }
 }
 
-/// Localize an offset-subtracted frame in ADU: [`one_pass`], then the joint
+/// Localize an offset-subtracted frame in ADU: [`start`], then the joint
 /// model ([`joint::Joint`]), then uncertainties from each final group's
 /// Fisher matrix. An ROI limits seeds and additions; everything runs on its
 /// bounding box plus enough context for every filter, window and group.
@@ -799,14 +608,14 @@ pub fn localize(
     let dc: &[f64] = if whole { d } else { &dsub };
     let rc: Option<&[bool]> = if whole { roi } else { rsub.as_deref() };
 
-    let first = one_pass(dc, ch, cw, rc, s, ws);
+    let first = start(dc, ch, cw, rc, s);
     let mut jm = joint::Joint::new(dc, ch, cw, &first.ems, &first.background, first.dispersion, first.u, s, rc, ws);
     jm.run(ws);
     let mut out = report(&jm, ws, bb.y0, bb.x0, h, w);
     out.u = first.u;
-    out.n_seeds = first.n_seeds;
-    out.fits = first.fits + jm.stats.fits;
-    out.lr_fail = first.lr_fail + jm.stats.lr_fail;
+    out.n_seeds = first.ems.len();
+    out.fits = jm.stats.fits;
+    out.lr_fail = jm.stats.lr_fail;
     // Outside the crop nothing was estimated: the map carries a fill there.
     out.background = if whole {
         jm.bg
@@ -1009,10 +818,10 @@ mod tests {
     fn the_threshold_solves_the_calibrated_rate() {
         for (sigma, fp) in [(1.0, 2.0), (1.45, 16.0), (2.0, 100.0)] {
             let u = threshold(sigma, fp);
-            let rate = RFT_C * u * (-0.5 * u * u).exp() / (sigma * sigma);
+            let rate = RFT_C * u * (-0.5 * u * u).exp() / sigma;
             assert!((rate / fp - 1.0).abs() < 1e-9, "sigma {sigma}: rate {rate}");
         }
-        assert!((threshold(1.45, FP_PER_MPX) - 4.003).abs() < 1e-3);
+        assert!((threshold(1.45, FP_PER_MPX) - 4.153).abs() < 1e-3);
     }
 
     #[test]
@@ -1060,34 +869,8 @@ mod tests {
     }
 
     #[test]
-    fn fit_flags_distinguish_iteration_limits_and_active_bounds() {
-        let (h, w) = (17, 17);
-        let mut data = vec![0.0; h*w];
-        psf::model_var_sigma_ax(
-            &[20.0, 1500.0, 8.2, 8.4, 2.8], &psf::local_axis(h), &psf::local_axis(w),
-            None, &mut psf::Factors::new(h, w, 1), &mut data,
-        );
-        let win = Window::new(&data, w, &vec![20.0; h*w],
-            &patches::BBox { y0: 0, x0: 0, y1: h, x1: w }, vec![true; h * w], 1.0);
-        let s = settings(1.0);
-        let mut ws = Workspace::new();
-        let start = [[1200.0, 8.0, 8.0, 1.5]];
-        let unfinished = fit_window(&mut ws, &win, 20.0, &start, &s, 0, FIT_TOL_OBJ);
-        assert_eq!(unfinished.flags, vec![FLAG_NOT_CONVERGED]);
-        let bounded = fit_window(&mut ws, &win, 20.0, &start, &s, 200, FIT_TOL_OBJ);
-        assert!(bounded.flags[0] & FLAG_BOUND != 0);
-        assert!(bounded.flags[0] & FLAG_NOT_CONVERGED == 0);
-        assert!((bounded.em[0][3] - SLACK.1).abs() < 1e-5);
-        let wider = Settings { slack: (0.7, 3.5), ..s };
-        let recovered = fit_window(&mut ws, &win, 20.0, &start, &wider, 200, FIT_TOL_OBJ);
-        assert_eq!(recovered.flags, vec![0]);
-        assert!((recovered.em[0][3] - 2.8).abs() < 1e-3);
-        assert!((recovered.em[0][0] - 1500.0).abs() < 1.0);
-    }
-
-    #[test]
     fn active_bounds_include_the_optimizers_interior_margin() {
-        let bounds = Bounds::new(&[100.0], &[1e8]);
+        let bounds = lmcl::Bounds::new(&[100.0], &[1e8]);
         let theta = lmcl::Interior::new(&[0.0], &bounds);
         assert!(at_bound(theta.as_slice()[0], 100.0, 1e8));
         assert!(!at_bound(10000.0, 100.0, 1e8));

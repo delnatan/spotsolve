@@ -1,15 +1,15 @@
 //! `spotsolve` core: emitter detection and localization.
 //!
-//! The detector is [`boxsearch`]: every change of count is decided by one
-//! statistic, the efficient score for one more reference-width emitter,
-//! against a threshold set by an expected false-positive rate. Background,
-//! dispersion, seeds, per-seed windows and uncertainties all run here; the
-//! one-pass result is then refined as one joint model of the frame by
-//! [`joint`] (pinned by `tests/fixtures/11_joint.json`), and
-//! the measurements behind its constants are recorded beside them. It was
-//! prototyped in Python (`src/spotsolve/scoregate.py`, last present in
-//! commit 7b7dfe7's successors on branch `scoregate-prototype`) and is pinned
-//! to that prototype by `tests/fixtures/10_scoregate.json`.
+//! The detector is [`boxsearch`]: every change of count is proposed by one
+//! statistic, the efficient score for one more reference-width emitter, and
+//! decided by the likelihood ratio of the refit, against a threshold set by
+//! an expected false-positive rate. Background, dispersion, seeds and
+//! uncertainties run there; the seeds start one joint model of the frame,
+//! [`joint`], which fits, removes and adds. The measurements behind the
+//! constants are recorded beside them. The design was prototyped in Python
+//! (`src/spotsolve/scoregate.py`, `scripts/jointfit_prototype.py`); since
+//! 2026-09-24 the Rust is the reference, held by statistical tests on
+//! simulated fields and pure noise (`tests/layer7_localize.rs`).
 //!
 //! The rest are the layers it is built from: [`psf`] (the
 //! pixel-integrated Gaussian and its Jacobian), [`lmcl`] (the bounded Poisson

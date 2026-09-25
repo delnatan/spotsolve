@@ -28,14 +28,11 @@ and migration from the old separate `spotsolve-rs` installation.
 
 | Mode | Entry points | Decision rule |
 |---|---|---|
-| Multi-emitter, default | `localize`, `localize_stack` | Joint fits; fixed 10-nat cost plus optional `count_penalty` |
-| Multi-emitter, experimental BIC | Same functions, `selection="bic"` | Compare background-only and several fitted emitter counts |
+| Multi-emitter, default | `localize`, `localize_stack` | One joint Poisson model per frame; counts decided by likelihood ratios at a threshold set by `fp_per_mpx` |
 | Sparse reference | `localize_aguet`, `localize_aguet_stack` | Aguet screening, then one independent `spotfitlm` fit per candidate |
 
-BIC asks whether fewer emitters explain the same pixels, at the cost of more
-fits. The sparse baseline follows the original `spotfitlm`; overlapping
-sources can bias its independent fits. Detection is per frame, before linking.
-None of these controls guarantees a frame-wide false-positive rate.
+The sparse baseline follows the original `spotfitlm`; overlapping sources can
+bias its independent fits. Detection is per frame, before linking.
 
 ## Detect spots
 
@@ -46,10 +43,8 @@ import spotsolve
 locs = spotsolve.localize(frame, sigma=1.45, offset=100)
 movie = spotsolve.localize_stack(stack, sigma=1.45, offset=100, n_threads=5)
 
-# More conservative count selection; penalty 2 is an example, not a calibration.
-locs = spotsolve.localize(
-    frame, sigma=1.45, offset=100, selection="bic", count_penalty=2,
-)
+# Stricter: 4 expected false emitters per 10^6 noise pixels instead of 16.
+locs = spotsolve.localize(frame, sigma=1.45, offset=100, fp_per_mpx=4)
 
 # Sparse reference; mask is an optional (H, W) boolean array.
 sparse = spotsolve.localize_aguet(frame, sigma=1.45, offset=100, roi=mask)
@@ -108,18 +103,14 @@ estimate its background reference level.
 
 | Multi-emitter setting | Default | Effect |
 |---|---|---|
-| `threshold` | 2.75 | LoG proposal cut in local noise units; higher is stricter and cheaper |
-| `selection` | `"fixed"` | Fixed cost or experimental `"bic"` count search |
-| `count_penalty` | 0 | Extra non-negative cost per emitter in either mode |
-| `k_max` | 12 | Maximum emitters fitted jointly in one box |
+| `fp_per_mpx` | 16 | Expected false emitters per 10^6 pixels of pure noise; lower is stricter |
 | `slack` | `(0.7, 2.2)` | Allowed fitted widths, relative to `sigma` |
 
-The fixed cost is `10 + count_penalty` in dispersion-scaled likelihood units.
-BIC minimizes `I/phi + K*(2*log(n_pixels) + count_penalty)` over a bounded
-forward/backward search, including background-only and removals after
-refinement. Larger penalties favor fewer emitters. This is a BIC-inspired
-score, not calibrated Bayesian evidence. See [count selection](docs/COUNT_SELECTION.md)
-for measured recall/error tradeoffs, cost and limitations.
+Seeds are local maxima of an efficient score above a threshold u solved from
+`fp_per_mpx`. Every seed starts as an emitter of one Poisson model of the
+frame, with a bilinear background; an emitter stays only if removing it costs
+at least `u^2/2` dispersion-scaled nats, and emitters are added where the
+residual asks for them. See the [multi-emitter method](docs/DETECTION.md).
 
 Aguet instead takes `significance=0.05` (smaller is stricter), odd
 `boxsize=9`, and `itermax=50`. It applies no width-reporting band. Its Poisson
@@ -139,15 +130,14 @@ Measured on the development Apple Silicon host:
 
 | Workload | Serial | Five workers |
 |---|---:|---:|
-| BIC, first five real 128x128 GEM frames | 2.810 s | 0.755 s |
-| BIC, all 49 frames of that crop | 27.865 s | 6.691 s |
+| Multi-emitter, first five real 256x256 GEM frames | 12.07 s | 3.12 s |
+| Multi-emitter, all 49 frames of that crop | 111.3 s | 27.4 s |
 | Aguet, 24 simulated sparse 128x128 frames | 26.3 ms | 7.32 ms |
 | Aguet, same frames with a quarter-frame ROI | 8.81 ms | 2.68 ms |
 
 These are different workloads, not a detector accuracy/speed comparison.
 The original `spotfitlm` took 172.1 ms on the sparse full-frame benchmark:
-6.5× the native serial time. See [BIC measurements](docs/COUNT_SELECTION.md#speed)
-and [Aguet measurements](docs/AGUET_BASELINE.md#validation-and-speed) for conditions
+6.5× the native serial time. See [Aguet measurements](docs/AGUET_BASELINE.md#validation-and-speed) for conditions
 and reproduction commands.
 
 ## Choose a detection width

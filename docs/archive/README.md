@@ -53,3 +53,22 @@ under the retired `detect`" refer to it.
 
 The current `localize_aguet` is a new port of `spotfitlm`, separate from the
 retired `localize_sparse`. See the [Aguet baseline](../AGUET_BASELINE.md).
+
+## Retired on 2026-09-24
+
+The Rust detector became its own reference. Removed, all present in commit
+`002cb04`:
+
+- the Python score-gate prototype (`src/spotsolve/scoregate.py`), the joint
+  model prototype (`scripts/jointfit_prototype.py`), their experiment
+  scripts and `output/scoregate/`;
+- the parity fixtures that pinned the Rust to them
+  (`tests/fixtures/10_scoregate.json`, `11_joint.json`, their generators and
+  `layer7_scoregate.rs` / `layer8_joint.rs`); statistical tests on simulated
+  fields and pure noise replaced them;
+- the windowed one-pass search that seeded the joint model: seeds now enter
+  the joint model directly;
+- the experimental BIC count selection (`COUNT_SELECTION.md`, its benchmark
+  and `output/hyp7gem_bic_*`), already gone from the API.
+
+`AUDIT_2026-09-22.md` is the code audit of the detector before the score gate.
