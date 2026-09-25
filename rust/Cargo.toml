@@ -3,7 +3,7 @@ members = ["spotsolve-core", "spotsolve-py"]
 resolver = "3"
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 # Edition 2024 needs >= 1.85. Pinned so a stale toolchain fails with a clear
 # message rather than a parse error in the manifest.

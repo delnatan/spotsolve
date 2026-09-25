@@ -28,7 +28,7 @@ from .results import FitFlag, Localizations  # noqa: F401
 from .aguet import localize_aguet, localize_aguet_stack  # noqa: F401
 from .tracking import link  # noqa: F401
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 __all__ = [
     "localize",

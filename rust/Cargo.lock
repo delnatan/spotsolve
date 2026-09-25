@@ -258,7 +258,7 @@ dependencies = [
 
 [[package]]
 name = "spotsolve-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "libm",
  "serde_json",
@@ -266,7 +266,7 @@ dependencies = [
 
 [[package]]
 name = "spotsolve-py"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "numpy",
  "pyo3",
