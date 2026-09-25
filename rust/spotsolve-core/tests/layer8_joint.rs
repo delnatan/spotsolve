@@ -7,12 +7,15 @@
 //! (with or without count changes) is a sequence of the same LM fits from the
 //! same starts, so emitters agree to 1e-5 except on GEM, whose coincident
 //! splits are chaotic (see layer 7); GEM is checked for stages only.
+//!
+//! These run [`Config::prototype`]. The fast default is held to the
+//! prototype's converged answer statistically (last test).
 
 mod common;
 
 use serde_json::Value;
 use spotsolve_core::boxsearch::{self as bs, Em, Settings, Workspace};
-use spotsolve_core::joint::Joint;
+use spotsolve_core::joint::{Config, Joint};
 
 fn ems_at(v: &Value, key: &str) -> Vec<Em> {
     v[key].as_array().unwrap().iter()
@@ -55,7 +58,11 @@ fn the_joint_stages_reproduce_the_prototype() {
         let u = bs::threshold(sigma, s.fp_per_mpx);
         let e0 = ems_at(case, "e0");
         let mut ws = Workspace::new();
-        let fresh = |ws: &mut Workspace| Joint::new(&d, h, w, &e0, &bg0, phi, u, &s, None, ws);
+        let fresh = |ws: &mut Workspace| {
+            let mut jm = Joint::new(&d, h, w, &e0, &bg0, phi, u, &s, None, ws);
+            jm.config = Config::prototype();
+            jm
+        };
 
         let jm = fresh(&mut ws);
         common::assert_all_rel(&jm.nodes.beta, &common::vec_at(case, "beta_pre"), 1e-8, &format!("{name}: beta_pre"));
@@ -113,6 +120,7 @@ fn the_converged_model_reproduces_the_prototype() {
         let (phi, u) = (bs::dispersion(&d, h, w), bs::threshold(sigma, s.fp_per_mpx));
         let mut ws = Workspace::new();
         let mut jm = Joint::new(&d, h, w, &ems_at(case, "e0"), &bg0, phi, u, &s, None, &mut ws);
+        jm.config = Config::prototype();
         jm.run(&mut ws);
         let r = &case["full"];
         for (key, got) in [("outer", jm.stats.outer), ("adds", jm.stats.adds), ("removed", jm.stats.removed),
@@ -128,5 +136,38 @@ fn the_converged_model_reproduces_the_prototype() {
                 common::assert_abs(g[c], e[c], tol, &format!("{name} full: [{k}][{c}]"));
             }
         }
+    }
+}
+
+/// The fast default against the prototype's converged answer: count within
+/// 2% (+1) and emitters within 0.5 px of one of its. Measured: every count
+/// identical; agreement 1.000 on every case but GEM, 0.939 there, where the
+/// 1e5-ADU objects' coincident splits settle differently (see layer 7).
+#[test]
+fn the_fast_default_agrees_with_the_converged_prototype() {
+    let fx = common::load("11_joint");
+    let src = frames();
+    for case in fx.cases() {
+        let name = case["name"].as_str().unwrap();
+        let shape = common::vec_at(case, "shape");
+        let (h, w) = (shape[0] as usize, shape[1] as usize);
+        let frame = if case.get("frame").is_some() { common::vec_at(case, "frame") } else { src[name].clone() };
+        let (sigma, offset) = (common::f64_at(case, "sigma"), common::f64_at(case, "offset"));
+        let s = Settings { sigma, fp_per_mpx: bs::FP_PER_MPX, slack: bs::SLACK };
+        let d: Vec<f64> = frame.iter().map(|v| v - offset).collect();
+        let bg0 = bs::median_background(&d, h, w);
+        let (phi, u) = (bs::dispersion(&d, h, w), bs::threshold(sigma, s.fp_per_mpx));
+        let mut ws = Workspace::new();
+        let mut jm = Joint::new(&d, h, w, &ems_at(case, "e0"), &bg0, phi, u, &s, None, &mut ws);
+        jm.run(&mut ws);
+        let want = ems_at(&case["full"], "emitters");
+        let near = |a: &[Em], b: &[Em]| a.iter()
+            .filter(|e| b.iter().any(|g| (g[1] - e[1]).hypot(g[2] - e[2]) < 0.5)).count();
+        let (n0, n1) = (want.len(), jm.ems.len());
+        let agree = if n0 + n1 == 0 { 1.0 } else { (near(&want, &jm.ems) + near(&jm.ems, &want)) as f64 / (n0 + n1) as f64 };
+        println!("{name}: N {n1} vs {n0}, agreement {agree:.3}, fits {} vs {}", jm.stats.fits, common::usize_at(&case["full"], "fits"));
+        assert!(n1.abs_diff(n0) as f64 <= 0.02 * n0 as f64 + 1.0, "{name}: N {n1} vs {n0}");
+        let floor = if name == "gem" { 0.9 } else { 0.999 };
+        assert!(agree >= floor, "{name}: agreement {agree}");
     }
 }

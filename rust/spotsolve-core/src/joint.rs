@@ -23,6 +23,13 @@
 //! the spread of the residual score far from emitters (an empirical null).
 //! Then the model is re-converged, until an add round changes nothing.
 //!
+//! Only the last round's answer matters, so no sub-problem is solved more
+//! exactly than the next round can use ([`Config`]): group refits stop at a
+//! looser tolerance, removal trials after a few steps, plain rounds use
+//! smaller boxes and the previous partition, and later add rounds retest only
+//! groups that changed. Together 6x faster than solving each block to
+//! convergence, at equal referee recall and precision.
+//!
 //! The design and its constants were measured on the Python prototype
 //! (`scripts/jointfit_prototype.py`; flags KG 12, PRE_BG, OMEGA 1.5,
 //! EMP_NULL, REMOVE at u) and `tests/fixtures/11_joint.json` pins its stages.
@@ -76,6 +83,69 @@ pub const NULL_BORDER: usize = 4;
 pub const NULL_MIN_PX: usize = 100;
 /// Gaussian consistency factor of the MAD.
 pub const MAD_SCALE: f64 = 1.4826;
+
+/// How exactly each block is solved. [`Config::default`] is the measured
+/// fast setting; [`Config::prototype`] solves every block to convergence, as
+/// the Python prototype did, and is what `tests/fixtures/11_joint.json` pins.
+///
+/// Measured together on 10 GEM frames (128^2), 4 bead frames (256^2) and 12
+/// referee cells (64^2), s/frame, single thread (speed round 2026-09-24):
+///
+/// ```text
+///                              GEM    beads  cells  cells recall/precision
+/// prototype                    9.83   12.94  2.35   0.820 / 0.936
+/// + remove_iter 3              3.83    4.85  1.12   0.823 / 0.936
+/// + plain_tol 1e-3             2.42    3.64  0.85   0.822 / 0.935
+/// + plain_pad, regroup         2.07    3.04  0.69   0.821 / 0.932
+/// + active_tol 0.05            1.62    2.01  0.63   0.821 / 0.931
+/// ```
+///
+/// GEM and bead counts stayed within 0.4%. Tried and rejected: removal
+/// trials refitting only members near the removed one (removed too few;
+/// precision 0.925), an active set in plain rounds (the groups it skipped
+/// converged in one step anyway), node over-relaxation 1.0-1.95 and a
+/// Schur-coupled node step (no fewer rounds), a looser outer tolerance (0.1
+/// cost precision). What remains is the background drifting along a ridge
+/// with wide emitters' flux and width, ~2 ADU per round on GEM.
+#[derive(Clone, Copy, Debug)]
+pub struct Config {
+    /// Objective tolerance (nats) of each group refit. Iterations per refit
+    /// fell 8.6 -> 3.2 from 1e-6, rounds unchanged.
+    pub plain_tol: f64,
+    /// LM iterations of a leave-one-out removal trial. A truncated trial
+    /// overstates the cost of removal, so it can only keep an emitter the
+    /// full trial would remove; removable ones show within 2-3 steps.
+    /// Iterations per trial fell 25 -> 2.9. 1 and 2 were no faster overall.
+    pub remove_iter: usize,
+    /// Plain rounds pad group boxes by [`GROUP_PAD`] widths only; the add
+    /// support `(OWN + SUPPORT) sigma` is needed only where emitters are added.
+    pub plain_pad: bool,
+    /// Keep the partition until the count changes.
+    pub regroup_on_change: bool,
+    /// After the first, an add round tests a group only if a member moved
+    /// or changed width by more than this many sigma, or flux by this
+    /// fraction, since the previous add round, or an emitter was added or
+    /// removed inside its box. 0.02 and 0.1 gave the same counts.
+    pub active_tol: f64,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self { plain_tol: 1e-3, remove_iter: 3, plain_pad: true, regroup_on_change: true, active_tol: 0.05 }
+    }
+}
+
+impl Config {
+    pub fn prototype() -> Self {
+        Self {
+            plain_tol: boxsearch::FIT_TOL_OBJ,
+            remove_iter: boxsearch::FIT_MAX_ITER,
+            plain_pad: false,
+            regroup_on_change: false,
+            active_tol: 0.0,
+        }
+    }
+}
 
 /// Bilinear background on a node lattice `ny x nx`, `TILE` px apart,
 /// node `(0, 0)` at pixel `(0, 0)`; the last row and column may lie beyond
@@ -258,6 +328,12 @@ pub struct Joint<'a> {
     /// Rendered emitter light, `h * w`.
     pub light: Vec<f64>,
     pub stats: Stats,
+    pub config: Config,
+    /// The partition, while `config.regroup_on_change` keeps it.
+    groups: Option<Vec<Vec<usize>>>,
+    /// Emitters as of the last add round, and where it added or removed.
+    tested: Vec<Em>,
+    changed_at: Vec<(f64, f64)>,
 }
 
 impl<'a> Joint<'a> {
@@ -297,6 +373,10 @@ impl<'a> Joint<'a> {
             bg: Vec::new(),
             light: Vec::new(),
             stats: Stats { kappa: 1.0, ..Stats::default() },
+            config: Config::default(),
+            groups: None,
+            tested: Vec::new(),
+            changed_at: Vec::new(),
         };
         j.redraw(ws);
         j.nodes.irls(d, &j.light, 1.0);
@@ -551,9 +631,14 @@ impl<'a> Joint<'a> {
     /// The pixel box of a group: its emitters plus the larger of
     /// [`GROUP_PAD`] widths and the add support `(OWN + SUPPORT) sigma`.
     pub fn group_box(&self, g: &[usize]) -> Box2 {
+        self.group_box_for(g, true)
+    }
+
+    fn group_box_for(&self, g: &[usize], add: bool) -> Box2 {
         let e = g.iter().map(|&i| self.ems[i]);
         let wmax = e.clone().map(|e| e[3]).fold(0.0, f64::max);
-        let pad = (GROUP_PAD * wmax).max((OWN + SUPPORT) * self.s.sigma).ceil() as i64;
+        let floor = if add { (OWN + SUPPORT) * self.s.sigma } else { 0.0 };
+        let pad = (GROUP_PAD * wmax).max(floor).ceil() as i64;
         let (ylo, yhi) = e.clone().fold((f64::INFINITY, f64::NEG_INFINITY), |(a, b), e| (a.min(e[1]), b.max(e[1])));
         let (xlo, xhi) = e.fold((f64::INFINITY, f64::NEG_INFINITY), |(a, b), e| (a.min(e[2]), b.max(e[2])));
         let (y0, y1) = span(ylo, yhi, pad, self.h);
@@ -594,7 +679,7 @@ impl<'a> Joint<'a> {
 
     /// Group fit with the level locked; `em` local. Flux bounds use the
     /// frame maximum, widths `slack * sigma`.
-    fn fit(&mut self, ws: &mut Workspace, win: &Window, em: &[Em]) -> Fitted {
+    fn fit(&mut self, ws: &mut Workspace, win: &Window, em: &[Em], max_iter: usize, tol_obj: f64) -> Fitted {
         self.stats.fits += 1;
         let (s, k) = (&self.s, em.len());
         let a_max = 8.0 * self.smax / psf::peak_factor(s.sigma) * s.slack.1 * s.slack.1;
@@ -619,7 +704,7 @@ impl<'a> Joint<'a> {
             &win.sub,
             &Bounds::new(&lo, &hi),
             Some(&win.halo),
-            FitOpts { max_iter: boxsearch::FIT_MAX_ITER, tol_obj: boxsearch::FIT_TOL_OBJ, ..Default::default() },
+            FitOpts { max_iter, tol_obj, ..Default::default() },
         );
         let t = ws.fit.theta();
         Fitted {
@@ -644,6 +729,24 @@ impl<'a> Joint<'a> {
         }
     }
 
+    /// Whether an add round must test group `g` ([`Config::active_tol`]).
+    fn changed(&self, g: &[usize], bb: &Box2) -> bool {
+        let tol = self.config.active_tol;
+        if tol <= 0.0 || self.tested.len() != self.ems.len() {
+            return true;
+        }
+        let sg = self.s.sigma;
+        g.iter().any(|&i| {
+            let (e, o) = (self.ems[i], self.tested[i]);
+            (e[1] - o[1]).abs() > tol * sg
+                || (e[2] - o[2]).abs() > tol * sg
+                || (e[3] - o[3]).abs() > tol * sg
+                || (e[0] - o[0]).abs() > tol * o[0]
+        }) || self.changed_at.iter().any(|&(y, x)| {
+            y >= bb.y0 as f64 && y < bb.y1 as f64 && x >= bb.x0 as f64 && x < bb.x1 as f64
+        })
+    }
+
     /// One Gauss-Seidel round: every group fitted in turn against the
     /// current light of all others, then the nodes. With `add`, each group
     /// first drops emitters whose removal costs less than `u^2/2` nats, then
@@ -660,29 +763,36 @@ impl<'a> Joint<'a> {
         };
         let (gain_add, gain_rem) = (0.5 * ue * ue * self.phi, 0.5 * self.u * self.u * self.phi);
         let own_r = OWN * self.s.sigma;
-        let groups = self.groups(&self.model(), ws);
+        let groups = match self.groups.take() {
+            Some(g) if self.config.regroup_on_change => g,
+            _ => self.groups(&self.model(), ws),
+        };
+        let (plain_iter, plain_tol) = (boxsearch::FIT_MAX_ITER, self.config.plain_tol);
+        let (full_iter, full_tol) = (boxsearch::FIT_MAX_ITER, boxsearch::FIT_TOL_OBJ);
+        let mut changed_at = Vec::new();
         let (mut n_add, mut n_rem) = (0, 0);
         let mut appended: Vec<(Em, u8)> = Vec::new();
         let mut tmp = Vec::new();
         for g in &groups {
             self.stats.max_group = self.stats.max_group.max(g.len());
-            let bb = self.group_box(g);
+            let bb = self.group_box_for(g, add || !self.config.plain_pad);
             let (mut win, own) = self.window(g, &bb, ws);
             let (fy, fx) = (bb.y0 as f64, bb.x0 as f64);
             let loc: Vec<Em> = g.iter().map(|&i| {
                 let e = self.ems[i];
                 [e[0], e[1] - fy, e[2] - fx, e[3]]
             }).collect();
-            let mut state = self.fit(ws, &win, &loc);
+            let test = add && self.changed(g, &bb);
+            let mut state = self.fit(ws, &win, &loc, plain_iter, plain_tol);
             // ids[j]: which group member loc[j] came from; None = added.
             let mut ids: Vec<Option<usize>> = (0..g.len()).map(Some).collect();
-            if add {
+            if test {
                 while !state.em.is_empty() {
                     let mut best: Option<(f64, usize, Fitted)> = None;
                     for k in 0..state.em.len() {
                         let mut em = state.em.clone();
                         em.remove(k);
-                        let t = self.fit(ws, &win, &em);
+                        let t = self.fit(ws, &win, &em, self.config.remove_iter, full_tol);
                         let marg = (t.i_div - state.i_div) - gain_rem;
                         if best.as_ref().is_none_or(|b| marg < b.0) {
                             best = Some((marg, k, t));
@@ -712,7 +822,7 @@ impl<'a> Joint<'a> {
                         }
                         let mut em = state.em.clone();
                         em.push([a, (i / win.w) as f64, (i % win.w) as f64, self.s.sigma]);
-                        let trial = self.fit(ws, &win, &em);
+                        let trial = self.fit(ws, &win, &em, full_iter, full_tol);
                         if !(state.i_div - trial.i_div > gain_add) {
                             self.stats.lr_fail += 1;
                             break;
@@ -738,11 +848,15 @@ impl<'a> Joint<'a> {
                         self.ems[gi] = new[j];
                         self.flags[gi] = state.flags[j];
                     }
-                    None => self.ems[gi][0] = 0.0,
+                    None => {
+                        changed_at.push((self.ems[gi][1], self.ems[gi][2]));
+                        self.ems[gi][0] = 0.0;
+                    }
                 }
             }
             for (j, q) in ids.iter().enumerate() {
                 if q.is_none() {
+                    changed_at.push((new[j][1], new[j][2]));
                     appended.push((new[j], state.flags[j]));
                 }
             }
@@ -756,6 +870,13 @@ impl<'a> Joint<'a> {
         self.ems.retain(|_| *it.next().unwrap());
         let mut it = keep.iter();
         self.flags.retain(|_| *it.next().unwrap());
+        if n_add == 0 && n_rem == 0 {
+            self.groups = Some(groups);
+        }
+        if add {
+            self.tested = self.ems.clone();
+            self.changed_at = changed_at;
+        }
         self.redraw(ws);
         self.nodes.irls(self.d, &self.light, OMEGA);
         self.bg = self.nodes.surface();
