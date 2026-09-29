@@ -47,10 +47,10 @@
 //! infeasible and no sentinel "forbidden" cost exists anywhere: a pair the
 //! gate rejected is simply not an edge.
 //!
-//! Exactness is the whole point -- tracksolve measured that greedy matching
-//! over the SAME scores costs 1-2 switches per 100 links at step/NN 0.5 -- so
-//! the tests below check it against brute-force enumeration of every partial
-//! matching, not against another solver.
+//! Exactness is the point -- greedy matching over the same scores can swap
+//! identities wherever candidates compete -- so the tests below check it
+//! against brute-force enumeration of every partial matching, not against
+//! another solver.
 
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;

@@ -3,8 +3,7 @@
 //! Gaussian derivatives are formed from the normalized order-zero kernel.
 //! A truncated second derivative need not sum to zero; changing that
 //! normalization would change the detector response. Golden fixtures pin
-//! the kernels and filtered images. Historical timing and threshold notes
-//! are in `docs/archive/DETECTOR_DESIGN_NOTES.md`.
+//! the kernels and filtered images.
 
 /// How a filter reads outside the array. `scipy.ndimage`'s names.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -240,11 +239,8 @@ pub fn log_kernel_l2(sigma: f64) -> f64 {
 /// scipy's own algorithm, not a convolution with `1/size` taps: a running
 /// sum kept undivided, `sum += entering - leaving`, and each output that sum
 /// divided by `size`. The two differ in the last bits, and the last bits
-/// matter where the result is compared for ties -- `estimate_gain` selects
-/// pixels at a quantile of this filter's output, and on integer-valued
-/// counts many of them tie exactly at the cut. With 1/size taps the native
-/// gain estimate came out 0.2% off the Python reference's on a simulated
-/// frame; with this, bit-identical.
+/// matter where the result is compared for ties: on integer-valued counts
+/// many outputs tie exactly.
 pub fn uniform_filter(img: &[f64], h: usize, w: usize, size: usize, mode: Mode) -> Vec<f64> {
     let mut a = vec![0.0; h * w];
     let mut b = vec![0.0; h * w];

@@ -1,13 +1,10 @@
 //! Loader for the golden fixtures in `tests/fixtures/*.json`. They are
-//! FROZEN: the Python reference and `scripts/make_fixtures.py` that wrote
-//! them were retired on 2026-09-11 (both last present in commit `ea6b17f`).
-//! Every float there is emitted at 17 significant digits, so it round-trips
-//! f64 exactly and the early layers can be compared bit for bit
-//! (PORTING_NOTES.md section 16).
+//! frozen: their generator no longer exists. Every float there is emitted at
+//! 17 significant digits, so it round-trips f64 exactly and the early layers
+//! can be compared bit for bit.
 //!
-//! Port bottom up and assert at each layer. Each fixture's own `compare` field
-//! states how exactly that layer can be reproduced; the layers genuinely
-//! differ, and pretending otherwise wastes days.
+//! Each fixture's own `compare` field states how exactly that layer can be
+//! reproduced.
 
 #![allow(dead_code)]
 

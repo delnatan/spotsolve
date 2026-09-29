@@ -34,7 +34,7 @@ def timed(fn, repeats=5):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--reference', type=Path, default=Path(__file__).resolve().parents[2]/'spotfitlm')
-    parser.add_argument('--out', type=Path, default=Path('output/aguet_benchmark/results.json'))
+    parser.add_argument('--out', type=Path, default=Path('output/aguet_benchmark.json'))
     args = parser.parse_args()
     root = args.reference.resolve()
     rng = np.random.default_rng(19037)

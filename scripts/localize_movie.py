@@ -16,9 +16,8 @@ import spotsolve
 from spotsolve import loctable
 
 # The hyp7gem crop, and the acquisition it was cut from. Pixel size and frame
-# interval come from the source .nd2 (65 nm, 20.005 ms); sigma is the value
-# calibrated for this dataset in section 10b of
-# docs/archive/ALGORITHM_HISTORY.md. The crop is not tracked (see .gitignore).
+# interval come from the source .nd2 (65 nm, 20.005 ms); sigma is the
+# dataset's in-focus PSF width. The crop is not tracked (see .gitignore).
 DEFAULT_IMAGE = str(Path(__file__).resolve().parent.parent
                     / "data" / "hyp7gem_wt_crop.tif")
 DEFAULT_SIGMA = 1.45      # px

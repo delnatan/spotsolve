@@ -121,8 +121,7 @@ Release wheels are built on CI with an older Xcode.
 
 `src/spotsolve_rs/__init__.py` preserves the native import API. The source
 archive includes the Rust workspace, lockfile, Python sources and test
-fixtures. Neither the wheel nor source archive includes `WORKING.md` or local
-build output.
+fixtures. Neither includes local build output.
 
 Implementation references: [maturin mixed projects](https://www.maturin.rs/project_layout),
 [maturin Action](https://github.com/PyO3/maturin-action), and

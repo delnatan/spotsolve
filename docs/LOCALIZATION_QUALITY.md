@@ -40,11 +40,11 @@ Flags can coexist. Test individual bits with `result.flags & int(spotsolve.FitFl
 |---|---:|---|
 | `OK` | 0 | No reported issue; does not certify the model or uncertainty |
 | `EDGE` | 1 | Three fitted sigmas extend beyond a physical image edge |
-| `NOT_CONVERGED` | 2 | Final refinement did not meet its projected-gradient tolerance, or refinement was disabled |
-| `STALLED` | 4 | Final optimizer stopped without an acceptable step; also not converged |
+| `NOT_CONVERGED` | 2 | The last fit of the emitter's group did not meet its projected-gradient tolerance |
+| `STALLED` | 4 | That fit stopped without an acceptable step; also not converged |
 | `COVARIANCE_UNAVAILABLE` | 8 | A positive finite variance could not be computed for every emitter parameter |
-| `AT_BOUND` | 16 | A fitted emitter parameter or shared background is within numerical tolerance of an optimization bound |
-| `CONTEXT_UNSETTLED` | 32 | Frozen neighboring light changed after the last fit beyond refinement tolerance |
+| `AT_BOUND` | 16 | A fitted flux, position or width is within numerical tolerance of an optimization bound |
+| `CONTEXT_UNSETTLED` | 32 | Not set by the current detectors; kept so tables from 0.1.0 decode |
 
 The edge flag uses pixel boundaries at -0.5 and size-0.5, independently of
 reference width or ROI boundaries. A Gaussian has infinite tails; three
@@ -54,12 +54,12 @@ strict-interiority margin (`1e-10` of the parameter range). A bound-limited fit 
 by the allowed model; it is not evidence that an object is biologically too
 wide or bright. Refitting with appropriate bounds can resolve that condition.
 
-The multi-emitter optimizer checks stationarity at returned parameters.
-Non-convergence and missing covariance are separate: finite SEs do not imply
-convergence. Convergence flags apply to the joint patch; boundary flags also
-include its shared background. Frozen-neighbor changes above 0.001 pixels in
-position/width or 0.1% in flux trigger another refinement, up to four sweeps.
-At the limit, `CONTEXT_UNSETTLED` exposes the remaining inconsistency.
+The multi-emitter detector fits coupled emitters in small groups, with every
+other emitter and the background held fixed, and repeats until the frame's
+model has converged. Each emitter carries the convergence and bound flags of
+its group's last fit; convergence flags apply to the whole group. The
+optimizer checks stationarity at the returned parameters. Non-convergence and
+missing covariance are separate: finite SEs do not imply convergence.
 
 Aguet's returned fits already passed optimizer, observed-Hessian covariance,
 parameter and patch-bound checks. They carry the same geometric edge flag.

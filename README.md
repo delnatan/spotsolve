@@ -79,14 +79,14 @@ the image background, but varies with width and can exceed the brightest
 observed pixel when the emitter lies between pixels. Localization tables
 include `peak`.
 
-Multi-emitter uncertainties use the final, undamped expected Fisher matrix,
-scaled by local dispersion. If covariance cannot be computed, errors are NaN.
+Multi-emitter uncertainties use the final, undamped expected Fisher matrix of
+each group of coupled emitters, scaled by the frame's dispersion. If covariance cannot be computed, errors are NaN.
 `locs.info["fisher_fraction"]` contains one row per detection and columns
 `(flux, y, x, sigma)`: values near zero indicate strong coupling to other
 fitted parameters; 1 means no coupling. This diagnostic is independent of
 parameter units and does not change count selection. All arrays stay aligned
 with the returned rows. See
-[curvature and uncertainty](docs/DETECTION.md#curvature-and-uncertainty).
+[uncertainties](docs/DETECTION.md#uncertainties).
 
 The detectors' fitted widths differ slightly by convention: pixel integration
 adds `1/12` pixel² to the profile variance, so Aguet's sampled-Gaussian width
@@ -115,7 +115,7 @@ residual asks for them. See the [multi-emitter method](docs/DETECTION.md).
 Aguet instead takes `significance=0.05` (smaller is stricter), odd
 `boxsize=9`, and `itermax=50`. It applies no width-reporting band. Its Poisson
 fit retains the reference noise assumptions; the multi-emitter detector
-estimates local noise and dispersion from the image. Details:
+measures the frame's dispersion (variance per unit mean) from the image. Details:
 [multi-emitter method](docs/DETECTION.md), [Aguet baseline](docs/AGUET_BASELINE.md).
 
 ## Masks, images and speed
@@ -213,7 +213,6 @@ Fisher diagnostics, tables and linking. Aguet is checked against
 frozen original `spotfitlm` fits, including covariance, masks and worker counts.
 
 [Documentation index](docs/README.md) · [Source map and validation](docs/README.md#implementation)
-· [Historical experiments](docs/archive/README.md)
 
 ## Measurement-first output
 
@@ -223,14 +222,11 @@ criteria. Candidate screening and emitter-count selection still determine
 which sources are fitted; this is not an exhaustive list of image maxima.
 
 `FitFlag` reports edge support, non-convergence, stalling, unavailable
-covariance, active bounds and unsettled neighboring-light context. Zero flags
+covariance and active bounds. Zero flags
 does not prove a correct PSF or calibrated uncertainty. The three-sigma edge
 support and numerical tolerances are explicit conventions, not object classes.
 See [fit diagnostics](docs/LOCALIZATION_QUALITY.md).
 
-API changes: `band`, `BAND`, `BAND_Z`, aggregate helpers and columns,
-`REJECT_DTYPE`, `Localizations.rejects`, `loctable.reject_table`,
-`calibrate_sigma`, and `SigmaCalibration` have been removed. `frame_tables`
-now returns `(localizations, frame_summary)`.
-The movie script saves those two tables and metadata; it no longer writes
-aggregate or reject tables. Rebuild the Rust extension when updating.
+Changes between versions, including removed and renamed API, are listed in
+the [changelog](CHANGELOG.md). Rebuild the Rust extension when updating a
+source install.

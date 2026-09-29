@@ -11,11 +11,8 @@
 //! The rest are the layers it is built from: [`psf`] (the
 //! pixel-integrated Gaussian and its derivatives), [`linalg`] (Cholesky,
 //! banded solves), [`filters`] (`scipy.ndimage`'s filters, matched exactly),
-//! [`grid`] (spatial grouping), [`render`] (model images) and
-//! [`statistics`]. The linker is [`track`], on the exact assignment in [`lap`].
-//!
-//! `PORTING_NOTES.md` records the implementation practices this port is
-//! built on; its section numbers are cited throughout as `[Pn]`.
+//! [`render`] (model images) and [`statistics`]. The linker is [`track`], on
+//! the exact assignment in [`lap`].
 //!
 //! # Portability
 //!
@@ -23,13 +20,12 @@
 //! `cfg(target_os)`. `libm::erf` is a port of musl's, so it is bit-identical on
 //! macOS, Linux and Windows. Do not enable fast-math, and do not build with
 //! `-C target-cpu=native`: FMA contraction would change f64 results between
-//! machines [P2].
+//! machines.
 
 pub mod aguet;
 pub mod detect;
 mod frames;
 pub mod filters;
-pub mod grid;
 pub mod lap;
 pub mod linalg;
 pub mod model;

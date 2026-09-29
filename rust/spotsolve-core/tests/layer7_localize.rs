@@ -1,10 +1,9 @@
 //! `localize` against truth: simulated fields and pure noise.
 //!
-//! The Rust detector is the reference (the Python prototypes' parity
-//! fixtures were retired on 2026-09-24), so its contract is statistical:
-//! recall, precision and position error on Poisson fields with known
-//! emitters, and the false-positive rate `fp_per_mpx` promises on noise.
-//! Floors sit a few points under the values measured when they were set.
+//! The detector's contract is statistical: recall, precision and position
+//! error on Poisson fields with known emitters, and the false-positive rate
+//! `fp_per_mpx` promises on noise. Floors sit a few points under what the
+//! detector achieves.
 
 use spotsolve_core::detect::{self as bs, Settings};
 use spotsolve_core::psf;
@@ -79,8 +78,7 @@ fn simulated_fields_are_recovered() {
     let (h, w, sigma) = (128, 128, 1.2);
     let s = Settings { sigma, fp_per_mpx: bs::FP_PER_MPX, slack: bs::SLACK };
     let mut rng = Rng(2026);
-    // (emitters per px, recall, precision, rmse px) floors and ceiling;
-    // measured 1.000/1.000/0.116, 0.890/0.991/0.200, 0.868/0.993/0.247.
+    // (emitters per px, recall, precision, rmse px) floors and ceiling.
     for (density, rec_min, prec_min, rmse_max) in [(0.005, 0.97, 0.98, 0.16), (0.015, 0.86, 0.97, 0.25), (0.03, 0.84, 0.97, 0.30)] {
         let n = (density * (h * w) as f64).round() as usize;
         let (d, truth) = field(&mut rng, h, w, n, sigma);
@@ -103,7 +101,6 @@ fn pure_noise_meets_the_false_positive_target() {
     }
     let expected = bs::FP_PER_MPX * (frames * h * w) as f64 / 1e6;
     println!("noise: {n} false emitters, {expected:.1} expected");
-    // Counts per frame are Poisson; over 67 Mpx at sigma 1.2 the rate was
-    // 16.4 per Mpx. Here 23: within 3 sd.
+    // The count is Poisson: accept within 3 sd of the promise.
     assert!((n as f64 - expected).abs() <= 3.0 * expected.sqrt(), "{n} vs {expected}");
 }

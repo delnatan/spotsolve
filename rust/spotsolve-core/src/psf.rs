@@ -11,9 +11,9 @@
 use libm::erf;
 
 pub const SQRT2: f64 = std::f64::consts::SQRT_2;
-/// `sqrt(2*pi)`, as `psf.py`'s `SQRT2PI`.
+/// `sqrt(2*pi)`.
 pub const SQRT2PI: f64 = 2.506_628_274_631_000_7;
-/// `sqrt(pi)`, as `psf.py`'s `SQRTPI`.
+/// `sqrt(pi)`.
 pub const SQRTPI: f64 = 1.772_453_850_905_516;
 
 /// Number of emitters in a `theta` of length `3K+1`.
@@ -106,10 +106,7 @@ pub fn peak_factor(sigma: f64) -> f64 {
 /// Scratch for the separable 1-D factors and the unpacked per-emitter values.
 ///
 /// The pixel grid never changes within a fit and `K` is fixed once the proposal
-/// is formed, so this is allocated once and borrowed for the duration [P5, P6].
-/// The Python re-derives the axes on every one of the ~160 model evaluations a
-/// single fit makes; that cost is an artifact of the interpreter, but the
-/// allocation it implies is not, and this removes both.
+/// is formed, so this is allocated once and borrowed for the duration.
 pub struct Factors {
     /// `ey[k*h + r]`
     pub ey: Vec<f64>,
@@ -210,8 +207,8 @@ pub fn shape_axis(ax: &[f64], centers: &[f64], sigma: f64, e: &mut [f64]) {
         let row = &mut e[k * n..k * n + n];
         for (i, &x) in ax.iter().enumerate() {
             // (x - c + 0.5) * kk, NOT (x - c)*kk + 0.5*kk. The two agree
-            // mathematically and differ in the last ulp, and float
-            // associativity is part of the contract here [P2].
+            // mathematically and differ in the last ulp, and the fixtures
+            // pin the last ulp.
             row[i] = 0.5 * (erf((x - c + 0.5) * kk) - erf((x - c - 0.5) * kk));
         }
     }
@@ -280,10 +277,8 @@ pub fn model_ax(
                 let e_r = ey[r];
                 let row = &mut m[r * w..r * w + w];
                 for c in 0..w {
-                    // a * (ey*ex), NOT (a*ey) * ex: `psf.py`'s product order,
-                    // which the fixture asserts to 1e-13. Hoisting `a*ey[r]`
-                    // out of the loop would save a multiply and move the last
-                    // ulp [P2].
+                    // a * (ey*ex), NOT (a*ey) * ex: the fixture asserts this
+                    // product order to 1e-13.
                     row[c] += a * (e_r * ex[c]);
                 }
             }

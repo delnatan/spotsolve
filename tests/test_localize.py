@@ -19,8 +19,8 @@ def _sim(seed, density=0.034, spread=0.2, **kw):
                     sigma_spread=spread, seed=seed, **kw)
 
 
-# Historical simulation baselines, with five percentage points of tolerance.
-# Unresolved neighbors limit recovery in the denser fields.
+# Floors with five percentage points of tolerance. Unresolved neighbours
+# limit recovery in the denser fields.
 @pytest.mark.parametrize("seed,density,spread,recall,precision",
                          [(17, 0.015, 0.4, 0.723, 0.919),
                           (18, 0.034, 0.2, 0.785, 0.913),
@@ -32,15 +32,14 @@ def test_referee_cells_hold_their_recall_and_precision(seed, density, spread,
     m = match(sim.positions, res.positions, radius=1.0)
     assert m.recall >= recall - 0.05
     assert m.precision >= precision - 0.05
-    # Every SE comes from the polish's Fisher matrix.
+    # Every SE comes from the final Fisher matrix.
     assert np.all(np.isfinite(res.se)) and np.all(res.se > 0)
     assert np.all(np.isfinite(res.sigma_se)) and np.all(res.sigma_se > 0)
 
 
 def test_read_noise_needs_no_model():
-    # bg 1 e-, sigma_r 2.5 e-, no emitters. Plain Poisson read these spikes as
-    # 13.3 sources per frame and needed the read noise passed in; the measured
-    # noise already contains it.
+    # bg 1 e-, sigma_r 2.5 e-, no emitters: the dispersion is measured from
+    # the image, so it already contains the read noise.
     sim = simulate(shape=(64, 64), n_emitters=0, background=1.0, sigma=SIGMA,
                    seed=17)
     img = sim.image + 2.5 * np.random.default_rng(1017).standard_normal((64, 64))
@@ -51,13 +50,10 @@ def test_read_noise_needs_no_model():
 
 
 def test_the_answer_does_not_depend_on_the_camera_gain():
-    # The same photons at several gains (true 1 here): the measured dispersion
-    # reads the gain exactly, and the detections are the same ones. Not bit
-    # for bit -- rescaling perturbs rounding, and inside a crowded cluster the
-    # search path is sensitive to that: measured, N stays within 2 at every
-    # gain from 0.25 to 32 on all three referee cells, but on the dense ones a
-    # cluster decomposes differently. On this sparse cell 43 of 43 match at
-    # every gain but one, where 37 do.
+    # The same photons at several gains (true 1 here): the dispersion scales
+    # with the gain exactly, and the detections are the same ones. Not bit
+    # for bit: rescaling perturbs rounding, and a crowded cluster's search
+    # path is sensitive to that.
     sim = _sim(17, 0.015, 0.4, background=20.0)
     ref = L.localize(sim.image + 100.0, sigma=SIGMA, offset=100.0)
     for g in (0.5, 4.0, 32.0):
@@ -90,8 +86,8 @@ def test_roi_confines_the_search():
     part = L.localize(img, sigma=SIGMA, roi=roi)
     full = L.localize(img, sigma=SIGMA)
     # Placements are on ROI pixels, but a fit follows the light: a source
-    # just outside whose wing crosses the ROI settles where it really is
-    # (measured: 2.3 px out, on a true source). Its reach is the placement's.
+    # just outside whose wing crosses the ROI settles where it really is.
+    # Its reach is the placement's.
     assert np.all(part.positions[:, 1] < 24 + 3 * SIGMA)
     # No window forms outside, so the work shrinks with the area searched.
     assert part.info["fits"] < 0.6 * full.info["fits"]
@@ -118,21 +114,12 @@ def test_stack_is_frame_by_frame_and_thread_count_free():
 
 
 def test_the_roi_crop_is_invisible_to_the_roi():
-    """`localize` runs FIND and the background on the ROI's bounding box plus
-    `crop_margin` (41 px, set by the background's 25 px kernel), not on the
-    frame. The margin's promise is that the answer inside the ROI does not
-    depend on how much frame surrounds it.
+    """`localize` runs on the ROI's bounding box plus a margin
+    (`crop_margin`), not on the frame. The margin's promise is that the
+    answer inside the ROI does not depend on how much frame surrounds it.
 
-    Checked here by handing the same ROI more context than the crop needs:
-    the whole 192^2 frame against a sub-array that still contains the crop.
-    The noise map's medians are exact on a grid `NOISE_STRIDE` (12 px) apart
-    in the INPUT array's coordinates, so the sub-array is cut on that grid:
-    within one call the crop cannot see it, but an image shifted by a
-    non-multiple of 12 samples its noise at different pixels.
-    Measured agreement on both: identical N, and positions to 1.3e-12 px --
-    filter summation order over a differently-shaped array, eleven orders
-    below the 5.7e-2 margin the candidate list carries (`filters`' module
-    note).
+    Checked by handing the same ROI more context than the crop needs: the
+    whole 192^2 frame against a sub-array that still contains the crop.
     """
     sim = simulate(shape=(192, 192), density=0.01,
                    amplitude_range=(900.0, 1900.0), sigma=SIGMA,

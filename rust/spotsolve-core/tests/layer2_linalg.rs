@@ -1,8 +1,7 @@
 //! LAYER 2: the dense SPD kernels.
 //!
-//! Randomized property tests against naive references, which is what
-//! localized the Cholesky-triangle problem in the Python in one run when the
-//! end-to-end test said only "something changed" [P15].
+//! Randomized property tests against naive references: a failure here names
+//! the kernel, where an end-to-end test would only say something changed.
 
 mod common;
 
@@ -71,9 +70,8 @@ fn solve_recovers_the_right_hand_side() {
 }
 
 /// `log|A|` against a naive LU determinant. Independent route, same answer.
-/// `diag(A^-1)` against `n` explicit solves against unit vectors -- the route
-/// the Python takes via `np.linalg.inv`, which this deliberately replaces so
-/// one factorization serves every consumer [P13].
+/// `diag(A^-1)` against `n` explicit solves against unit vectors, so one
+/// factorization serves every consumer.
 #[test]
 fn inv_diag_matches_column_solves() {
     let mut rng = Rng::new(13);
@@ -95,7 +93,7 @@ fn inv_diag_matches_column_solves() {
 }
 
 /// `F_ij` and `F_ji` differ by an ulp in practice, so which triangle is read
-/// changes the answer unless the factorization symmetrizes first [P3]. It does,
+/// changes the answer unless the factorization symmetrizes first. It does,
 /// so feeding it a matrix or its transpose must give bit-identical results.
 #[test]
 fn factorization_is_transpose_invariant() {

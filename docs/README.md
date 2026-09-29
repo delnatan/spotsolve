@@ -10,7 +10,6 @@ API examples and linking.
 | [Multi-emitter detection](DETECTION.md) | Image/noise model, the joint model, count rule, widths and uncertainties |
 | [Aguet / spotfitlm baseline](AGUET_BASELINE.md) | Sparse screening/fitting, reference parity, uncertainties and speed |
 | [Tracking](TRACKING.md) | Motion model, assignment, parameters, benchmarks and limits |
-| [Archive](archive/README.md) | Retired designs and historical experiments |
 
 ## Implementation
 
@@ -27,11 +26,8 @@ with reusable worker storage. There is no nested thread pool.
 | Tracking | `src/spotsolve/tracking.py` | `track.rs`, `lap.rs` |
 
 Core files live under `rust/spotsolve-core/src`; bindings are in
-`rust/spotsolve-py/src`. Rust retains current algorithm rules and numerical
-invariants. Long benchmark commentary moved to
-[detector design history](archive/DETECTOR_DESIGN_NOTES.md); halo collection
-and frame scheduling are shared, while sparse and joint fitting remain
-separate because their models differ.
+`rust/spotsolve-py/src`. Frame scheduling is shared; sparse and joint
+fitting remain separate because their models differ.
 
 ## Verification
 
@@ -66,4 +62,3 @@ Benchmark runners:
 `--fp-per-mpx` and `--threads`. Aguet is currently exposed
 through its Python API, not that script.
 
-- [Code audit and API migration](archive/AUDIT_2026-09-22.md): measurement output, fit diagnostics and numerical corrections.

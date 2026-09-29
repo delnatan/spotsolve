@@ -43,7 +43,7 @@ def main(args):
 
     t = time.time()
     res = spotsolve.localize(img, sigma=args.sigma, offset=CAMERA_OFFSET,
-                             k_max=args.k_max)
+                             fp_per_mpx=args.fp_per_mpx)
     dt = time.time() - t
 
     # The audit in the likelihood's own terms: dividing ADU by the measured
@@ -106,6 +106,6 @@ if __name__ == "__main__":
     ap.add_argument("--frame", type=int, default=0,
                     help="which frame, if the file is a stack")
     ap.add_argument("--sigma", type=float, default=1.2)
-    ap.add_argument("--k-max", type=int, default=12)
+    ap.add_argument("--fp-per-mpx", type=float, default=spotsolve.FP_PER_MPX)
     ap.add_argument("--out", default="result.png")
     main(ap.parse_args())

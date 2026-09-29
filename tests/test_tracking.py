@@ -112,13 +112,8 @@ def test_no_link_is_longer_than_max_step_and_a_missed_frame_ends_a_track():
     assert np.all(np.diff(tracks["frame"].to_numpy().astype(int))[same] == 1)
 
 
-# Measured when the thresholds were set (three seeds, MAX_STEP = 5.0 px,
-# 30% immobile); floors carry about 30% headroom:
-#
-#   regime                    step/NN  switches/100   links/detection
-#   sparse, every frame seen    0.11       0.57            0.950
-#   GEM-like, 95% detected      0.31       3.48            0.906
-#   dense, 90% detected         0.54      13.00            0.877
+# Floors carry about 30% headroom over what the linker achieves (three
+# seeds, MAX_STEP = 5.0 px, 30% immobile).
 @pytest.mark.parametrize("name,n,field,p_detect,max_switch,min_links", [
     ("sparse", 80, 256.0, 1.0, 1.0, 0.92),
     ("gem_like", 160, 128.0, 0.95, 4.5, 0.88),

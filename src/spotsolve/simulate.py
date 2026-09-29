@@ -44,20 +44,8 @@ def simulate(
     area excluding `border`) must be given.
 
     `sigma_spread` is the sd, IN LOG SPACE, of a per-emitter lognormal width
-    drawn around `sigma`. It exists because a field where every emitter sits at
-    the model's own width cannot exhibit the failure the real data does: on
-    `beads_80pct-glycerol` the per-object sigma_ratio sd is 0.194 and the
-    per-localization sd 0.442, so 0.2 and 0.4 bracket that data. Measured at
-    the benchmark's easiest arm (bright, density 0.015, flat background, where
-    recall is 0.978 and FP 0.00), width spread alone drives N_est/N_true:
-
-        spread   0.0    0.10   0.20   0.40
-        Nest/Nt  0.95   1.07   1.26   1.56
-
-    and the excess is one-sided tiling, monotone in each emitter's OWN width:
-    at sigma_true/sigma <= 1.05 no emitter collects a second detection, at
-    1.05-1.25 38% do, at 1.25-1.60 85% do. Emitters NARROWER than the model
-    never tile.
+    drawn around `sigma`: real emitters are not all at the model's in-focus
+    width, and a field where they are cannot show what width mismatch does.
 
     `sigma_spread = 0` draws no random numbers and renders through `psf.model`,
     so every existing seed reproduces its field byte for byte.
