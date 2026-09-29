@@ -50,6 +50,10 @@ pub const OMEGA: f64 = 1.5;
 pub const IRLS_STEPS: usize = 3;
 /// Nats per emitter: a round that improves the objective less has converged.
 pub const TOL: f64 = 1e-2;
+/// Nats per emitter: convergence enough for a test round that may still
+/// change the count, well under the `u^2 / 2` its decisions turn on. The
+/// test that ends the run follows convergence to [`TOL`].
+pub const TOL_TEST: f64 = 1.0;
 pub const MAX_OUTER: usize = 80;
 /// Nats: a group refit stops here, since the next round moves its halo
 /// anyway; decisive fits (additions) go to [`FIT_TOL`].
@@ -1088,17 +1092,21 @@ impl<'a> Model<'a> {
     /// round changes nothing, within [`MAX_OUTER`] rounds.
     pub fn run(&mut self) {
         let mut prev = f64::INFINITY;
-        let mut test = false;
+        let (mut test, mut tol, mut strict) = (false, TOL_TEST.max(TOL), false);
         for _ in 0..MAX_OUTER {
             let (n_add, n_rem, obj) = self.round(test);
-            let converged = prev - obj < TOL * self.ems.len().max(1) as f64;
+            let gain = (prev - obj) / self.ems.len().max(1) as f64;
             if test {
                 test = false;
                 if n_add == 0 && n_rem == 0 {
-                    break;
+                    if strict {
+                        break;
+                    }
+                    tol = TOL;
                 }
-            } else if converged {
+            } else if gain < tol {
                 test = true;
+                strict = gain < TOL;
             }
             prev = obj;
         }
