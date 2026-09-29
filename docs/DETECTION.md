@@ -8,7 +8,8 @@ decide every emitter by a likelihood ratio. The separate
 
 Work in camera units: `d = frame - offset`. Each emitter has flux `A`,
 position `(y, x)` and width `s`; its Gaussian is integrated over each pixel.
-The background `B` is bilinear on a lattice of nodes 16 px apart:
+The background `B` is bilinear on a lattice of nodes `ceil(8 * slack[1] *
+sigma)` px apart:
 
 ```text
 m[i,j] = B[i,j] + sum_k A_k * E(i; y_k, s_k) * E(j; x_k, s_k)
@@ -23,12 +24,16 @@ calibration is needed; fluxes scale with gain, geometry does not.
 
 ## Algorithm
 
-1. **Seeds.** Against a 25-px median background, compute the efficient score
-   `z` for one emitter at every pixel, on a bank of widths from
-   `slack[0] * sigma` to `slack[1] * sigma`, adjacent widths at most 1.5x
-   apart (an emitter between two keeps 98% of its score). Local maxima over
-   position and width with `z > u` become emitters at their template's
-   width. `u` is solved from `fp_per_mpx` (below).
+1. **Seeds.** Fit the nodes to a 25-px median background, which emitters
+   barely move, and compute the score `z` for one emitter at every pixel
+   against it: the signed root of its likelihood ratio with the nodes
+   profiled out. The bank of widths runs from `slack[0] * sigma` to
+   `slack[1] * sigma`, adjacent widths at most 1.5x apart. Local maxima over
+   position and width become emitters at their template's width when `z`
+   exceeds `u` times what the grid can lose of a maximum: half a pixel off
+   in y and x costs `1 / (8 s^2)` of it, and midway between two widths 2%.
+   No emitter a test at `u` would keep goes unproposed. `u` is solved from
+   `fp_per_mpx` (below).
 2. **Fit.** Emitters and background are fitted together by block coordinate
    descent. Emitters are fitted in groups by bounded Levenberg-Marquardt,
    with every other emitter and the background held fixed; groups join the
@@ -39,16 +44,22 @@ calibration is needed; fluxes scale with gain, geometry does not.
    - an emitter is removed if removing it costs less than `u^2/2` nats;
    - an emitter is added at the pixel and width of highest residual score,
      over the seed widths and within `4 sigma` of a member, if that score
-     exceeds `u * kappa` and the refit gains `(u * kappa)^2 / 2` nats.
+     exceeds `u * kappa` (less the grid's loss, as for seeds) and the refit
+     gains `(u * kappa)^2 / 2` nats.
 
    The score is efficient: its information is what remains after projecting
-   out the group's parameters and level. With free widths a fitted emitter
-   absorbs an unfound neighbour by widening, which leaves little of the
-   neighbour in the residual; the projection is what finds it there.
+   out the group's parameters and the background nodes. With free widths a
+   fitted emitter absorbs an unfound neighbour by widening, which leaves
+   little of the neighbour in the residual; the projection is what finds it
+   there.
 
-   Both likelihood ratios let the patch's level float, as the seed score
-   does: a wide emitter and the background trade light, and a fixed level
-   would credit the emitter with the background's share.
+   Every likelihood ratio, and the Wald screen that spares clear emitters a
+   removal trial, profiles out the background nodes. A node's tent and a
+   wide emitter trade light: with the nodes held at a fit that includes the
+   emitter, the test would credit it with the evidence the nodes gave up.
+   The nodes enter linearly, so they are profiled to second order: after a
+   change of the model, refitting them gains `s^T F^-1 s / 2` nats, with
+   `F = sum_p t_p t_p^T / m_p` their information and `s` their score.
 
    `kappa >= 1` is the spread of the residual score far from every emitter,
    an empirical null. It is 1 where the model describes the data, and grows
@@ -62,32 +73,43 @@ not an acceptance interval; a fit at a bound is flagged.
 ## The threshold
 
 An emitter survives on pure noise when its likelihood ratio, maximized over
-position and width, reaches `u^2/2`: a local maximum above `u` of the
-matched-filter field over position and log width. With `tau = log s`, that
-field's metric is `(dx^2 + dy^2) / (2 s^2) + dtau^2`, a slab of hyperbolic
-space, and the Gaussian kinematic formula gives the expected number per
-pixel (`statistics::scale_space_ec`):
+position and width with the nodes profiled out, reaches `u^2/2`: a local
+maximum above `u` of that ratio's signed root, a Gaussian field over
+position and `tau = log s`. The field is `<h, r> / |h|`, with `h = g - P g`
+the pixel-integrated profile less its projection on the nodes' tents. Its
+metric, the covariance of the unit field's derivatives, comes from 1-D sums
+because `g` and the tents separate; averaged over a node cell it is
+`f(tau)^2 (dy^2 + dx^2) + L_tt(tau) dtau^2`. The Gaussian kinematic formula
+for that slab gives the expected Euler characteristic per pixel
+(`statistics::lkc`, `statistics::expected_ec`):
 
 ```text
-EC(u) = 1/4 (1/s1^2 - 1/s2^2) rho3(u) + 1/4 (1/s1^2 + 1/s2^2) rho2(u)
-      + 1/(8 pi) (1/s1^2 - 1/s2^2) rho1(u)
+EC(u) = L3 rho3(u) + L2 rho2(u) + L1 rho1(u)
+L3 = int sqrt(det Lambda) dtau
+L2 = (f(tau1)^2 + f(tau2)^2) / 2
+L1 = 1/(2 pi) int (df/dtau)^2 / sqrt(L_tt) dtau
 ```
 
-with `s^2` the profile variance (`(slack * sigma)^2 + 1/12` with pixel
-integration) and `rho_j` the Gaussian EC densities. `u` solves
-`10^6 EC(u) = fp_per_mpx`. The narrowest widths dominate the count, which
-is why the search starts at the in-focus width.
+with `rho_j` the Gaussian EC densities. `u` solves `10^6 EC(u) =
+fp_per_mpx`. With a known background, `f^2 = 1/(2 s^2)` and `L_tt = 1`:
+the slab of hyperbolic space of the continuous Gaussian scale space. The
+narrowest widths dominate the count, which is why the search starts at the
+in-focus width.
+
+A node's tent resembles a wide emitter, so the node spacing sets how much
+of an emitter's flux information the background leaves it. At `8 * slack[1]
+* sigma` the widest emitter keeps at least two thirds of it wherever it sits
+(0.82 averaged over a node cell); narrower emitters keep more.
 
 This counts the maxima of a continuous Gaussian field, so `fp_per_mpx` is a
-bound, not a calibration: sampling on the pixel lattice finds fewer maxima
-for PSFs near a pixel wide, while Poisson skew at low counts and fits at the
-frame edge (flagged `EDGE`) add some.
+bound for Gaussian noise: the detector finds fewer maxima than the field
+has, while Poisson skew at low counts adds some.
 
 ## Uncertainties
 
 Standard errors come from the undamped expected Fisher information
-`F = J.T @ diag(1/m) @ J` of each final group, with a free local level,
-scaled by `phi`. If `F` cannot be factored, the errors are NaN.
+`F = J.T @ diag(1/m) @ J` of each final group, with the background nodes
+profiled out, scaled by `phi`. If `F` cannot be factored, the errors are NaN.
 
 `result.info['fisher_fraction']` has shape `(N, 4)` in `(flux, y, x, sigma)`
 order:
@@ -98,8 +120,8 @@ fraction[q] = 1 / (F[q,q] * inverse(F)[q,q]) = conditional / marginal variance
 
 1 means no coupling to other fitted parameters; values near zero mean strong
 confounding. It is invariant to parameter units and order. Neighbours
-outside the group and the background nodes are treated as known, so this is
-not a full uncertainty budget.
+outside the group are treated as known, so this is not a full uncertainty
+budget.
 
 ## ROI and reference width
 

@@ -84,19 +84,21 @@ def localize(frame, sigma, *, offset=0.0, roi=None, fp_per_mpx=FP_PER_MPX,
     multiples of `sigma`. Boundary solutions are flagged.
 
     One statistic proposes every emitter: the efficient score z for one more
-    emitter of width `sigma`, given everything already fitted nearby. Seeds
-    are local maxima of z over the frame above a threshold u; each starts as
-    one emitter of one joint model of the frame: every emitter plus a
-    bilinear background on 16-px nodes (the returned background map), fitted
-    to convergence in small coupled groups. Then counts change: an emitter
-    is removed if dropping it costs less than u^2 / 2 dispersion-scaled
-    nats, and one is added where the residual's z exceeds u * kappa and the
-    refit gains (u * kappa)^2 / 2, until nothing changes. `info["kappa"]`
-    >= 1 is the residual score's spread far from any emitter (an empirical
-    null that absorbs PSF and background misfit; 1 in the first add round).
-    `fp_per_mpx` sets u: the expected number of false emitters per 10^6
-    pixels of pure noise (calibrated on simulated noise). Lower it for fewer
-    false positives, raise it for dim data. `info` reports `u`, `adds`,
+    emitter, at any searched width, given everything already fitted nearby.
+    Seeds are local maxima of z over position and width near a threshold u;
+    each starts as one emitter of one joint model of the frame: every
+    emitter plus a bilinear background on nodes `ceil(8 * slack[1] *
+    sigma)` px apart (the returned background map), fitted to convergence
+    in small coupled groups. Then counts change: an emitter is removed if
+    dropping it costs less than u^2 / 2 dispersion-scaled nats, and one is
+    added where the residual's z exceeds u * kappa and the refit gains
+    (u * kappa)^2 / 2, until nothing changes; every such likelihood ratio
+    refits the background. `info["kappa"]` >= 1 is the residual score's
+    spread far from any emitter (an empirical null that absorbs PSF and
+    background misfit; 1 in the first add round). `fp_per_mpx` sets u: an
+    upper bound on the expected number of false emitters per 10^6 pixels of
+    pure Gaussian noise. Lower it for fewer false positives, raise it for
+    dim data. `info` reports `u`, `adds`,
     `removed` and `outer` (rounds).
 
     Every emitter is returned with `FitFlag` diagnostics; there are no

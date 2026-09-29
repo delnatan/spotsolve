@@ -1,7 +1,7 @@
 //! `spotsolve` core: emitter detection and localization.
 //!
-//! The detector is [`detect`]: seeds are local maxima of the efficient
-//! score for one more reference-width emitter, above a threshold set by an
+//! The detector is [`detect`]: seeds are local maxima over position and
+//! width of the score for one more emitter, near a threshold set by an
 //! expected false-positive rate; each starts as an emitter of one Poisson
 //! model of the frame, [`model`], which fits, removes and adds by likelihood
 //! ratios. `tests/layer7_localize.rs` holds it to recall, precision and

@@ -185,50 +185,67 @@ impl Chol {
     }
 }
 
-/// Solve a banded symmetric-positive-definite system in place.
+/// A banded symmetric-positive-definite matrix's Cholesky factor, kept for
+/// repeated solves.
 ///
-/// `a` holds the lower band of the `n x n` matrix, row-major `n x (kd+1)`:
-/// `A[i][j]` for `i - kd <= j <= i` sits at `a[i * (kd+1) + kd + j - i]`. It
-/// is overwritten by the Cholesky factor, and `b` by the solution. O(n kd^2);
-/// a bilinear node lattice `nx` wide couples nodes at most `nx + 1` apart.
-/// Returns `false` for non-positive-definite or non-finite input.
-pub fn band_solve(a: &mut [f64], n: usize, kd: usize, b: &mut [f64]) -> bool {
-    let wd = kd + 1;
-    debug_assert_eq!(a.len(), n * wd);
-    debug_assert_eq!(b.len(), n);
-    let at = |i: usize, j: usize| i * wd + kd + j - i;
-    for i in 0..n {
-        let j0 = i.saturating_sub(kd);
-        for j in j0..=i {
-            let mut sum = a[at(i, j)];
-            for k in j0.max(j.saturating_sub(kd))..j {
-                sum -= a[at(i, k)] * a[at(j, k)];
-            }
-            if i == j {
-                if !(sum > 0.0) || !sum.is_finite() {
-                    return false;
+/// Storage is the lower band, row-major `n x (kd+1)`: `A[i][j]` for
+/// `i - kd <= j <= i` sits at `a[i * (kd+1) + kd + j - i]`. Factoring is
+/// O(n kd^2) and each solve O(n kd); a bilinear node lattice `nx` wide couples
+/// nodes at most `nx + 1` apart.
+pub struct BandChol {
+    a: Vec<f64>,
+    n: usize,
+    kd: usize,
+}
+
+impl BandChol {
+    /// Factor `a` (the lower band, as above). `None` for non-positive-definite
+    /// or non-finite input.
+    pub fn factor(mut a: Vec<f64>, n: usize, kd: usize) -> Option<Self> {
+        let wd = kd + 1;
+        debug_assert_eq!(a.len(), n * wd);
+        let at = |i: usize, j: usize| i * wd + kd + j - i;
+        for i in 0..n {
+            let j0 = i.saturating_sub(kd);
+            for j in j0..=i {
+                let mut sum = a[at(i, j)];
+                for k in j0.max(j.saturating_sub(kd))..j {
+                    sum -= a[at(i, k)] * a[at(j, k)];
                 }
-                a[at(i, i)] = sum.sqrt();
-            } else {
-                a[at(i, j)] = sum / a[at(j, j)];
+                if i == j {
+                    if !(sum > 0.0) || !sum.is_finite() {
+                        return None;
+                    }
+                    a[at(i, i)] = sum.sqrt();
+                } else {
+                    a[at(i, j)] = sum / a[at(j, j)];
+                }
             }
         }
+        Some(Self { a, n, kd })
     }
-    for i in 0..n {
-        let mut sum = b[i];
-        for k in i.saturating_sub(kd)..i {
-            sum -= a[at(i, k)] * b[k];
+
+    /// Overwrite `b` with `A^-1 b`.
+    pub fn solve_in_place(&self, b: &mut [f64]) {
+        let (n, kd, a) = (self.n, self.kd, &self.a);
+        let wd = kd + 1;
+        debug_assert_eq!(b.len(), n);
+        let at = |i: usize, j: usize| i * wd + kd + j - i;
+        for i in 0..n {
+            let mut sum = b[i];
+            for k in i.saturating_sub(kd)..i {
+                sum -= a[at(i, k)] * b[k];
+            }
+            b[i] = sum / a[at(i, i)];
         }
-        b[i] = sum / a[at(i, i)];
-    }
-    for i in (0..n).rev() {
-        let mut sum = b[i];
-        for k in i + 1..(i + wd).min(n) {
-            sum -= a[at(k, i)] * b[k];
+        for i in (0..n).rev() {
+            let mut sum = b[i];
+            for k in i + 1..(i + wd).min(n) {
+                sum -= a[at(k, i)] * b[k];
+            }
+            b[i] = sum / a[at(i, i)];
         }
-        b[i] = sum / a[at(i, i)];
     }
-    true
 }
 
 /// Largest eigenvalue of a small symmetric matrix (row-major `n x n`), by

@@ -106,12 +106,12 @@ estimate its background reference level.
 | `fp_per_mpx` | 16 | Expected false emitters per 10^6 pixels of pure noise; lower is stricter |
 | `slack` | `(1.0, 2.2)` | Searched and fitted widths, relative to `sigma` |
 
-Seeds are local maxima, over position and width, of an efficient score above
+Seeds are local maxima, over position and width, of an efficient score near
 a threshold u solved from `fp_per_mpx`. Every seed starts as an emitter of
 one Poisson model of the frame, with a bilinear background; an emitter stays
-only if removing it costs at least `u^2/2` dispersion-scaled nats with a free
-local level, and emitters are added where the residual asks for them.
-`fp_per_mpx` is an upper bound derived for Gaussian noise; see the
+only if removing it costs at least `u^2/2` dispersion-scaled nats with the
+background refitted, and emitters are added where the residual asks for
+them. `fp_per_mpx` is an upper bound derived for Gaussian noise; see the
 [multi-emitter method](docs/DETECTION.md) for when counts depart from it.
 
 Aguet instead takes `significance=0.05` (smaller is stricter), odd

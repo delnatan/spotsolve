@@ -1,8 +1,8 @@
 //! The distributional facts the detector needs.
 //!
 //! [`crate::detect::dispersion`] reads the pixel variance from the median
-//! of a squared fourth difference; [`scale_space_ec`] sets the count
-//! threshold from the false emitters pure noise produces.
+//! of a squared fourth difference; [`lkc`] and [`expected_ec`] set the
+//! count threshold from the false emitters pure noise produces.
 
 use std::f64::consts::PI;
 
@@ -11,30 +11,155 @@ use std::f64::consts::PI;
 /// comes out at. [`crate::detect::dispersion`] divides by it.
 pub const CHI2_1_MEDIAN: f64 = 0.454_936_423_119_572_8;
 
-/// Expected Euler characteristic, per pixel, of the excursion above `u` of
-/// the matched-filter field of white noise over position and width, widths
-/// `s` in `[s1, s2]` (profile standard deviations, px). At high `u` it is
-/// the expected number of its local maxima above `u`.
+/// Lipschitz-Killing curvatures, per pixel, of the space one emitter's
+/// likelihood ratio is maximized over: position, and log width over
+/// `[lo, hi]`. [`expected_ec`] turns them into a count.
+#[derive(Clone, Copy, Debug)]
+pub struct Lkc {
+    pub l1: f64,
+    pub l2: f64,
+    pub l3: f64,
+}
+
+/// Width samples of [`lkc`]'s integrals over log width.
+const LKC_WIDTHS: usize = 17;
+/// Centres per axis over a node cell (or a pixel) that [`lkc`] averages.
+const LKC_OFFSETS: usize = 8;
+/// Widths of profile, and node spacings, a 1-D window holds each side.
+const LKC_REACH: (f64, f64) = (6.0, 3.0);
+
+/// [`Lkc`] of the likelihood-ratio field of one emitter of width `s` in
+/// `[lo, hi]` (the fit's width bounds) against white noise, with a bilinear
+/// background on nodes `tile` px apart profiled out (`None`: a known
+/// background).
 ///
-/// With `tau = log s`, the field's metric is `(dx^2 + dy^2) / (2 s^2) +
-/// dtau^2` (a slab of hyperbolic space between two horospheres), and the
-/// Gaussian kinematic formula gives
+/// The field is `<h, r> / |h|` with `h = g - P g`: the pixel-integrated
+/// profile less its projection on the background. Its metric over
+/// `(y, x, tau = log s)` is the covariance of the unit field's derivatives,
+/// computed from 1-D sums since `g` and the tents separate. Averaged over a
+/// node cell, it is `f(tau)^2 (dy^2 + dx^2) + L_tt(tau) dtau^2`, and the
+/// Gaussian kinematic formula for that warped slab gives
 ///
 /// ```text
-/// EC = 1/4 (1/s1^2 - 1/s2^2) rho3 + 1/4 (1/s1^2 + 1/s2^2) rho2
-///    + 1/(8 pi) (1/s1^2 - 1/s2^2) rho1
+/// L3 = int sqrt(det Lambda) dtau
+/// L2 = (f(lo)^2 + f(hi)^2) / 2
+/// L1 = 1/(2 pi) int (df/dtau)^2 / sqrt(L_tt) dtau
 /// ```
 ///
-/// which for `s1 = s2` is the 2-D field's `rho2 / (2 s^2)`. It counts the
-/// maxima of the continuous field; sampling on the pixel lattice finds
-/// fewer where `s` is near a pixel.
-pub fn scale_space_ec(u: f64, s1: f64, s2: f64) -> f64 {
+/// With no background and `s` well above a pixel, `f^2 = 1/(2 s^2)` and
+/// `L_tt = 1`: the slab of hyperbolic space of the continuous Gaussian scale
+/// space. Profiling out the nodes shortens `|h|` more than its derivatives,
+/// so the field varies faster and has more maxima.
+pub fn lkc(lo: f64, hi: f64, tile: Option<usize>) -> Lkc {
+    let nt = if hi > lo { LKC_WIDTHS } else { 1 };
+    let taus: Vec<f64> = (0..nt).map(|j| lo.ln() + (hi / lo).ln() * j as f64 / (nt - 1).max(1) as f64).collect();
+    let period = tile.map_or(1.0, |t| t as f64);
+    let offs: Vec<f64> = (0..LKC_OFFSETS).map(|k| (k as f64 + 0.5) / LKC_OFFSETS as f64 * period).collect();
+    let (mut vol, mut face, mut ltt) = (vec![0.0; nt], vec![0.0; nt], vec![0.0; nt]);
+    for (j, &tau) in taus.iter().enumerate() {
+        let s = tau.exp();
+        let axes: Vec<AxisGram> = offs.iter().map(|&c| AxisGram::new(c, s, tile)).collect();
+        for gy in &axes {
+            for gx in &axes {
+                let lam = gy.metric(gx);
+                let det2 = lam[0][0] * lam[1][1] - lam[0][1] * lam[1][0];
+                let det3 = lam[0][0] * (lam[1][1] * lam[2][2] - lam[1][2] * lam[2][1])
+                    - lam[0][1] * (lam[1][0] * lam[2][2] - lam[1][2] * lam[2][0])
+                    + lam[0][2] * (lam[1][0] * lam[2][1] - lam[1][1] * lam[2][0]);
+                vol[j] += det3.max(0.0).sqrt();
+                face[j] += det2.max(0.0).sqrt();
+                ltt[j] += lam[2][2];
+            }
+        }
+        let n = (axes.len() * axes.len()) as f64;
+        vol[j] /= n;
+        face[j] /= n;
+        ltt[j] /= n;
+    }
+    let l2 = 0.5 * (face[0] + face[nt - 1]);
+    if nt == 1 {
+        return Lkc { l1: 0.0, l2, l3: 0.0 };
+    }
+    let dt = taus[1] - taus[0];
+    let f: Vec<f64> = face.iter().map(|v| v.sqrt()).collect();
+    let df = |j: usize| {
+        let (a, b) = (j.saturating_sub(1), (j + 1).min(nt - 1));
+        (f[b] - f[a]) / ((b - a) as f64 * dt)
+    };
+    let trap = |v: &dyn Fn(usize) -> f64| dt * ((0..nt).map(v).sum::<f64>() - 0.5 * (v(0) + v(nt - 1)));
+    Lkc { l1: trap(&|j| df(j).powi(2) / ltt[j].sqrt()) / (2.0 * PI), l2, l3: trap(&|j| vol[j]) }
+}
+
+/// Expected Euler characteristic, per pixel, of the excursion above `u` of
+/// a unit Gaussian field with curvatures `l`. At high `u` it is the
+/// expected number of local maxima above `u`.
+pub fn expected_ec(u: f64, l: &Lkc) -> f64 {
     let e = (-0.5 * u * u).exp();
     let rho1 = e / (2.0 * PI);
     let rho2 = u * e / (2.0 * PI).powf(1.5);
     let rho3 = (u * u - 1.0) * e / (4.0 * PI * PI);
-    let (a, b) = (1.0 / (s1 * s1), 1.0 / (s2 * s2));
-    0.25 * (a - b) * rho3 + 0.25 * (a + b) * rho2 + (a - b) / (8.0 * PI) * rho1
+    l.l3 * rho3 + l.l2 * rho2 + l.l1 * rho1
+}
+
+/// Along one axis, for a profile centred at `c` of width `s`: the Gram
+/// matrices of `v = (E, dE/dc, s dE/ds)` plain (`g`) and through the
+/// projection on the tents (`p`).
+struct AxisGram {
+    g: [[f64; 3]; 3],
+    p: [[f64; 3]; 3],
+}
+
+impl AxisGram {
+    fn new(c: f64, s: f64, tile: Option<usize>) -> Self {
+        let reach = LKC_REACH.0 * s + tile.map_or(0.0, |t| LKC_REACH.1 * t as f64);
+        let (t0, t1) = ((c - reach).floor() as i64, (c + reach).ceil() as i64);
+        let ax: Vec<f64> = (t0..=t1).map(|v| v as f64).collect();
+        let n = ax.len();
+        let (mut e, mut de, mut ds) = (vec![0.0; n], vec![0.0; n], vec![0.0; n]);
+        crate::psf::factors_axis_sigma(&ax, &[c], s, &mut e, &mut de, &mut ds);
+        let et: Vec<f64> = ds.iter().map(|v| v * s).collect();
+        let v = [e, de, et];
+        let dot = |a: &[f64], b: &[f64]| a.iter().zip(b).map(|(x, y)| x * y).sum::<f64>();
+        let g = std::array::from_fn(|i| std::array::from_fn(|j| dot(&v[i], &v[j])));
+        let Some(tile) = tile else { return Self { g, p: [[0.0; 3]; 3] } };
+        // Tents at multiples of `tile` that reach the window.
+        let tl = tile as f64;
+        let (j0, j1) = ((ax[0] / tl).floor() as i64, (ax[n - 1] / tl).ceil() as i64);
+        let tent = |j: i64, x: f64| (1.0 - (x - j as f64 * tl).abs() / tl).max(0.0);
+        let nodes: Vec<i64> = (j0..=j1).collect();
+        let k = nodes.len();
+        let mut m = vec![0.0; k * k];
+        for (a, &ja) in nodes.iter().enumerate() {
+            for (b, &jb) in nodes.iter().enumerate() {
+                m[a * k + b] = ax.iter().map(|&x| tent(ja, x) * tent(jb, x)).sum();
+            }
+        }
+        let mut chol = crate::linalg::Chol::new(k);
+        assert!(chol.factor(&m, k), "tent Gram is positive definite");
+        let tv: Vec<Vec<f64>> = v.iter().map(|vi| nodes.iter().map(|&j| dot(vi, &ax.iter().map(|&x| tent(j, x)).collect::<Vec<_>>())).collect()).collect();
+        let mut x = vec![0.0; k];
+        let mut p = [[0.0; 3]; 3];
+        for j in 0..3 {
+            chol.solve(&tv[j], &mut x);
+            for i in 0..3 {
+                p[i][j] = dot(&tv[i], &x);
+            }
+        }
+        Self { g, p }
+    }
+
+    /// Covariance of the unit field's derivatives by `(y, x, tau)`, with
+    /// `self` the y axis and `gx` the x axis. The 2-D vectors are sums of
+    /// outer products `a (x) b`, and `<a (x) b, (I - P) (c (x) d)> =
+    /// g_y[a][c] g_x[b][d] - p_y[a][c] p_x[b][d]`.
+    fn metric(&self, gx: &AxisGram) -> [[f64; 3]; 3] {
+        let k = |(a, b): (usize, usize), (c, d): (usize, usize)| self.g[a][c] * gx.g[b][d] - self.p[a][c] * gx.p[b][d];
+        // h, d/dy, d/dx, d/dtau as sums of (y factor, x factor).
+        let dirs: [&[(usize, usize)]; 4] = [&[(0, 0)], &[(1, 0)], &[(0, 1)], &[(2, 0), (0, 2)]];
+        let ip = |i: usize, j: usize| dirs[i].iter().map(|&a| dirs[j].iter().map(|&b| k(a, b)).sum::<f64>()).sum::<f64>();
+        let nn = ip(0, 0);
+        std::array::from_fn(|i| std::array::from_fn(|j| ip(i + 1, j + 1) / nn - ip(i + 1, 0) * ip(j + 1, 0) / (nn * nn)))
+    }
 }
 
 #[cfg(test)]
@@ -47,13 +172,32 @@ mod tests {
         assert!((libm::erf((CHI2_1_MEDIAN / 2.0).sqrt()) - 0.5).abs() < 1e-15);
     }
 
+    /// The continuous Gaussian scale space over `[s1, s2]` (profile
+    /// standard deviations): a slab of hyperbolic space.
+    fn hyperbolic_ec(u: f64, s1: f64, s2: f64) -> f64 {
+        let (a, b) = (1.0 / (s1 * s1), 1.0 / (s2 * s2));
+        let l = Lkc { l3: 0.25 * (a - b), l2: 0.25 * (a + b), l1: (a - b) / (8.0 * PI) };
+        expected_ec(u, &l)
+    }
+
     #[test]
-    fn one_width_is_the_two_dimensional_field() {
-        for (u, s) in [(3.0f64, 1.0f64), (4.5, 1.7)] {
-            let flat = u * (-0.5 * u * u).exp() / ((2.0 * PI).powf(1.5) * 2.0 * s * s);
-            assert!((scale_space_ec(u, s, s) / flat - 1.0).abs() < 1e-12);
+    fn with_a_known_background_the_curvatures_are_the_gaussian_scale_space() {
+        let sd = |s: f64| (s * s + 1.0 / 12.0).sqrt();
+        for (lo, hi) in [(1.5, 1.5), (1.5, 3.3), (2.0, 4.4)] {
+            let l = lkc(lo, hi, None);
+            for u in [3.5, 4.5] {
+                let r = expected_ec(u, &l) / hyperbolic_ec(u, sd(lo), sd(hi));
+                assert!((r - 1.0).abs() < 2e-3, "lo {lo} hi {hi} u {u}: ratio {r}");
+            }
         }
-        // Searching more widths can only find more maxima.
-        assert!(scale_space_ec(4.0, 1.0, 2.0) > scale_space_ec(4.0, 1.0, 1.0));
+    }
+
+    #[test]
+    fn profiling_out_the_background_adds_maxima() {
+        let known = expected_ec(4.0, &lkc(2.0, 4.4, None));
+        let tiles = |t: usize| expected_ec(4.0, &lkc(2.0, 4.4, Some(t)));
+        // Finer nodes take more of the profile, and the field left has
+        // more maxima; nodes far coarser than the profile take nothing.
+        assert!(tiles(36) > known && tiles(18) > tiles(36) && tiles(400) / known < 1.01);
     }
 }

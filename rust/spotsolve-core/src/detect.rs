@@ -2,11 +2,12 @@
 //!
 //! 1. Background: a [`BG_WIN`] median of the frame rounded to whole ADU;
 //!    dispersion `phi`: one scalar from the fourth difference.
-//! 2. Seeds: local maxima over position and width of the efficient score
-//!    for one emitter against that background, with z > u, on a bank of
-//!    widths spanning the fit's bounds ([`widths`]). u is solved from
-//!    `fp_per_mpx`, the expected false emitters per 10^6 noise pixels
-//!    ([`threshold`]). Each seed becomes one emitter ([`start`]).
+//! 2. Seeds: local maxima over position and width of the score for one
+//!    emitter against the nodes fitted to that background ([`score_map`]),
+//!    on a bank of widths spanning the fit's bounds ([`widths`]), above u
+//!    less what that grid can miss of a maximum ([`proposal_factor`]). u is
+//!    solved from `fp_per_mpx`, the expected false emitters per 10^6 noise
+//!    pixels ([`threshold`]). Each seed becomes one emitter ([`start`]).
 //! 3. The joint model ([`Model`]) fits them together with a node
 //!    background, removes those not worth `u^2 / 2` nats and adds where the
 //!    residual asks for more.
@@ -107,17 +108,16 @@ pub fn widths(s: &Settings) -> Vec<f64> {
 
 /// Score threshold u giving `fp_per_mpx` expected noise false emitters.
 /// An emitter survives on noise when its likelihood ratio, maximized over
-/// position and width, reaches `u^2 / 2`: a maximum of the matched-filter
-/// field over position and width above u. Their expected number is
-/// [`statistics::scale_space_ec`] over the fit's width bounds (profile
-/// variance `s^2 + 1/12` with pixel integration), so the count is at most
-/// `fp_per_mpx`. Solved on `u >= 1`, where the rate decreases, by
+/// position and width with the background nodes profiled out, reaches
+/// `u^2 / 2`: a maximum above u of that ratio's signed root, a Gaussian
+/// field over position and log width. Their expected number is the field's
+/// expected Euler characteristic ([`statistics::lkc`]), so the count is at
+/// most `fp_per_mpx`. Solved on `u >= 1`, where the rate decreases, by
 /// bisection.
 pub fn threshold(s: &Settings) -> f64 {
-    let sd = |k: f64| ((k * s.sigma).powi(2) + 1.0 / 12.0).sqrt();
-    let (s1, s2) = (sd(s.slack.0), sd(s.slack.1));
+    let l = statistics::lkc(s.slack.0 * s.sigma, s.slack.1 * s.sigma, Some(model::tile(s)));
     let fp_per_mpx = s.fp_per_mpx;
-    let rate = |u: f64| 1e6 * statistics::scale_space_ec(u, s1, s2);
+    let rate = |u: f64| 1e6 * statistics::expected_ec(u, &l);
     let (mut lo, mut hi) = (1.0, 40.0);
     if rate(lo) <= fp_per_mpx {
         return lo;
@@ -255,37 +255,80 @@ pub(crate) fn psf_kernel1d(sigma: f64) -> Vec<f64> {
     k
 }
 
-/// Separable 2-D correlation `ky (x) kx` with symmetric kernels.
-fn sep(src: &[f64], h: usize, w: usize, ky: &[f64], kx: &[f64], mode: Mode) -> Vec<f64> {
-    let mut a = vec![0.0; h * w];
-    let mut b = vec![0.0; h * w];
-    filters::convolve1d(src, &mut a, h, w, ky, 0, mode);
-    filters::convolve1d(&a, &mut b, h, w, kx, 1, mode);
-    b
+/// Frame-wide score z of one emitter of width `sigma` against the bilinear
+/// background on nodes `tile` px apart: the correlation of `r = d - B` (`B`
+/// the fitted nodes) with the profile `g`, over
+/// `sqrt(var |g - P g|^2)`, `P` the projection on the nodes' tents. That is
+/// the signed root of the likelihood ratio with the nodes profiled out, the
+/// statistic the count decisions test, taking `var` as constant across the
+/// profile. The frame has no pixels beyond its edge.
+pub fn score_map(r: &[f64], var: &[f64], h: usize, w: usize, sigma: f64, tile: usize) -> Vec<f64> {
+    let k1 = psf_kernel1d(sigma);
+    let c = model::blur(r, h, w, &k1, (0, h, 0, w));
+    let (ny, py) = axis_norms(&k1, h, tile);
+    let (nx, px) = axis_norms(&k1, w, tile);
+    (0..h * w)
+        .map(|i| {
+            let (y, x) = (i / w, i % w);
+            let n = (ny[y] * nx[x] - py[y] * px[x]).max(1e-12);
+            c[i] / (var[i] * n).max(1e-12).sqrt()
+        })
+        .collect()
 }
 
-/// Frame-wide K = 0 score z, blind to a local constant level: correlation
-/// of `r = d - background` with the zero-mean kernel `k = g - mean(g)`,
-/// over `sqrt(var * sum k^2)`. `var` is the pixel variance, taken as
-/// constant across the kernel: it follows the background, which is flat on
-/// that scale. A separable filter and a box sum.
-pub fn detection_map(r: &[f64], var: &[f64], h: usize, w: usize, sigma: f64) -> Vec<f64> {
-    let k1 = psf_kernel1d(sigma);
-    let n = k1.len();
-    let s1: f64 = k1.iter().sum();
-    let s2: f64 = k1.iter().map(|v| v * v).sum();
-    let c = s1 * s1 / (n * n) as f64;
-    // sum (k - c)^2 = sum k^2 - (sum k)^2 / n^2 over the n x n window.
-    let kk = s2 * s2 - c * s1 * s1;
-    let rg = sep(r, h, w, &k1, &k1, Mode::Reflect);
-    let rb = filters::uniform_filter(r, h, w, n, Mode::Reflect);
-    let box_n = (n * n) as f64;
-    (0..h * w).map(|i| (rg[i] - c * box_n * rb[i]) / (var[i] * kk).max(1e-12).sqrt()).collect()
+/// Along an axis of `n` pixels, for the profile `k1` centred on each pixel
+/// and cut at the edges: `|e|^2` and `e^T P e`, `P` the projection on the
+/// tents of nodes `tile` apart ([`model::Nodes`]).
+fn axis_norms(k1: &[f64], n: usize, tile: usize) -> (Vec<f64>, Vec<f64>) {
+    let rad = k1.len() / 2;
+    let nn = (n.max(1) - 1).div_ceil(tile) + 1;
+    let tent = |j: usize, t: usize| if nn == 1 { 1.0 } else { (1.0 - (t as f64 / tile as f64 - j as f64).abs()).max(0.0) };
+    let mut gram = vec![0.0; nn * nn];
+    for t in 0..n {
+        let j = (t / tile).min(nn.saturating_sub(2));
+        for a in j..(j + 2).min(nn) {
+            for b in j..(j + 2).min(nn) {
+                gram[a * nn + b] += tent(a, t) * tent(b, t);
+            }
+        }
+    }
+    let mut chol = Chol::new(nn);
+    let ok = chol.factor(&gram, nn);
+    let (mut norm, mut proj) = (vec![0.0; n], vec![0.0; n]);
+    let (mut tv, mut x) = (vec![0.0; nn], vec![0.0; nn]);
+    for ctr in 0..n {
+        tv.fill(0.0);
+        let (t0, t1) = (ctr.saturating_sub(rad), (ctr + rad + 1).min(n));
+        for t in t0..t1 {
+            let v = k1[t + rad - ctr];
+            norm[ctr] += v * v;
+            let j = (t / tile).min(nn.saturating_sub(2));
+            for a in j..(j + 2).min(nn) {
+                tv[a] += tent(a, t) * v;
+            }
+        }
+        if ok {
+            chol.solve(&tv, &mut x);
+            proj[ctr] = tv.iter().zip(&x).map(|(a, b)| a * b).sum();
+        }
+    }
+    (norm, proj)
+}
+
+/// Fraction of its continuous maximum the score keeps where the template
+/// grid samples it worst: half a pixel off in y and x, which to second
+/// order loses `Lambda / 4` of it (`Lambda = 1 / (2 s^2)` the field's
+/// curvature, `s^2` the profile variance), and midway between two widths
+/// [`WIDTH_STEP`] apart. Proposals are taken at `u` times this, so none a
+/// test at `u` would keep is missed; the likelihood ratio decides.
+pub fn proposal_factor(s: f64) -> f64 {
+    let lambda = 0.5 / (s * s + 1.0 / 12.0);
+    (1.0 - 0.25 * lambda) * 2.0 * WIDTH_STEP.sqrt() / (1.0 + WIDTH_STEP)
 }
 
 /// Local maxima over position and width of the score maps `z` (one per
-/// width of `widths`) with z > u, as `(pixel, width index)`, strongest
-/// first. A maximum at width `j` tops its `2 ceil(s_j) + 1` window and the
+/// width of `widths`) with z above `u` times [`proposal_factor`], as
+/// `(pixel, width index)`, strongest first. A maximum at width `j` tops its `2 ceil(s_j) + 1` window and the
 /// adjacent widths' windows at the same pixel.
 pub fn find_seeds(z: &[Vec<f64>], widths: &[f64], h: usize, w: usize, u: f64) -> Vec<(usize, usize)> {
     let mx: Vec<Vec<f64>> = z
@@ -298,7 +341,7 @@ pub fn find_seeds(z: &[Vec<f64>], widths: &[f64], h: usize, w: usize, u: f64) ->
         .flat_map(|j| (0..h * w).map(move |i| (i, j)))
         .filter(|&(i, j)| {
             let v = z[j][i];
-            v > u && v == mx[j][i] && (j == 0 || v >= mx[j - 1][i]) && (j + 1 == n || v >= mx[j + 1][i])
+            v > u * proposal_factor(widths[j]) && v == mx[j][i] && (j == 0 || v >= mx[j - 1][i]) && (j + 1 == n || v >= mx[j + 1][i])
         })
         .collect();
     seeds.sort_by(|a, b| z[b.1][b.0].total_cmp(&z[a.1][a.0]));
@@ -387,18 +430,25 @@ pub struct Start {
 }
 
 /// Seeds as emitters: local maxima over position and width of the score
-/// against the median background with z > u, strongest first, each at its
-/// template's width. `roi` (same shape as `d`) limits seeds. Seeds are
+/// ([`score_map`]) against the nodes fitted to the median background, above
+/// `u` times [`proposal_factor`],
+/// strongest first, each at its template's width. `roi` (same shape as `d`) limits seeds. Seeds are
 /// proposals; the joint model's removal test decides them.
 pub fn start(d: &[f64], h: usize, w: usize, roi: Option<&[bool]>, s: &Settings) -> Start {
     assert_eq!(d.len(), h * w);
     let u = threshold(s);
     let bmap = median_background(d, h, w);
     let phi = dispersion(d, h, w);
-    let resid: Vec<f64> = d.iter().zip(&bmap).map(|(a, b)| a - b).collect();
-    let var: Vec<f64> = bmap.iter().map(|b| phi * b.max(BG_FLOOR)).collect();
+    // The nodes fitted to the median, which the emitters barely move: the
+    // background with every emitter in the model, as the score assumes.
+    let tile = model::tile(s);
+    let mut nodes = model::Nodes::new(h, w, tile);
+    nodes.fit_map(&bmap);
+    let bg = nodes.surface();
+    let resid: Vec<f64> = d.iter().zip(&bg).map(|(a, b)| a - b).collect();
+    let var: Vec<f64> = bg.iter().map(|b| phi * b.max(BG_FLOOR)).collect();
     let ws = widths(s);
-    let z: Vec<Vec<f64>> = ws.iter().map(|&sj| detection_map(&resid, &var, h, w, sj)).collect();
+    let z: Vec<Vec<f64>> = ws.iter().map(|&sj| score_map(&resid, &var, h, w, sj, tile)).collect();
     let ems = find_seeds(&z, &ws, h, w, u)
         .into_iter()
         .filter(|&(i, _)| roi.is_none_or(|m| m[i]))
@@ -456,8 +506,7 @@ pub fn localize(d: &[f64], h: usize, w: usize, roi: Option<&[bool]>, s: &Setting
 
 /// Output rows for the model's emitters, in its order, shifted by
 /// `(oy, ox)` into an `h x w` frame. SEs come from each final group's
-/// Fisher information with a free local level: the nodes are estimated
-/// too, and a free level is the conservative stand-in for that.
+/// Fisher information with the background nodes profiled out.
 fn report(md: &Model, oy: usize, ox: usize, h: usize, w: usize) -> Output {
     let n = md.ems.len();
     let mut out = Output {
@@ -525,7 +574,7 @@ fn store_uncertainties(
     let p = var.len();
     for (j, &i) in indices.iter().enumerate() {
         for c in 0..4 {
-            let q = 1 + 4 * j + c;
+            let q = 4 * j + c;
             let dst = 4 * i as usize + c;
             let (v, f) = (var[q], fisher[q * p + q]);
             se[dst] = if v.is_finite() && v > 0.0 { v.sqrt() } else { f64::NAN };
@@ -607,12 +656,12 @@ mod tests {
     }
 
     #[test]
-    fn the_threshold_solves_the_scale_space_rate() {
+    fn the_threshold_solves_the_expected_rate() {
         for (sigma, fp) in [(1.0, 2.0), (1.45, 16.0), (2.0, 100.0)] {
             let s = Settings { sigma, fp_per_mpx: fp, slack: SLACK };
             let u = threshold(&s);
-            let sd = |k: f64| ((k * sigma).powi(2) + 1.0 / 12.0).sqrt();
-            let rate = 1e6 * statistics::scale_space_ec(u, sd(SLACK.0), sd(SLACK.1));
+            let l = statistics::lkc(SLACK.0 * sigma, SLACK.1 * sigma, Some(model::tile(&s)));
+            let rate = 1e6 * statistics::expected_ec(u, &l);
             assert!((rate / fp - 1.0).abs() < 1e-9, "sigma {sigma}: rate {rate}");
         }
     }
@@ -642,14 +691,14 @@ mod tests {
         // Two emitter fluxes correlated through the information matrix;
         // everything else is independent. Each flux retains 1-rho^2 of its
         // conditional information after the other flux is allowed to vary.
-        let p = 9;
+        let p = 8;
         let rho = 0.99;
         for order in [[0u32, 1], [1, 0]] {
-            for scale in [[1.0; 9], [0.01, 1e-3, 2.0, 3.0, 4.0, 1e3, 5.0, 6.0, 7.0]] {
+            for scale in [[1.0; 8], [1e-3, 2.0, 3.0, 4.0, 1e3, 5.0, 6.0, 7.0]] {
                 let mut f = vec![0.0; p * p];
                 for q in 0..p { f[q * p + q] = scale[q] * scale[q]; }
-                f[p + 5] = rho * scale[1] * scale[5];
-                f[5 * p + 1] = f[p + 5];
+                f[4] = rho * scale[0] * scale[4];
+                f[4 * p] = f[4];
                 let mut chol = Chol::new(p);
                 assert!(chol.factor(&f, p));
                 let mut var = vec![0.0; p];
