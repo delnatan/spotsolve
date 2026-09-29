@@ -104,13 +104,15 @@ estimate its background reference level.
 | Multi-emitter setting | Default | Effect |
 |---|---|---|
 | `fp_per_mpx` | 16 | Expected false emitters per 10^6 pixels of pure noise; lower is stricter |
-| `slack` | `(0.7, 2.2)` | Allowed fitted widths, relative to `sigma` |
+| `slack` | `(1.0, 2.2)` | Searched and fitted widths, relative to `sigma` |
 
-Seeds are local maxima of an efficient score above a threshold u solved from
-`fp_per_mpx`. Every seed starts as an emitter of one Poisson model of the
-frame, with a bilinear background; an emitter stays only if removing it costs
-at least `u^2/2` dispersion-scaled nats, and emitters are added where the
-residual asks for them. See the [multi-emitter method](docs/DETECTION.md).
+Seeds are local maxima, over position and width, of an efficient score above
+a threshold u solved from `fp_per_mpx`. Every seed starts as an emitter of
+one Poisson model of the frame, with a bilinear background; an emitter stays
+only if removing it costs at least `u^2/2` dispersion-scaled nats with a free
+local level, and emitters are added where the residual asks for them.
+`fp_per_mpx` is an upper bound derived for Gaussian noise; see the
+[multi-emitter method](docs/DETECTION.md) for when counts depart from it.
 
 Aguet instead takes `significance=0.05` (smaller is stricter), odd
 `boxsize=9`, and `itermax=50`. It applies no width-reporting band. Its Poisson
@@ -145,11 +147,12 @@ and reproduction commands.
 
 ## Choose a detection width
 
-`sigma` is an approximate search scale, not an exact width shared by every
-emitter. Each spot's width is fitted; the multi-emitter fit uses the bounds
-`slack * sigma`. Inspect a `fit_sigma` histogram from the first frame or a
-few frames to choose a representative scale. Aguet provides a cheap initial
-pass when spots are sufficiently isolated:
+`sigma` is the in-focus PSF width: the narrowest a spot can be. Each spot's
+width is fitted within `slack * sigma`, by default `sigma` to `2.2 sigma`, so
+defocused spots are searched for and fitted at their own width. Inspect a
+`fit_sigma` histogram from the first frame or a few frames and take `sigma`
+from its narrow, in-focus mode. Aguet provides a cheap initial pass when
+spots are sufficiently isolated:
 
 ```python
 import numpy as np
@@ -164,8 +167,9 @@ Choose from the main isolated-spot population rather than automatically
 averaging broad objects and overlaps. In crowded images, use an isolated ROI
 or the joint detector for this inspection. Aguet's sampled-Gaussian widths
 differ slightly from integrated widths; an approximate starting scale does
-not need an exact conversion. If fitted widths reach the optimization bounds,
-reconsider `sigma` or `slack`. There is no separate width-calibration API.
+not need an exact conversion. Many fits at the lower bound mean `sigma` is
+set too wide; to admit narrower fits, lower `slack[0]`, at the cost of a
+stricter threshold. There is no separate width-calibration API.
 
 ## Link detections
 

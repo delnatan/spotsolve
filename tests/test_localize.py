@@ -173,7 +173,9 @@ def test_narrow_broad_and_bright_sources_keep_their_measurements():
     theta = psf.pack_var_sigma(30., flux, truth[:, 0], truth[:, 1], widths)
     mean = psf.model_var_sigma(theta, yy, xx)
     image = np.random.default_rng(73).poisson(mean).astype(float)
-    result = L.localize(image, 1.0)
+    # The default bounds stop at the in-focus width; a source narrower than
+    # `sigma` needs a lower bound that admits it.
+    result = L.localize(image, 1.0, slack=(0.6, 2.2))
     distance, found = cKDTree(result.positions).query(truth)
     assert np.all(distance < .1)
     np.testing.assert_allclose(result.amplitudes[found], flux, rtol=.05)

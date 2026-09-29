@@ -2,8 +2,9 @@
 //!
 //! 1. Background: a [`BG_WIN`] median of the frame rounded to whole ADU;
 //!    dispersion `phi`: one scalar from the fourth difference.
-//! 2. Seeds: local maxima of the efficient score for one reference-width
-//!    emitter against that background, with z > u. u is solved from
+//! 2. Seeds: local maxima over position and width of the efficient score
+//!    for one emitter against that background, with z > u, on a bank of
+//!    widths spanning the fit's bounds ([`widths`]). u is solved from
 //!    `fp_per_mpx`, the expected false emitters per 10^6 noise pixels
 //!    ([`threshold`]). Each seed becomes one emitter ([`start`]).
 //! 3. The joint model ([`Model`]) fits them together with a node
@@ -18,16 +19,12 @@ use crate::psf;
 use crate::statistics;
 
 /// Optimization bounds for fitted widths, as multiples of `sigma`.
-pub const SLACK: (f64, f64) = (0.70, 2.2);
+pub const SLACK: (f64, f64) = (1.0, 2.2);
 /// Default count knob: expected false emitters per 10^6 pixels of pure noise.
 pub const FP_PER_MPX: f64 = 16.0;
-/// Noise false emitters per Mpx = RFT_C * u * exp(-u^2/2) / sigma. The seeds
-/// follow the Euler-characteristic density of the smoothed field (1/sigma^2);
-/// the fit then lets each one choose position and width, and what survives
-/// falls as 1/sigma. The constant is measured on Poisson noise; the rate
-/// holds within 3% for sigma 1.0-1.45 at the default target and overshoots
-/// for wide PSFs at strict targets.
-pub const RFT_C: f64 = 0.98 * 1e6 / (2.0 * 15.749_609_945_722_419);
+/// Width ratio of adjacent seed templates: an emitter between two keeps at
+/// least `2 sqrt(r) / (1 + r)` = 98% of its score.
+pub const WIDTH_STEP: f64 = 1.5;
 /// sigma. An add round places emitters within this of a group member.
 pub const OWN: f64 = 4.0;
 /// sigma. Context beyond the placement radius, so an emitter placed at its
@@ -100,11 +97,27 @@ pub struct Output {
     pub kappa: f64,
 }
 
-/// Score threshold u giving `fp_per_mpx` expected noise false emitters:
-/// solves `RFT_C * u * exp(-u^2/2) / sigma = fp_per_mpx` on `u >= 1`,
-/// where the left side decreases, by bisection.
-pub fn threshold(sigma: f64, fp_per_mpx: f64) -> f64 {
-    let rate = |u: f64| RFT_C * u * (-0.5 * u * u).exp() / sigma;
+/// The seed templates' widths: geometric from `slack.0 * sigma` to
+/// `slack.1 * sigma`, adjacent ones at most [`WIDTH_STEP`] apart.
+pub fn widths(s: &Settings) -> Vec<f64> {
+    let (lo, hi) = (s.slack.0 * s.sigma, s.slack.1 * s.sigma);
+    let n = ((hi / lo).ln() / WIDTH_STEP.ln() - 1e-9).ceil().max(0.0) as usize + 1;
+    (0..n).map(|j| if n == 1 { lo } else { lo * (hi / lo).powf(j as f64 / (n - 1) as f64) }).collect()
+}
+
+/// Score threshold u giving `fp_per_mpx` expected noise false emitters.
+/// An emitter survives on noise when its likelihood ratio, maximized over
+/// position and width, reaches `u^2 / 2`: a maximum of the matched-filter
+/// field over position and width above u. Their expected number is
+/// [`statistics::scale_space_ec`] over the fit's width bounds (profile
+/// variance `s^2 + 1/12` with pixel integration), so the count is at most
+/// `fp_per_mpx`. Solved on `u >= 1`, where the rate decreases, by
+/// bisection.
+pub fn threshold(s: &Settings) -> f64 {
+    let sd = |k: f64| ((k * s.sigma).powi(2) + 1.0 / 12.0).sqrt();
+    let (s1, s2) = (sd(s.slack.0), sd(s.slack.1));
+    let fp_per_mpx = s.fp_per_mpx;
+    let rate = |u: f64| 1e6 * statistics::scale_space_ec(u, s1, s2);
     let (mut lo, mut hi) = (1.0, 40.0);
     if rate(lo) <= fp_per_mpx {
         return lo;
@@ -252,37 +265,44 @@ fn sep(src: &[f64], h: usize, w: usize, ky: &[f64], kx: &[f64], mode: Mode) -> V
 }
 
 /// Frame-wide K = 0 score z, blind to a local constant level: correlation
-/// of `r = d - background` with the zero-mean kernel `g - mean(g)`, over
-/// the square root of `var` correlated with its square. Both expand into
-/// separable filters and box sums.
+/// of `r = d - background` with the zero-mean kernel `k = g - mean(g)`,
+/// over `sqrt(var * sum k^2)`. `var` is the pixel variance, taken as
+/// constant across the kernel: it follows the background, which is flat on
+/// that scale. A separable filter and a box sum.
 pub fn detection_map(r: &[f64], var: &[f64], h: usize, w: usize, sigma: f64) -> Vec<f64> {
     let k1 = psf_kernel1d(sigma);
-    let k2: Vec<f64> = k1.iter().map(|v| v * v).collect();
-    let ones = vec![1.0; k1.len()];
+    let n = k1.len();
     let s1: f64 = k1.iter().sum();
-    let c = s1 * s1 / (k1.len() * k1.len()) as f64;
+    let s2: f64 = k1.iter().map(|v| v * v).sum();
+    let c = s1 * s1 / (n * n) as f64;
+    // sum (k - c)^2 = sum k^2 - (sum k)^2 / n^2 over the n x n window.
+    let kk = s2 * s2 - c * s1 * s1;
     let rg = sep(r, h, w, &k1, &k1, Mode::Reflect);
-    let rb = sep(r, h, w, &ones, &ones, Mode::Reflect);
-    let vg2 = sep(var, h, w, &k2, &k2, Mode::Reflect);
-    let vg = sep(var, h, w, &k1, &k1, Mode::Reflect);
-    let vb = sep(var, h, w, &ones, &ones, Mode::Reflect);
-    (0..h * w)
-        .map(|i| {
-            let num = rg[i] - c * rb[i];
-            let den = vg2[i] - 2.0 * c * vg[i] + c * c * vb[i];
-            num / den.max(1e-12).sqrt()
-        })
-        .collect()
+    let rb = filters::uniform_filter(r, h, w, n, Mode::Reflect);
+    let box_n = (n * n) as f64;
+    (0..h * w).map(|i| (rg[i] - c * box_n * rb[i]) / (var[i] * kk).max(1e-12).sqrt()).collect()
 }
 
-/// Local maxima of `z` over a `2 ceil(sigma) + 1` window with z > u, as
-/// pixel indices, strongest first.
-pub fn find_seeds(z: &[f64], h: usize, w: usize, sigma: f64, u: f64) -> Vec<usize> {
-    let win = 2 * sigma.ceil() as usize + 1;
-    let mx = filters::maximum_filter(z, h, w, win, Mode::Reflect);
-    let mut s: Vec<usize> = (0..h * w).filter(|&i| z[i] == mx[i] && z[i] > u).collect();
-    s.sort_by(|&a, &b| z[b].total_cmp(&z[a]));
-    s
+/// Local maxima over position and width of the score maps `z` (one per
+/// width of `widths`) with z > u, as `(pixel, width index)`, strongest
+/// first. A maximum at width `j` tops its `2 ceil(s_j) + 1` window and the
+/// adjacent widths' windows at the same pixel.
+pub fn find_seeds(z: &[Vec<f64>], widths: &[f64], h: usize, w: usize, u: f64) -> Vec<(usize, usize)> {
+    let mx: Vec<Vec<f64>> = z
+        .iter()
+        .zip(widths)
+        .map(|(zj, s)| filters::maximum_filter(zj, h, w, 2 * s.ceil() as usize + 1, Mode::Reflect))
+        .collect();
+    let n = z.len();
+    let mut seeds: Vec<(usize, usize)> = (0..n)
+        .flat_map(|j| (0..h * w).map(move |i| (i, j)))
+        .filter(|&(i, j)| {
+            let v = z[j][i];
+            v > u && v == mx[j][i] && (j == 0 || v >= mx[j - 1][i]) && (j + 1 == n || v >= mx[j + 1][i])
+        })
+        .collect();
+    seeds.sort_by(|a, b| z[b.1][b.0].total_cmp(&z[a.1][a.0]));
+    seeds
 }
 
 /// Whether the emitter's support crosses a physical frame edge.
@@ -300,11 +320,12 @@ pub(crate) fn at_bound(value: f64, lo: f64, hi: f64) -> bool {
 }
 
 /// Context needed around an ROI: an add-round box around any seed
-/// (`(OWN + SUPPORT) sigma`), plus the median window and score kernel that
-/// seed's background and z read.
-fn crop_margin(sigma: f64) -> usize {
-    let kernel = (4.0 * sigma).ceil() as usize + sigma.ceil() as usize;
-    let pad = ((OWN + SUPPORT) * sigma).ceil() as usize;
+/// (`(OWN + SUPPORT) sigma`), plus the median window and the widest score
+/// kernel that seed's background and z read.
+fn crop_margin(s: &Settings) -> usize {
+    let wide = s.slack.1 * s.sigma;
+    let kernel = (4.0 * wide).ceil() as usize + wide.ceil() as usize;
+    let pad = ((OWN + SUPPORT) * s.sigma).ceil() as usize;
     pad.max(kernel) + 1 + BG_WIN / 2 + 2
 }
 
@@ -323,7 +344,7 @@ fn widen(lo: usize, hi: usize, want: usize, n: usize) -> (usize, usize) {
 /// The ROI's bounding box plus [`crop_margin`], at least `3 * BG_WIN` a
 /// side where the frame allows, so the scalar dispersion has pixels to read.
 /// `None` when the ROI selects no pixel.
-fn roi_crop(roi: &[bool], h: usize, w: usize, sigma: f64) -> Option<Rect> {
+fn roi_crop(roi: &[bool], h: usize, w: usize, s: &Settings) -> Option<Rect> {
     let (mut y0, mut y1) = (usize::MAX, 0usize);
     let (mut x0, mut x1) = (usize::MAX, 0usize);
     for r in 0..h {
@@ -339,7 +360,7 @@ fn roi_crop(roi: &[bool], h: usize, w: usize, sigma: f64) -> Option<Rect> {
     if y0 == usize::MAX {
         return None;
     }
-    let m = crop_margin(sigma);
+    let m = crop_margin(s);
     let side = 3 * BG_WIN;
     let (y0, y1) = widen(y0.saturating_sub(m), (y1 + m).min(h), side, h);
     let (x0, x1) = widen(x0.saturating_sub(m), (x1 + m).min(w), side, w);
@@ -365,22 +386,23 @@ pub struct Start {
     pub u: f64,
 }
 
-/// Seeds as emitters: local maxima of the score against the median
-/// background with z > u, strongest first. `roi` (same shape as `d`) limits
-/// seeds. Seeds are proposals; the joint model's removal test decides them.
+/// Seeds as emitters: local maxima over position and width of the score
+/// against the median background with z > u, strongest first, each at its
+/// template's width. `roi` (same shape as `d`) limits seeds. Seeds are
+/// proposals; the joint model's removal test decides them.
 pub fn start(d: &[f64], h: usize, w: usize, roi: Option<&[bool]>, s: &Settings) -> Start {
     assert_eq!(d.len(), h * w);
-    let u = threshold(s.sigma, s.fp_per_mpx);
+    let u = threshold(s);
     let bmap = median_background(d, h, w);
     let phi = dispersion(d, h, w);
     let resid: Vec<f64> = d.iter().zip(&bmap).map(|(a, b)| a - b).collect();
     let var: Vec<f64> = bmap.iter().map(|b| phi * b.max(BG_FLOOR)).collect();
-    let z = detection_map(&resid, &var, h, w, s.sigma);
-    let peak = psf::peak_factor(s.sigma);
-    let ems = find_seeds(&z, h, w, s.sigma, u)
+    let ws = widths(s);
+    let z: Vec<Vec<f64>> = ws.iter().map(|&sj| detection_map(&resid, &var, h, w, sj)).collect();
+    let ems = find_seeds(&z, &ws, h, w, u)
         .into_iter()
-        .filter(|&i| roi.is_none_or(|m| m[i]))
-        .map(|i| Em { a: (resid[i] / peak).max(1.0), y: (i / w) as f64, x: (i % w) as f64, s: s.sigma })
+        .filter(|&(i, _)| roi.is_none_or(|m| m[i]))
+        .map(|(i, j)| Em { a: (resid[i] / psf::peak_factor(ws[j])).max(1.0), y: (i / w) as f64, x: (i % w) as f64, s: ws[j] })
         .collect();
     Start { ems, background: bmap, dispersion: phi, u }
 }
@@ -394,13 +416,13 @@ pub fn localize(d: &[f64], h: usize, w: usize, roi: Option<&[bool]>, s: &Setting
     assert_eq!(d.len(), h * w);
     let bb = match roi {
         None => Rect::frame(h, w),
-        Some(m) => match roi_crop(m, h, w, s.sigma) {
+        Some(m) => match roi_crop(m, h, w, s) {
             Some(bb) => bb,
             None => {
                 return Output {
                     background: vec![BG_FLOOR; h * w],
                     dispersion: f64::NAN,
-                    u: threshold(s.sigma, s.fp_per_mpx),
+                    u: threshold(s),
                     kappa: 1.0,
                     ..Output::default()
                 }
@@ -585,13 +607,23 @@ mod tests {
     }
 
     #[test]
-    fn the_threshold_solves_the_calibrated_rate() {
+    fn the_threshold_solves_the_scale_space_rate() {
         for (sigma, fp) in [(1.0, 2.0), (1.45, 16.0), (2.0, 100.0)] {
-            let u = threshold(sigma, fp);
-            let rate = RFT_C * u * (-0.5 * u * u).exp() / sigma;
+            let s = Settings { sigma, fp_per_mpx: fp, slack: SLACK };
+            let u = threshold(&s);
+            let sd = |k: f64| ((k * sigma).powi(2) + 1.0 / 12.0).sqrt();
+            let rate = 1e6 * statistics::scale_space_ec(u, sd(SLACK.0), sd(SLACK.1));
             assert!((rate / fp - 1.0).abs() < 1e-9, "sigma {sigma}: rate {rate}");
         }
-        assert!((threshold(1.45, FP_PER_MPX) - 4.153).abs() < 1e-3);
+    }
+
+    #[test]
+    fn the_width_bank_spans_the_bounds_in_steps_no_wider_than_allowed() {
+        let s = settings(1.2);
+        let ws = widths(&s);
+        assert!((ws[0] - SLACK.0 * 1.2).abs() < 1e-12 && (ws[ws.len() - 1] - SLACK.1 * 1.2).abs() < 1e-12);
+        assert!(ws.windows(2).all(|p| p[1] / p[0] <= WIDTH_STEP + 1e-12));
+        assert_eq!(widths(&Settings { slack: (1.0, 1.0), ..s }), vec![1.2]);
     }
 
     #[test]

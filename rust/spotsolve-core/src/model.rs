@@ -36,16 +36,20 @@ pub const RHO_MIN: f64 = 0.05;
 /// coupling is read over stamps of `PAIR_SUPPORT` widths.
 pub const PAIR_REACH: f64 = 6.0;
 pub const PAIR_SUPPORT: f64 = 3.0;
-/// Widths: an emitter's stamp radius. Truncating at `R` widths loses about
-/// `(z^2 / 2) exp(-R^2)` nats of an emitter at SNR `z`: at 4, under 0.01
-/// nats up to `z = 400`.
-pub const STAMP: f64 = 4.0;
+/// Nats: the light an emitter's stamp may leave out, no more than a refit
+/// resolves ([`PLAIN_TOL`]). Truncating at `R` widths loses about
+/// `(z^2 / 2) exp(-R^2)` nats of an emitter at SNR `z` ([`stamp_radius`]).
+pub const STAMP_NATS: f64 = PLAIN_TOL;
 /// Widths: margin of a group's pixels around its members, and at least the
 /// add support `(OWN + SUPPORT) sigma`.
 pub const GROUP_PAD: f64 = 3.0;
 /// Over-relaxation of each node update: emitters and nodes pull against
 /// each other, and overshooting the nodes shortens the zig-zag.
 pub const OMEGA: f64 = 1.5;
+/// Cap on Newton steps for a patch's free level in a count decision. The
+/// objective in the level is smooth and convex and starts at the fitted
+/// background, so a handful converge.
+pub const LEVEL_STEPS: usize = 20;
 /// IRLS steps per node update.
 pub const IRLS_STEPS: usize = 3;
 /// Nats per emitter: a round that improves the objective less has converged.
@@ -152,6 +156,14 @@ impl Rect {
     fn contains(&self, y: f64, x: f64) -> bool {
         y >= self.r0 as f64 && y < self.r1 as f64 && x >= self.c0 as f64 && x < self.c1 as f64
     }
+}
+
+/// Widths: the stamp radius that loses [`STAMP_NATS`] of emitter `e`, with
+/// SNR `z^2 = a^2 / (4 pi s^2 var)` against pixel variance `var`: about 3.3
+/// at `z = 10`, 4.3 at 400. At least one width.
+pub fn stamp_radius(e: &Em, var: f64) -> f64 {
+    let z2 = e.a * e.a / (4.0 * std::f64::consts::PI * e.s * e.s * var.max(BG_FLOOR));
+    (z2 / (2.0 * STAMP_NATS)).ln().max(1.0).sqrt()
 }
 
 /// An emitter's profile `E(r) E(c)` on its rectangle, with the derivatives
@@ -311,12 +323,40 @@ fn idiv(d: &[f64], m: &[f64]) -> f64 {
         .sum()
 }
 
+/// `min_t I(d, m + t)` over a constant `t` keeping `m + t` above
+/// [`BG_FLOOR`], by Newton on `t`: the I-divergence with a free local level.
+fn level_idiv(d: &[f64], m: &[f64]) -> f64 {
+    let lo = BG_FLOOR - m.iter().cloned().fold(f64::INFINITY, f64::min);
+    let mut t = 0.0f64;
+    for _ in 0..LEVEL_STEPS {
+        let (mut g, mut h) = (0.0, 0.0);
+        for (&d, &m) in d.iter().zip(m) {
+            let (d, v) = (d.max(0.0), m + t);
+            g += 1.0 - d / v;
+            h += d / (v * v);
+        }
+        if !(h > 0.0) {
+            break;
+        }
+        let next = (t - g / h).max(lo);
+        let done = (next - t).abs() <= 1e-9 * (1.0 + t.abs());
+        t = next;
+        if done {
+            break;
+        }
+    }
+    let shifted: Vec<f64> = m.iter().map(|v| (v + t).max(BG_FLOOR)).collect();
+    idiv(d, &shifted)
+}
+
 /// A group's pixels: the data, and everything the group does not own
 /// (background and every other emitter) as `halo`.
 struct Patch {
     rc: Rect,
     d: Vec<f64>,
     halo: Vec<f64>,
+    /// Pixel variance setting stamp radii ([`stamp_radius`]).
+    var: f64,
     /// Parameter bounds `(a, y, x, s)`, shared by every emitter here.
     lo: [f64; 4],
     hi: [f64; 4],
@@ -324,7 +364,13 @@ struct Patch {
 
 impl Patch {
     fn stamps(&self, ems: &[Em]) -> Vec<Stamp> {
-        ems.iter().map(|e| Stamp::new(e, STAMP, &self.rc)).collect()
+        ems.iter().map(|e| Stamp::new(e, stamp_radius(e, self.var), &self.rc)).collect()
+    }
+
+    /// I-divergence of `ems` on the patch with a free local level: what the
+    /// count decisions compare, blind to a level as the seed score is.
+    fn level_idiv(&self, ems: &[Em]) -> f64 {
+        level_idiv(&self.d, &self.model(&self.stamps(ems)))
     }
 
     fn model(&self, st: &[Stamp]) -> Vec<f64> {
@@ -395,12 +441,10 @@ impl Patch {
     }
 }
 
-/// A group fit: emitters, the I-divergence on the patch, and each emitter's
-/// diagnostics.
+/// A group fit: emitters and each emitter's diagnostics.
 #[derive(Clone)]
 struct Fit {
     ems: Vec<Em>,
-    idiv: f64,
     flags: Vec<u8>,
 }
 
@@ -509,25 +553,25 @@ fn fit(p: &Patch, ems: &[Em], max_iter: usize, tol: f64) -> Fit {
             flag
         })
         .collect();
-    Fit { ems: ems_of(&t), idiv: cur, flags }
+    Fit { ems: ems_of(&t), flags }
 }
 
 /// Wald cost of removing each emitter of `f`: `a^2 / (2 var(a))`, with
-/// `var` from the patch's Fisher information with every other parameter
-/// free. The Poisson likelihood falls off faster than its quadratic
-/// approximation at the fit, so this understates the likelihood-ratio cost.
-/// Zero where the information cannot be factored.
+/// `var` from the patch's Fisher information with a local level and every
+/// other parameter free. The Poisson likelihood falls off faster than its
+/// quadratic approximation at the fit, so this understates the
+/// likelihood-ratio cost. Zero where the information cannot be factored.
 fn wald_costs(p: &Patch, f: &Fit) -> Vec<f64> {
-    let n = 4 * f.ems.len();
+    let n = 1 + 4 * f.ems.len();
     let st = p.stamps(&f.ems);
-    let (fi, _) = p.normal(&st, &p.model(&st), false);
-    let mut chol = Chol::new(n.max(1));
-    if n == 0 || !chol.factor(&fi, n) {
+    let (fi, _) = p.normal(&st, &p.model(&st), true);
+    let mut chol = Chol::new(n);
+    if !chol.factor(&fi, n) {
         return vec![0.0; f.ems.len()];
     }
     let mut var = vec![0.0; n];
     chol.inv_diag(&mut var, &mut Vec::new());
-    f.ems.iter().enumerate().map(|(k, e)| 0.5 * e.a * e.a / var[4 * k]).collect()
+    f.ems.iter().enumerate().map(|(k, e)| 0.5 * e.a * e.a / var[1 + 4 * k]).collect()
 }
 
 /// Separable correlation with a symmetric kernel, zero outside `rows x cols`.
@@ -582,6 +626,9 @@ pub struct Model<'a> {
     pub w: usize,
     s: Settings,
     pub phi: f64,
+    /// Pixel variance of the starting background's median, fixed for the
+    /// run so an emitter's stamp is always the same rectangle.
+    var: f64,
     pub u: f64,
     roi: Option<&'a [bool]>,
     /// Flux bounds: from the frame maximum, so a fit never runs away.
@@ -634,6 +681,7 @@ impl<'a> Model<'a> {
             roi,
             a_min: detect::A_MIN.max(detect::A_MIN_REL * a_max),
             a_max,
+            var: phi * detect::median(bg0).max(BG_FLOOR),
             k1: detect::psf_kernel1d(s.sigma),
             ems: e0.iter().map(|&e| Emitter { e, flags: 0, seen: e }).collect(),
             nodes,
@@ -659,7 +707,7 @@ impl<'a> Model<'a> {
         let frame = self.frame();
         self.light = vec![0.0; self.h * self.w];
         for em in &self.ems {
-            Stamp::new(&em.e, STAMP, &frame).paint(&mut self.light, &frame, 1.0);
+            Stamp::new(&em.e, stamp_radius(&em.e, self.var), &frame).paint(&mut self.light, &frame, 1.0);
         }
     }
 
@@ -841,13 +889,14 @@ impl<'a> Model<'a> {
             }
         }
         for &i in g {
-            Stamp::new(&self.ems[i].e, STAMP, &rc).paint(&mut halo, &rc, -1.0);
+            Stamp::new(&self.ems[i].e, stamp_radius(&self.ems[i].e, self.var), &rc).paint(&mut halo, &rc, -1.0);
         }
         let (sl, sh) = (self.s.slack.0 * self.s.sigma, self.s.slack.1 * self.s.sigma);
         Patch {
             rc,
             d,
             halo,
+            var: self.var,
             lo: [self.a_min, rc.r0 as f64 - 0.5, rc.c0 as f64 - 0.5, sl],
             hi: [self.a_max, rc.r1 as f64 - 0.5, rc.c1 as f64 - 0.5, sh],
         }
@@ -979,8 +1028,7 @@ impl<'a> Model<'a> {
             let p = self.patch(g, rc);
             let em0: Vec<Em> = g.iter().map(|&i| self.ems[i].e).collect();
             let mut state = if still {
-                let st = p.stamps(&em0);
-                Fit { idiv: idiv(&p.d, &p.model(&st)), flags: g.iter().map(|&i| self.ems[i].flags).collect(), ems: em0 }
+                Fit { flags: g.iter().map(|&i| self.ems[i].flags).collect(), ems: em0 }
             } else {
                 self.stats.fits += 1;
                 fit(&p, &em0, FIT_MAX_ITER, PLAIN_TOL)
@@ -996,13 +1044,14 @@ impl<'a> Model<'a> {
                     if wc.iter().all(|&c| c >= gain_rem) {
                         break;
                     }
+                    let base = p.level_idiv(&state.ems);
                     let (cost, k, trial) = (0..state.ems.len())
                         .filter(|&k| wc[k] < gain_rem)
                         .map(|k| {
                             let mut em = state.ems.clone();
                             em.remove(k);
                             let t = fit(&p, &em, REMOVE_ITER, FIT_TOL);
-                            (t.idiv - state.idiv, k, t)
+                            (p.level_idiv(&t.ems) - base, k, t)
                         })
                         .min_by(|a, b| a.0.total_cmp(&b.0))
                         .unwrap();
@@ -1030,7 +1079,7 @@ impl<'a> Model<'a> {
                     em.push(Em { a, y: r as f64, x: c as f64, s: self.s.sigma });
                     let trial = fit(&p, &em, FIT_MAX_ITER, FIT_TOL);
                     self.stats.fits += 1;
-                    if !(state.idiv - trial.idiv > gain_add) {
+                    if !(p.level_idiv(&state.ems) - p.level_idiv(&trial.ems) > gain_add) {
                         self.stats.lr_fail += 1;
                         break;
                     }
@@ -1040,10 +1089,10 @@ impl<'a> Model<'a> {
                 }
             }
             for &i in g {
-                Stamp::new(&self.ems[i].e, STAMP, &frame).paint(&mut self.light, &frame, -1.0);
+                Stamp::new(&self.ems[i].e, stamp_radius(&self.ems[i].e, self.var), &frame).paint(&mut self.light, &frame, -1.0);
             }
             for (j, (e, &flags)) in state.ems.iter().zip(&state.flags).enumerate() {
-                Stamp::new(e, STAMP, &frame).paint(&mut self.light, &frame, 1.0);
+                Stamp::new(e, stamp_radius(e, self.var), &frame).paint(&mut self.light, &frame, 1.0);
                 match origin[j] {
                     Some(i) => {
                         self.ems[g[i]].e = *e;
@@ -1148,10 +1197,11 @@ mod tests {
         );
         let frame = Rect::frame(h, w);
         let mut img = vec![0.0; h * w];
-        let st = Stamp::new(&e, STAMP, &frame);
+        let rad = 4.0;
+        let st = Stamp::new(&e, rad, &frame);
         st.paint(&mut img, &frame, 1.0);
         // Exact inside the stamp; outside, only the truncated tail is missing.
-        let tail = e.a * (-0.5 * STAMP * STAMP).exp() / (2.0 * std::f64::consts::PI * e.s * e.s);
+        let tail = e.a * (-0.5f64 * rad * rad).exp() / (2.0 * std::f64::consts::PI * e.s * e.s);
         for r in 0..h {
             for c in 0..w {
                 let (a, b) = (img[r * w + c], dense[r * w + c]);
@@ -1165,7 +1215,7 @@ mod tests {
     fn the_stamp_jacobian_matches_finite_differences() {
         let frame = Rect::frame(21, 21);
         let e = em(900.0, 10.2, 9.7, 1.3);
-        let st = Stamp::new(&e, STAMP, &frame);
+        let st = Stamp::new(&e, 4.0, &frame);
         for (r, c) in [(10, 10), (8, 12), (13, 7)] {
             let j = st.jac(r, c);
             for q in 0..4 {
@@ -1173,7 +1223,7 @@ mod tests {
                 let (mut up, mut dn) = (e.params(), e.params());
                 up[q] += h;
                 dn[q] -= h;
-                let v = |t: [f64; 4]| Stamp::new(&Em::from(&t), STAMP, &frame).value(r, c);
+                let v = |t: [f64; 4]| Stamp::new(&Em::from(&t), 4.0, &frame).value(r, c);
                 let fd = (v(up) - v(dn)) / (2.0 * h);
                 assert!((j[q] - fd).abs() <= 1e-5 * (1.0 + fd.abs()), "({r}, {c}) q {q}: {} vs {fd}", j[q]);
             }
@@ -1185,7 +1235,7 @@ mod tests {
         let rc = Rect::frame(17, 17);
         let mut d = vec![20.0; rc.n()];
         Stamp::new(&em(1500.0, 8.2, 8.4, 2.8), 20.0, &rc).paint(&mut d, &rc, 1.0);
-        Patch { rc, d, halo: vec![20.0; rc.n()], lo: [1e-3, -0.5, -0.5, 0.7], hi: [1e6, 16.5, 16.5, slack_hi] }
+        Patch { rc, d, halo: vec![20.0; rc.n()], var: 20.0, lo: [1e-3, -0.5, -0.5, 0.7], hi: [1e6, 16.5, 16.5, slack_hi] }
     }
 
     #[test]

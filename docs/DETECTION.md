@@ -24,9 +24,11 @@ calibration is needed; fluxes scale with gain, geometry does not.
 ## Algorithm
 
 1. **Seeds.** Against a 25-px median background, compute the efficient score
-   `z` for one emitter of width `sigma` at every pixel. Local maxima with
-   `z > u` become emitters. `u` is solved from `fp_per_mpx`, the expected
-   number of false emitters per 10^6 pixels of pure noise.
+   `z` for one emitter at every pixel, on a bank of widths from
+   `slack[0] * sigma` to `slack[1] * sigma`, adjacent widths at most 1.5x
+   apart (an emitter between two keeps 98% of its score). Local maxima over
+   position and width with `z > u` become emitters at their template's
+   width. `u` is solved from `fp_per_mpx` (below).
 2. **Fit.** Emitters and background are fitted together by block coordinate
    descent. Emitters are fitted in groups by bounded Levenberg-Marquardt,
    with every other emitter and the background held fixed; groups join the
@@ -38,13 +40,42 @@ calibration is needed; fluxes scale with gain, geometry does not.
    - an emitter is added at the pixel of highest residual score if that
      score exceeds `u * kappa` and the refit gains `(u * kappa)^2 / 2` nats.
 
+   Both likelihood ratios let the patch's level float, as the seed score
+   does: a wide emitter and the background trade light, and a fixed level
+   would credit the emitter with the background's share.
+
    `kappa >= 1` is the spread of the residual score far from every emitter,
    an empirical null. It is 1 where the model describes the data, and grows
    where it does not (PSF wings, haze), raising the bar for additions there.
    The model is re-converged and tested again until nothing changes.
 
-Widths are fitted within `slack * sigma` (default 0.7-2.2). These are
-optimization bounds, not an acceptance interval; a fit at a bound is flagged.
+Widths are fitted within `slack * sigma` (default 1.0-2.2): `sigma` is the
+in-focus width, the narrowest a spot can be. These are optimization bounds,
+not an acceptance interval; a fit at a bound is flagged.
+
+## The threshold
+
+An emitter survives on pure noise when its likelihood ratio, maximized over
+position and width, reaches `u^2/2`: a local maximum above `u` of the
+matched-filter field over position and log width. With `tau = log s`, that
+field's metric is `(dx^2 + dy^2) / (2 s^2) + dtau^2`, a slab of hyperbolic
+space, and the Gaussian kinematic formula gives the expected number per
+pixel (`statistics::scale_space_ec`):
+
+```text
+EC(u) = 1/4 (1/s1^2 - 1/s2^2) rho3(u) + 1/4 (1/s1^2 + 1/s2^2) rho2(u)
+      + 1/(8 pi) (1/s1^2 - 1/s2^2) rho1(u)
+```
+
+with `s^2` the profile variance (`(slack * sigma)^2 + 1/12` with pixel
+integration) and `rho_j` the Gaussian EC densities. `u` solves
+`10^6 EC(u) = fp_per_mpx`. The narrowest widths dominate the count, which
+is why the search starts at the in-focus width.
+
+This counts the maxima of a continuous Gaussian field, so `fp_per_mpx` is a
+bound, not a calibration: sampling on the pixel lattice finds fewer maxima
+for PSFs near a pixel wide, while Poisson skew at low counts and fits at the
+frame edge (flagged `EDGE`) add some.
 
 ## Uncertainties
 
@@ -78,18 +109,17 @@ frames; see the [width inspection example](../README.md#choose-a-detection-width
 
 `rust/spotsolve-core/tests/layer7_localize.rs` holds the detector to recall,
 precision and position error on simulated fields (flux 150-3000 ADU on a
-background of 20, width `sigma` +-20%) and to its false-positive rate on pure
-Poisson noise. Measured when the tests were set (sigma 1.2, 128x128):
+background of 20, width `sigma` +-20%) and its false-positive rate on pure
+Poisson noise to within a factor of 2 of `fp_per_mpx`.
 
-| Emitters / px | Recall | Precision | RMS error, px |
-|---:|---:|---:|---:|
-| 0.005 | 1.000 | 1.000 | 0.12 |
-| 0.015 | 0.890 | 0.991 | 0.20 |
-| 0.03 | 0.868 | 0.993 | 0.25 |
+`rust/spotsolve-core/examples/characterize.rs` measures the detector against
+what the data allow: recall by oracle SNR and width, position error over the
+Cramer-Rao bound, close pairs, recall by neighbour distance, and false
+emitters on Poisson and Gaussian noise:
 
-On noise the false-positive rate is within 3% of `fp_per_mpx` for `sigma`
-1.0-1.45 at the default of 16; wide PSFs at strict targets overshoot (1.5x
-at `sigma` 1.8 and `fp_per_mpx` 4).
+```sh
+cargo run --release --manifest-path rust/Cargo.toml -p spotsolve-core --example characterize
+```
 
 ## Limits
 

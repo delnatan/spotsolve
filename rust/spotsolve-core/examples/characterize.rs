@@ -6,8 +6,9 @@
 //! - `pairs`: equal pairs by separation -- how many detections each yields;
 //! - `fields`: random fields by density -- recall by nearest-neighbour
 //!   distance and oracle SNR, precision, time;
-//! - `noise`: false emitters per 10^6 pixels of pure noise, against the
-//!   `fp_per_mpx` promise.
+//! - `noise`: false emitters per 10^6 pixels of Poisson and of Gaussian
+//!   noise, against the `fp_per_mpx` bound, and how many sit at a frame
+//!   edge or a width bound.
 //!
 //! The oracle SNR is the flux over its standard error for a matched filter at
 //! the emitter's true width, with a free local level: the best any detector
@@ -330,18 +331,26 @@ fn fields(rng: &mut Rng, sref: f64, spread: (f64, f64), label: &str) {
 }
 
 fn noise(rng: &mut Rng) {
-    println!("\n== pure noise, bg 20, 8 frames 256x256");
+    let (h, w, bg, frames) = (256usize, 256usize, 20.0f64, 32);
+    let mpx = (frames * h * w) as f64 / 1e6;
+    println!("\n== pure noise, bg {bg}, {frames} frames 256x256: false emitters per Mpx (target at most {}), of them at an edge / at a width bound", bs::FP_PER_MPX);
     for sref in [1.0, 1.2, 1.6, 2.0] {
-        let (h, w) = (256usize, 256usize);
-        let mut n = 0;
-        let mut ms = 0.0;
-        for _ in 0..8 {
-            let d: Vec<f64> = (0..h * w).map(|_| rng.poisson(20.0)).collect();
-            let t0 = Instant::now();
-            n += bs::localize(&d, h, w, None, &settings(sref)).amp.len();
-            ms += t0.elapsed().as_secs_f64() * 1e3 / 8.0;
+        let mut line = format!("sref {sref}:");
+        for gauss in [false, true] {
+            let (mut n, mut edge, mut bound, mut ms) = (0, 0, 0, 0.0);
+            for _ in 0..frames {
+                let d: Vec<f64> = (0..h * w).map(|_| if gauss { bg + bg.sqrt() * rng.normal() } else { rng.poisson(bg) }).collect();
+                let t0 = Instant::now();
+                let o = bs::localize(&d, h, w, None, &settings(sref));
+                ms += t0.elapsed().as_secs_f64() * 1e3 / frames as f64;
+                n += o.amp.len();
+                edge += o.flags.iter().filter(|&&f| f & bs::FLAG_EDGE != 0).count();
+                bound += o.flags.iter().filter(|&&f| f & bs::FLAG_BOUND != 0).count();
+            }
+            let kind = if gauss { "Gaussian" } else { "Poisson" };
+            line += &format!("  {kind} {:.1} ({edge} / {bound} of {n}), {ms:.1} ms/frame", n as f64 / mpx);
         }
-        println!("sref {sref}: {:.1} FP/Mpx (target {}), {ms:.1} ms/frame", n as f64 / (8.0 * (h * w) as f64) * 1e6, bs::FP_PER_MPX);
+        println!("{line}");
     }
 }
 
