@@ -36,9 +36,10 @@ pub const RHO_MIN: f64 = 0.05;
 /// coupling is read over stamps of `PAIR_SUPPORT` widths.
 pub const PAIR_REACH: f64 = 6.0;
 pub const PAIR_SUPPORT: f64 = 3.0;
-/// Widths: an emitter's stamp radius. Beyond it the profile is below 1e-7
-/// of its peak.
-pub const STAMP: f64 = 6.0;
+/// Widths: an emitter's stamp radius. Truncating at `R` widths loses about
+/// `(z^2 / 2) exp(-R^2)` nats of an emitter at SNR `z`: at 4, under 0.01
+/// nats up to `z = 400`.
+pub const STAMP: f64 = 4.0;
 /// Widths: margin of a group's pixels around its members, and at least the
 /// add support `(OWN + SUPPORT) sigma`.
 pub const GROUP_PAD: f64 = 3.0;
@@ -507,6 +508,24 @@ fn fit(p: &Patch, ems: &[Em], max_iter: usize, tol: f64) -> Fit {
     Fit { ems: ems_of(&t), idiv: cur, flags }
 }
 
+/// Wald cost of removing each emitter of `f`: `a^2 / (2 var(a))`, with
+/// `var` from the patch's Fisher information with every other parameter
+/// free. The Poisson likelihood falls off faster than its quadratic
+/// approximation at the fit, so this understates the likelihood-ratio cost.
+/// Zero where the information cannot be factored.
+fn wald_costs(p: &Patch, f: &Fit) -> Vec<f64> {
+    let n = 4 * f.ems.len();
+    let st = p.stamps(&f.ems);
+    let (fi, _) = p.normal(&st, &p.model(&st), false);
+    let mut chol = Chol::new(n.max(1));
+    if n == 0 || !chol.factor(&fi, n) {
+        return vec![0.0; f.ems.len()];
+    }
+    let mut var = vec![0.0; n];
+    chol.inv_diag(&mut var, &mut Vec::new());
+    f.ems.iter().enumerate().map(|(k, e)| 0.5 * e.a * e.a / var[4 * k]).collect()
+}
+
 /// Separable correlation with a symmetric kernel, zero outside `rows x cols`.
 fn blur(src: &[f64], rows: usize, cols: usize, k: &[f64]) -> Vec<f64> {
     let r = (k.len() / 2) as isize;
@@ -574,6 +593,9 @@ pub struct Model<'a> {
     pub stats: Stats,
     /// The partition, kept until the count changes.
     groups: Option<Vec<Vec<usize>>>,
+    /// Each converged group, by its members' parameters: its rectangle and
+    /// the frame model (background and light) there after its last fit.
+    settled: std::collections::HashMap<Vec<[u64; 4]>, (Rect, Vec<f64>)>,
     /// Where the last test round added or removed.
     changed_at: Vec<(f64, f64)>,
 }
@@ -615,6 +637,7 @@ impl<'a> Model<'a> {
             light: Vec::new(),
             stats: Stats { kappa: 1.0, ..Stats::default() },
             groups: None,
+            settled: Default::default(),
             changed_at: Vec::new(),
         };
         md.redraw();
@@ -879,6 +902,24 @@ impl<'a> Model<'a> {
         best
     }
 
+    /// Background plus light on `rc`.
+    fn frame_model(&self, rc: &Rect) -> Vec<f64> {
+        let mut out = Vec::with_capacity(rc.n());
+        for r in rc.r0..rc.r1 {
+            let row = r * self.w;
+            out.extend((rc.c0..rc.c1).map(|c| self.bg[row + c] + self.light[row + c]));
+        }
+        out
+    }
+
+    /// Whether a converged group's fit still stands: a halo change `dm` can
+    /// improve the group's objective by at most `sum dm^2 / (2 phi m)` nats,
+    /// so a refit is owed only once that bound reaches [`TOL`] per member.
+    fn unmoved(&self, h0: &[f64], h1: &[f64], members: usize) -> bool {
+        let gain: f64 = h0.iter().zip(h1).map(|(a, b)| (b - a) * (b - a) / b.max(BG_FLOOR)).sum();
+        gain / (2.0 * self.phi) < TOL * members as f64
+    }
+
     /// Whether a test round must test group `g` ([`ACTIVE_TOL`]).
     fn must_test(&self, g: &[usize], rc: &Rect) -> bool {
         let (tol, sg) = (ACTIVE_TOL, self.s.sigma);
@@ -913,21 +954,46 @@ impl<'a> Model<'a> {
         let own_r = OWN * self.s.sigma;
         let frame = self.frame();
         let groups = self.groups.take().unwrap_or_else(|| self.partition());
+        let mut settled = std::mem::take(&mut self.settled);
+        let mut next = std::collections::HashMap::new();
+        let key = |ems: &[Emitter], g: &[usize]| -> Vec<[u64; 4]> { g.iter().map(|&i| ems[i].e.params().map(f64::to_bits)).collect() };
         let (mut n_add, mut n_rem) = (0, 0);
         let mut changed_at = Vec::new();
         let mut dead = vec![false; self.ems.len()];
         let mut born = Vec::new();
         for g in &groups {
+            let memo = settled.remove(&key(&self.ems, g));
             let rc = self.group_rect(g);
+            // A group untouched since its last fit sees its halo change
+            // exactly as the frame model changes on its rectangle.
+            let still = memo.as_ref().is_some_and(|(rc0, m0)| *rc0 == rc && self.unmoved(m0, &self.frame_model(&rc), g.len()));
+            let testing = test && self.must_test(g, &rc);
+            if still && !testing {
+                next.insert(key(&self.ems, g), memo.unwrap());
+                continue;
+            }
             let p = self.patch(g, rc);
             let em0: Vec<Em> = g.iter().map(|&i| self.ems[i].e).collect();
-            let mut state = fit(&p, &em0, FIT_MAX_ITER, PLAIN_TOL);
-            self.stats.fits += 1;
+            let mut state = if still {
+                let st = p.stamps(&em0);
+                Fit { idiv: idiv(&p.d, &p.model(&st)), flags: g.iter().map(|&i| self.ems[i].flags).collect(), ems: em0 }
+            } else {
+                self.stats.fits += 1;
+                fit(&p, &em0, FIT_MAX_ITER, PLAIN_TOL)
+            };
+            let converged = state.flags.iter().all(|fl| fl & (detect::FLAG_NOT_CONVERGED | detect::FLAG_STALLED) == 0);
             // origin[j]: the member state.ems[j] came from; None if added.
             let mut origin: Vec<Option<usize>> = (0..g.len()).map(Some).collect();
-            if test && self.must_test(g, &rc) {
+            if testing {
                 while !state.ems.is_empty() {
+                    // Wald costs understate the likelihood-ratio cost, so a
+                    // member whose Wald cost clears the bar is kept untried.
+                    let wc = wald_costs(&p, &state);
+                    if wc.iter().all(|&c| c >= gain_rem) {
+                        break;
+                    }
                     let (cost, k, trial) = (0..state.ems.len())
+                        .filter(|&k| wc[k] < gain_rem)
                         .map(|k| {
                             let mut em = state.ems.clone();
                             em.remove(k);
@@ -936,7 +1002,7 @@ impl<'a> Model<'a> {
                         })
                         .min_by(|a, b| a.0.total_cmp(&b.0))
                         .unwrap();
-                    self.stats.fits += state.ems.len();
+                    self.stats.fits += wc.iter().filter(|&&c| c < gain_rem).count();
                     if cost >= gain_rem {
                         break;
                     }
@@ -991,7 +1057,12 @@ impl<'a> Model<'a> {
                     changed_at.push((self.ems[gi].e.y, self.ems[gi].e.x));
                 }
             }
+            if converged && origin.len() == g.len() && origin.iter().all(Option::is_some) {
+                let rc = self.group_rect(g);
+                next.insert(key(&self.ems, g), (rc, self.frame_model(&rc)));
+            }
         }
+        self.settled = next;
         let mut alive = dead.iter().map(|d| !d);
         self.ems.retain(|_| alive.next().unwrap());
         self.ems.extend(born);
@@ -1069,9 +1140,16 @@ mod tests {
         );
         let frame = Rect::frame(h, w);
         let mut img = vec![0.0; h * w];
-        Stamp::new(&e, STAMP, &frame).paint(&mut img, &frame, 1.0);
-        for (a, b) in img.iter().zip(&dense) {
-            assert!((a - b).abs() < 1e-6 * e.a, "{a} vs {b}");
+        let st = Stamp::new(&e, STAMP, &frame);
+        st.paint(&mut img, &frame, 1.0);
+        // Exact inside the stamp; outside, only the truncated tail is missing.
+        let tail = e.a * (-0.5 * STAMP * STAMP).exp() / (2.0 * std::f64::consts::PI * e.s * e.s);
+        for r in 0..h {
+            for c in 0..w {
+                let (a, b) = (img[r * w + c], dense[r * w + c]);
+                let tol = if st.rc.contains(r as f64, c as f64) { 1e-9 * e.a } else { tail };
+                assert!((a - b).abs() <= tol, "({r}, {c}): {a} vs {b}");
+            }
         }
     }
 
