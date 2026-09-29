@@ -1,5 +1,34 @@
 # Changelog
 
+## 0.3.0
+
+No API changes; detections differ from 0.2.0.
+
+- Seeds are local maxima of the score over position and width, and
+  additions go in at the width the score asks for, so defocused emitters
+  are proposed at their own width.
+- The default `slack` is `(1.0, 2.2)`: `sigma` is the in-focus width, the
+  narrowest a spot can be. Lower `slack[0]` to admit narrower fits.
+- Every count decision, and the reported SEs and `fisher_fraction`, refit
+  the background (to second order) instead of holding it at a fit that
+  includes the emitter. Background nodes sit `ceil(8 * slack[1] * sigma)`
+  px apart instead of 16, so the background leaves a wide emitter most of
+  its flux information; SEs of wide emitters grow accordingly.
+- `fp_per_mpx` is now derived rather than fitted: the expected Euler
+  characteristic of the likelihood-ratio field over position and width. It
+  is an upper bound for Gaussian noise; with the default 16, pure noise at a
+  background of 20 gives 5-11 false emitters per 10^6 pixels (Gaussian) and
+  11-17 (Poisson) for `sigma` 1-2. In 0.2.0 false emitters grew with
+  `sigma`, to 40 per 10^6 Poisson pixels at `sigma` 2.
+- Fewer fits per frame: shorter stamps, removal trials only where the Wald
+  cost is below the bar, refits only where the model changed, and tests
+  before full convergence. Dense frames run at about 0.2.0's speed; sparse
+  frames 20-30% slower.
+- `examples/characterize.rs` measures the detector against what the data
+  allow: recall by oracle SNR and width, position error over the
+  Cramer-Rao bound, close pairs, recall by neighbour distance, and false
+  emitters on noise.
+
 ## 0.2.0
 
 Incompatible API changes: see below.
