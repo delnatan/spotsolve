@@ -574,27 +574,32 @@ fn wald_costs(p: &Patch, f: &Fit) -> Vec<f64> {
     f.ems.iter().enumerate().map(|(k, e)| 0.5 * e.a * e.a / var[1 + 4 * k]).collect()
 }
 
-/// Separable correlation with a symmetric kernel, zero outside `rows x cols`.
-fn blur(src: &[f64], rows: usize, cols: usize, k: &[f64]) -> Vec<f64> {
-    let r = (k.len() / 2) as isize;
-    let pass = |src: &[f64], along_rows: bool| {
-        let mut out = vec![0.0; rows * cols];
-        for i in 0..rows {
-            for j in 0..cols {
-                let mut acc = 0.0;
-                for (t, &kv) in k.iter().enumerate() {
-                    let o = t as isize - r;
-                    let (y, x) = if along_rows { (i as isize + o, j as isize) } else { (i as isize, j as isize + o) };
-                    if y >= 0 && x >= 0 && (y as usize) < rows && (x as usize) < cols {
-                        acc += src[y as usize * cols + x as usize] * kv;
-                    }
-                }
-                out[i * cols + j] = acc;
+/// Separable correlation with a symmetric kernel, zero outside `rows x
+/// cols`, of an image that is zero outside rows `r0..r1` and columns
+/// `c0..c1`. Computed only where it can be nonzero: that box grown by the
+/// kernel's radius.
+fn blur(src: &[f64], rows: usize, cols: usize, k: &[f64], (r0, r1, c0, c1): (usize, usize, usize, usize)) -> Vec<f64> {
+    let rad = k.len() / 2;
+    let (y0, y1) = (r0.saturating_sub(rad), (r1 + rad).min(rows));
+    let (x0, x1) = (c0.saturating_sub(rad), (c1 + rad).min(cols));
+    // Tap t reads index i + t - rad, which must lie in lo..hi.
+    let taps = |i: usize, lo: usize, hi: usize| (lo + rad).saturating_sub(i)..(hi + rad).saturating_sub(i).min(k.len());
+    let mut mid = vec![0.0; rows * cols];
+    for i in y0..y1 {
+        for t in taps(i, r0, r1) {
+            let (src_row, kv) = ((i + t - rad) * cols, k[t]);
+            for j in c0..c1 {
+                mid[i * cols + j] += kv * src[src_row + j];
             }
         }
-        out
-    };
-    pass(&pass(src, true), false)
+    }
+    let mut out = vec![0.0; rows * cols];
+    for i in y0..y1 {
+        for j in x0..x1 {
+            out[i * cols + j] = taps(j, c0, c1).map(|t| k[t] * mid[i * cols + j + t - rad]).sum();
+        }
+    }
+    out
 }
 
 #[derive(Clone, Debug, Default)]
@@ -634,8 +639,9 @@ pub struct Model<'a> {
     /// Flux bounds: from the frame maximum, so a fit never runs away.
     a_min: f64,
     a_max: f64,
-    /// Unit-flux reference-width profile along one axis.
-    k1: Vec<f64>,
+    /// The seed widths ([`detect::widths`]) and each one's unit-flux
+    /// profile along one axis.
+    k1: Vec<(f64, Vec<f64>)>,
     pub ems: Vec<Emitter>,
     pub nodes: Nodes,
     /// `nodes.surface()` and the emitters' light, `h * w` each.
@@ -682,7 +688,7 @@ impl<'a> Model<'a> {
             a_min: detect::A_MIN.max(detect::A_MIN_REL * a_max),
             a_max,
             var: phi * detect::median(bg0).max(BG_FLOOR),
-            k1: detect::psf_kernel1d(s.sigma),
+            k1: detect::widths(s).into_iter().map(|w| (w, detect::psf_kernel1d(w))).collect(),
             ems: e0.iter().map(|&e| Emitter { e, flags: 0, seen: e }).collect(),
             nodes,
             bg: Vec::new(),
@@ -902,25 +908,25 @@ impl<'a> Model<'a> {
         }
     }
 
-    /// Best pixel of `owned` for one more reference-width emitter:
-    /// `(z, row, col, one-step flux)`. `z = S / sqrt(I_eff)`, where `S` is
-    /// the score of its flux and `I_eff` its information less the projection
-    /// onto `[level, members]`, so a fitted neighbour's light cannot pass
-    /// for a new emitter.
-    fn score(&self, p: &Patch, ems: &[Em], owned: &[bool]) -> Option<(f64, usize, usize, f64)> {
+    /// Best pixel and width of `owned` for one more emitter, over the seed
+    /// widths: `(z, row, col, one-step flux, width)`. `z = S / sqrt(I_eff)`,
+    /// where `S` is the score of its flux and `I_eff` its information less
+    /// the projection onto `[level, members]`. A member that has absorbed a
+    /// neighbour by widening leaves little of it in the residual, and the
+    /// projection is what finds it there.
+    fn score(&self, p: &Patch, ems: &[Em], owned: &[bool]) -> Option<(f64, usize, usize, f64, f64)> {
         let (rows, cols, n) = (p.rc.rows(), p.rc.cols(), p.rc.n());
         let st = p.stamps(ems);
         let m = p.model(&st);
         let wt: Vec<f64> = m.iter().map(|m| 1.0 / (self.phi * m)).collect();
         let resid: Vec<f64> = (0..n).map(|k| (p.d[k] - m[k]) * wt[k]).collect();
-        let k2: Vec<f64> = self.k1.iter().map(|v| v * v).collect();
-        let s = blur(&resid, rows, cols, &self.k1);
-        let igg = blur(&wt, rows, cols, &k2);
-        // c[q][k] = sum_j g_k(j) J_q(j) wt(j), for the level and each stamp.
-        let np = 1 + 4 * st.len();
-        let mut c = Vec::with_capacity(np);
-        c.push(blur(&wt, rows, cols, &self.k1));
+        // The members' weighted Jacobian images, each nonzero only on its
+        // stamp, blurred per width below over that support.
+        let all = (0, rows, 0, cols);
+        let mut jw: Vec<(Vec<f64>, (usize, usize, usize, usize))> = Vec::with_capacity(1 + 4 * st.len());
+        jw.push((wt.clone(), all));
         for sq in &st {
+            let sup = (sq.rc.r0 - p.rc.r0, sq.rc.r1 - p.rc.r0, sq.rc.c0 - p.rc.c0, sq.rc.c1 - p.rc.c0);
             let mut cols4 = vec![vec![0.0; n]; 4];
             for r in sq.rc.r0..sq.rc.r1 {
                 for cc in sq.rc.c0..sq.rc.c1 {
@@ -930,26 +936,34 @@ impl<'a> Model<'a> {
                     }
                 }
             }
-            c.extend(cols4.iter().map(|img| blur(img, rows, cols, &self.k1)));
+            jw.extend(cols4.into_iter().map(|img| (img, sup)));
         }
+        let np = jw.len();
         let f: Vec<f64> = p.normal(&st, &m, true).0.iter().map(|v| v / self.phi).collect();
         let mut chol = Chol::new(np);
         let proj = chol.factor(&f, np);
         let (mut cq, mut x) = (vec![0.0; np], vec![0.0; np]);
-        let mut best: Option<(f64, usize, usize, f64)> = None;
-        for k in (0..n).filter(|&k| owned[k]) {
-            let mut ieff = igg[k];
-            if proj {
-                for q in 0..np {
-                    cq[q] = c[q][k];
+        let mut best: Option<(f64, usize, usize, f64, f64)> = None;
+        for (width, k1) in &self.k1 {
+            let k2: Vec<f64> = k1.iter().map(|v| v * v).collect();
+            let s = blur(&resid, rows, cols, k1, all);
+            let igg = blur(&wt, rows, cols, &k2, all);
+            // c[q][k] = sum_j g_k(j) J_q(j) wt(j), for the level and each stamp.
+            let c: Vec<Vec<f64>> = if proj { jw.iter().map(|(img, sup)| blur(img, rows, cols, k1, *sup)).collect() } else { Vec::new() };
+            for k in (0..n).filter(|&k| owned[k]) {
+                let mut ieff = igg[k];
+                if proj {
+                    for q in 0..np {
+                        cq[q] = c[q][k];
+                    }
+                    chol.solve(&cq, &mut x);
+                    ieff -= cq.iter().zip(&x).map(|(a, b)| a * b).sum::<f64>();
                 }
-                chol.solve(&cq, &mut x);
-                ieff -= cq.iter().zip(&x).map(|(a, b)| a * b).sum::<f64>();
-            }
-            let ieff = ieff.max(1e-12);
-            let z = s[k] / ieff.sqrt();
-            if best.is_none_or(|b| z > b.0) {
-                best = Some((z, p.rc.r0 + k / cols, p.rc.c0 + k % cols, s[k] / ieff));
+                let ieff = ieff.max(1e-12);
+                let z = s[k] / ieff.sqrt();
+                if best.is_none_or(|b| z > b.0) {
+                    best = Some((z, p.rc.r0 + k / cols, p.rc.c0 + k % cols, s[k] / ieff, *width));
+                }
             }
         }
         best
@@ -990,7 +1004,8 @@ impl<'a> Model<'a> {
     /// One Gauss-Seidel round: every group refitted in turn against the
     /// current light of all others, then the nodes. With `test`, each group
     /// first drops emitters whose removal costs less than `u^2/2` nats, then
-    /// adds within `OWN` sigma of its members at `u * kappa`.
+    /// adds within `OWN` sigma of its members, at any seed width, at
+    /// `u * kappa`.
     /// Returns `(adds, removals, objective)`.
     #[allow(clippy::neg_cmp_op_on_partial_ord)]
     pub fn round(&mut self, test: bool) -> (usize, usize, f64) {
@@ -1071,12 +1086,12 @@ impl<'a> Model<'a> {
                     })
                     .collect();
                 while state.ems.len() < g.len() + K_MAX {
-                    let Some((z, r, c, a)) = self.score(&p, &state.ems, &owned) else { break };
+                    let Some((z, r, c, a, width)) = self.score(&p, &state.ems, &owned) else { break };
                     if !(z > ut) {
                         break;
                     }
                     let mut em = state.ems.clone();
-                    em.push(Em { a, y: r as f64, x: c as f64, s: self.s.sigma });
+                    em.push(Em { a, y: r as f64, x: c as f64, s: width });
                     let trial = fit(&p, &em, FIT_MAX_ITER, FIT_TOL);
                     self.stats.fits += 1;
                     if !(p.level_idiv(&state.ems) - p.level_idiv(&trial.ems) > gain_add) {

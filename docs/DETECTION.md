@@ -37,8 +37,14 @@ calibration is needed; fluxes scale with gain, geometry does not.
    background nodes are fitted by Poisson IRLS with emitters held fixed.
 3. **Count.** Once the model has converged, each group is tested:
    - an emitter is removed if removing it costs less than `u^2/2` nats;
-   - an emitter is added at the pixel of highest residual score if that
-     score exceeds `u * kappa` and the refit gains `(u * kappa)^2 / 2` nats.
+   - an emitter is added at the pixel and width of highest residual score,
+     over the seed widths and within `4 sigma` of a member, if that score
+     exceeds `u * kappa` and the refit gains `(u * kappa)^2 / 2` nats.
+
+   The score is efficient: its information is what remains after projecting
+   out the group's parameters and level. With free widths a fitted emitter
+   absorbs an unfound neighbour by widening, which leaves little of the
+   neighbour in the residual; the projection is what finds it there.
 
    Both likelihood ratios let the patch's level float, as the seed score
    does: a wide emitter and the background trade light, and a fixed level
@@ -109,8 +115,10 @@ frames; see the [width inspection example](../README.md#choose-a-detection-width
 
 `rust/spotsolve-core/tests/layer7_localize.rs` holds the detector to recall,
 precision and position error on simulated fields (flux 150-3000 ADU on a
-background of 20, width `sigma` +-20%) and its false-positive rate on pure
-Poisson noise to within a factor of 2 of `fp_per_mpx`.
+background of 20, width `sigma` +-20%), and its false-positive rate on pure
+Poisson noise to within a factor of 2 of `fp_per_mpx`. Position error is
+held in units of each detection's reported SE (median about `sqrt(ln 2)`),
+so recovering a hard emitter does not count against the detector.
 
 `rust/spotsolve-core/examples/characterize.rs` measures the detector against
 what the data allow: recall by oracle SNR and width, position error over the
