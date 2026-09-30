@@ -104,7 +104,7 @@ estimate its background reference level.
 | Multi-emitter setting | Default | Effect |
 |---|---|---|
 | `fp_per_mpx` | 16 | Expected false emitters per 10^6 pixels of pure noise; lower is stricter |
-| `slack` | `(1.0, 2.2)` | Searched and fitted widths, relative to `sigma` |
+| `slack` | `(1.0, 2.25)` | Widths of reported emitters, relative to `sigma`; wider light is background |
 
 Seeds are local maxima, over position and width, of an efficient score near
 a threshold u solved from `fp_per_mpx`. Every seed starts as an emitter of
@@ -147,9 +147,10 @@ and reproduction commands.
 
 ## Choose a detection width
 
-`sigma` is the in-focus PSF width: the narrowest a spot can be. Each spot's
-width is fitted within `slack * sigma`, by default `sigma` to `2.2 sigma`, so
-defocused spots are searched for and fitted at their own width. Inspect a
+`sigma` is the in-focus PSF width: the narrowest a spot can be. Spots are
+reported between `sigma` and `slack[1] * sigma` (by default `2.25 sigma`),
+the edge of the depth of focus; wider, out-of-focus light is fitted too but
+returned as part of the background. Inspect a
 `fit_sigma` histogram from the first frame or a few frames and take `sigma`
 from its narrow, in-focus mode. Aguet provides a cheap initial pass when
 spots are sufficiently isolated:

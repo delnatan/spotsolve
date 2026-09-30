@@ -15,11 +15,17 @@
 //! groups by Levenberg-Marquardt with everything else fixed, the nodes by
 //! Poisson IRLS with the emitters fixed. Once it has converged each group is
 //! tested: an emitter stays only if removing it costs at least `u^2 / 2`
-//! nats, and one is added where the residual's efficient score exceeds
-//! `u * kappa` and the refit gains `(u * kappa)^2 / 2`. Every such decision,
-//! and every information matrix, profiles the nodes out ([`NodeProfile`]):
-//! the likelihood ratios are those of the whole model. The model is
-//! re-converged and tested until a test changes nothing.
+//! nats. Then every maximum of the residual's efficient score above
+//! `u * kappa` becomes a candidate at once, one refit takes them all in, and
+//! they stay only if each costs, and together they gain, `(u * kappa)^2 / 2`
+//! apiece. Every such decision, and every information matrix, profiles the
+//! nodes out ([`NodeProfile`]): the likelihood ratios are those of the whole
+//! model. The model is re-converged and tested until a test changes nothing.
+//!
+//! Widths run from the in-focus width to [`detect::widest`]. Components
+//! wider than `slack.1 * sigma` are out of focus: they are fitted and
+//! tested like any other, so light goes to whichever explains it, but they
+//! belong to the background ([`Model::background`]).
 
 use crate::detect::{self, Settings, BG_FLOOR, K_MAX, OWN, SUPPORT};
 use crate::linalg::{self, BandChol, Chol};
@@ -36,8 +42,8 @@ pub const KG: usize = 12;
 /// of their parameters) are never joined: Gauss-Seidel between blocks
 /// contracts by rho^2 per round, so weak links cost little.
 pub const RHO_MIN: f64 = 0.05;
-/// Widths: pairs farther apart than this are not examined; a pair's
-/// coupling is read over stamps of `PAIR_SUPPORT` widths.
+/// Widths (the wider of the pair's): pairs farther apart than this are not
+/// examined; a pair's coupling is read over stamps of `PAIR_SUPPORT` widths.
 pub const PAIR_REACH: f64 = 6.0;
 pub const PAIR_SUPPORT: f64 = 3.0;
 /// Nats: the light an emitter's stamp may leave out, no more than a refit
@@ -63,6 +69,10 @@ pub const MAX_OUTER: usize = 80;
 /// anyway; decisive fits (additions) go to [`FIT_TOL`].
 pub const PLAIN_TOL: f64 = 1e-3;
 pub const FIT_TOL: f64 = 1e-6;
+/// Nats: the node profile of a decision stops once a Newton step would gain
+/// less, as a decisive fit does ([`FIT_TOL`]).
+pub const PROFILE_TOL: f64 = FIT_TOL;
+pub const PROFILE_MAX_ITER: usize = 50;
 pub const FIT_MAX_ITER: usize = 100;
 /// LM steps of a leave-one-out removal trial. A truncated trial overstates
 /// the cost of removal, so it can only keep an emitter a full trial would
@@ -333,12 +343,12 @@ impl Nodes {
     }
 }
 
-/// The nodes profiled out, to second order, of every count decision and
-/// information matrix. They enter the model linearly, so after a change of
-/// the model refitting them gains `s^T F^-1 s / 2` nats, with `F = sum_p
-/// s_p s_p^T / m_p` their information and `s = sum_p s_p (d_p / m_p - 1)`
-/// their score. Built once per round on the frame model `m0`; a change on a
-/// patch moves the score by `delta = sum_p s_p d_p (1/m_p - 1/m0_p)` there.
+/// The nodes profiled out of every count decision and information matrix.
+/// Built once per round on the frame model `m0`: the nodes' information
+/// `F = sum_p t_p t_p^T / m0_p` and score `s = sum_p t_p (d_p / m0_p - 1)`,
+/// `t_p` a pixel's tent weights. A decision changes the model on one patch
+/// only; outside it the model moves only with the nodes, and that part of
+/// the objective is taken to second order at `m0` ([`Local::profile`]).
 pub struct NodeProfile {
     nodes: Nodes,
     chol: Option<BandChol>,
@@ -367,10 +377,13 @@ impl NodeProfile {
         Self { nodes: nodes.clone(), chol, w0, m0 }
     }
 
-    /// The nodes under rectangle `rc`: their block of `F^-1`, their part of
-    /// `F^-1 s(m0)`, and each pixel's stencil in local indices. No nodes if
-    /// `F` could not be factored.
-    fn local(&self, rc: &Rect) -> Local {
+    /// The nodes under rectangle `rc`: their block `C` of `F^-1`, their part
+    /// of `F^-1 s(m0)`, each pixel's stencil in local indices, and the
+    /// objective outside `rc` as a quadratic in their offsets, the other
+    /// nodes refitted: curvature `C^-1 - F_rc` and score `C^-1 w0 - s_rc`,
+    /// `F_rc` and `s_rc` the terms of `F` and `s` on `rc`. No nodes if `F`
+    /// could not be factored.
+    fn local(&self, rc: &Rect, d: &[f64]) -> Local {
         let Some(chol) = &self.chol else { return Local::default() };
         let (w, nd) = (self.nodes.w, self.nodes.ny * self.nodes.nx);
         let mut index = std::collections::HashMap::new();
@@ -398,13 +411,38 @@ impl NodeProfile {
                 cinv[a * k + b] = col[i];
             }
         }
-        let m0 = (rc.r0..rc.r1).flat_map(|r| (rc.c0..rc.c1).map(move |c| r * w + c)).map(|p| self.m0[p]).collect();
-        Local { cinv, w0: ids.iter().map(|&i| self.w0[i]).collect(), stencil, m0 }
+        let px: Vec<usize> = (rc.r0..rc.r1).flat_map(|r| (rc.c0..rc.c1).map(move |c| r * w + c)).collect();
+        let m0: Vec<f64> = px.iter().map(|&p| self.m0[p]).collect();
+        let w0: Vec<f64> = ids.iter().map(|&i| self.w0[i]).collect();
+        let (mut hout, mut gout) = (vec![0.0; k * k], vec![0.0; k]);
+        let mut ch = Chol::new(k.max(1));
+        if k > 0 && ch.factor(&cinv, k) {
+            let (mut e, mut col) = (vec![0.0; k], vec![0.0; k]);
+            for j in 0..k {
+                e.fill(0.0);
+                e[j] = 1.0;
+                ch.solve(&e, &mut col);
+                for i in 0..k {
+                    hout[i * k + j] = col[i];
+                }
+            }
+            ch.solve(&w0, &mut gout);
+            for (q, st) in stencil.iter().enumerate() {
+                let (mq, dq) = (m0[q], d[px[q]].max(0.0));
+                for &(a, ta) in st {
+                    gout[a] -= ta * (dq / mq - 1.0);
+                    for &(b, tb) in st {
+                        hout[a * k + b] -= ta * tb / mq;
+                    }
+                }
+            }
+        }
+        Local { cinv, w0, stencil, m0, hout, gout }
     }
 }
 
 /// [`NodeProfile`] on one patch.
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct Local {
     /// `F^-1` on the local nodes, `k x k`.
     cinv: Vec<f64>,
@@ -412,11 +450,84 @@ struct Local {
     /// Per patch pixel: `(local node, weight)`.
     stencil: Vec<[(usize, f64); 4]>,
     m0: Vec<f64>,
+    /// The objective outside the patch, the other nodes refitted, as a
+    /// quadratic in the local nodes' offsets: `-gout^T b + b^T hout b / 2`.
+    /// It does not depend on the model on the patch.
+    hout: Vec<f64>,
+    gout: Vec<f64>,
 }
 
 impl Local {
     fn k(&self) -> usize {
         self.w0.len()
+    }
+
+    /// The profile moved from the round's model `m0` to `m` on this patch:
+    /// the local nodes' information gains `U = sum_p t t^T (1/m - 1/m0)`
+    /// and their score `delta`, so `F^-1` becomes `(F^-1^-1 + U)^-1` and
+    /// the Newton step `(F^-1^-1 + U)^-1 (F^-1^-1 w0 + delta)`. Exact on the
+    /// local block, since only local nodes see the patch. A template mostly
+    /// inside the nodes' span keeps a small efficient information that the
+    /// profile at `m0` would misstate. Unchanged if a block cannot be
+    /// factored.
+    fn at(&self, d: &[f64], m: &[f64]) -> Local {
+        let k = self.k();
+        let mut out = self.clone();
+        if k == 0 {
+            return out;
+        }
+        let (mut u, mut delta) = (vec![0.0; k * k], vec![0.0; k]);
+        for (p, st) in self.stencil.iter().enumerate() {
+            let dw = 1.0 / m[p] - 1.0 / self.m0[p];
+            if dw == 0.0 {
+                continue;
+            }
+            for &(a, ta) in st {
+                delta[a] += ta * d[p].max(0.0) * dw;
+                for &(b, tb) in st {
+                    u[a * k + b] += ta * tb * dw;
+                }
+            }
+        }
+        let mut chol = Chol::new(k);
+        if !chol.factor(&self.cinv, k) {
+            return out;
+        }
+        // F_loc = cinv^-1, by columns.
+        let (mut e, mut col) = (vec![0.0; k], vec![0.0; k]);
+        let mut a = vec![0.0; k * k];
+        for j in 0..k {
+            e.fill(0.0);
+            e[j] = 1.0;
+            chol.solve(&e, &mut col);
+            for i in 0..k {
+                a[i * k + j] = col[i] + u[i * k + j];
+            }
+        }
+        let mut rhs = vec![0.0; k];
+        chol.solve(&self.w0, &mut rhs);
+        rhs.iter_mut().zip(&delta).for_each(|(r, dl)| *r += dl);
+        for i in 0..k {
+            for j in 0..i {
+                let v = 0.5 * (a[i * k + j] + a[j * k + i]);
+                a[i * k + j] = v;
+                a[j * k + i] = v;
+            }
+        }
+        if !chol.factor(&a, k) {
+            return out;
+        }
+        chol.solve(&rhs, &mut out.w0);
+        for j in 0..k {
+            e.fill(0.0);
+            e[j] = 1.0;
+            chol.solve(&e, &mut col);
+            for i in 0..k {
+                out.cinv[i * k + j] = col[i];
+            }
+        }
+        out.m0 = m.to_vec();
+        out
     }
 
     /// `out = F^-1 b` on the local nodes.
@@ -434,19 +545,68 @@ impl Local {
         a.iter().zip(&fb).map(|(u, v)| u * v).sum()
     }
 
-    /// What refitting the nodes gains on model `m` of the patch, less what
-    /// it gains on `m0`: `delta^T F^-1 s(m0) + delta^T F^-1 delta / 2`.
-    fn gain(&self, d: &[f64], m: &[f64]) -> f64 {
-        let mut delta = vec![0.0; self.k()];
-        for (p, st) in self.stencil.iter().enumerate() {
-            let v = d[p].max(0.0) * (1.0 / m[p] - 1.0 / self.m0[p]);
-            if v != 0.0 {
-                for &(l, t) in st {
-                    delta[l] += t * v;
+    /// The objective of patch model `m` with the nodes refitted: the
+    /// patch's I-divergence at `m + T b` plus the quadratic outside, least
+    /// over the local nodes' offsets `b`, by Fisher scoring with
+    /// backtracking until the Newton decrement is below [`PROFILE_TOL`].
+    /// Exact on the patch, where a decision changes the model by as much as
+    /// an emitter's light: a second-order profile there overstates what
+    /// the nodes recover from a wide component by tens of nats.
+    fn profile(&self, d: &[f64], m: &[f64]) -> f64 {
+        let k = self.k();
+        if k == 0 {
+            return idiv(d, m);
+        }
+        let at = |b: &[f64]| -> Vec<f64> {
+            self.stencil.iter().zip(m).map(|(st, &mp)| (mp + st.iter().map(|&(l, t)| t * b[l]).sum::<f64>()).max(BG_FLOOR)).collect()
+        };
+        let outside = |b: &[f64]| {
+            let hb: f64 = (0..k).map(|i| b[i] * (0..k).map(|j| self.hout[i * k + j] * b[j]).sum::<f64>()).sum();
+            -b.iter().zip(&self.gout).map(|(u, v)| u * v).sum::<f64>() + 0.5 * hb
+        };
+        let mut b = vec![0.0; k];
+        let mut mm = at(&b);
+        let mut cur = idiv(d, &mm);
+        let mut chol = Chol::new(k);
+        for _ in 0..PROFILE_MAX_ITER {
+            // Gradient and Fisher information of the objective in b.
+            let mut g: Vec<f64> = (0..k).map(|i| -self.gout[i] + (0..k).map(|j| self.hout[i * k + j] * b[j]).sum::<f64>()).collect();
+            let mut h = self.hout.clone();
+            for (st, (&dp, &mp)) in self.stencil.iter().zip(d.iter().zip(&mm)) {
+                let r = 1.0 - dp.max(0.0) / mp;
+                for &(i, ti) in st {
+                    g[i] += ti * r;
+                    for &(j, tj) in st {
+                        h[i * k + j] += ti * tj / mp;
+                    }
                 }
             }
+            if !chol.factor(&h, k) {
+                break;
+            }
+            let mut step: Vec<f64> = g.iter().map(|v| -v).collect();
+            chol.solve_in_place(&mut step);
+            let dec = -step.iter().zip(&g).map(|(u, v)| u * v).sum::<f64>();
+            if dec < 2.0 * PROFILE_TOL {
+                break;
+            }
+            let mut t = 1.0;
+            let mut moved = false;
+            while t > 1e-6 {
+                let b2: Vec<f64> = b.iter().zip(&step).map(|(u, v)| u + t * v).collect();
+                let m2 = at(&b2);
+                let v2 = idiv(d, &m2) + outside(&b2);
+                if v2 <= cur - 0.25 * t * dec {
+                    (b, mm, cur, moved) = (b2, m2, v2, true);
+                    break;
+                }
+                t *= 0.5;
+            }
+            if !moved {
+                break;
+            }
         }
-        delta.iter().zip(&self.w0).map(|(a, b)| a * b).sum::<f64>() + 0.5 * self.quad(&delta, &delta)
+        cur
     }
 }
 
@@ -460,6 +620,7 @@ fn idiv(d: &[f64], m: &[f64]) -> f64 {
 
 /// A group's pixels: the data, and everything the group does not own
 /// (background and every other emitter) as `halo`.
+#[derive(Clone)]
 struct Patch {
     rc: Rect,
     d: Vec<f64>,
@@ -481,8 +642,7 @@ impl Patch {
     /// I-divergence of `ems` on the patch with the nodes profiled out, up to
     /// a constant: what the count decisions compare.
     fn profiled(&self, ems: &[Em]) -> f64 {
-        let m = self.model(&self.stamps(ems));
-        idiv(&self.d, &m) - self.loc.gain(&self.d, &m)
+        self.loc.profile(&self.d, &self.model(&self.stamps(ems)))
     }
 
     /// Fisher information of the stamps' `(a, y, x, s)` with the nodes
@@ -736,6 +896,46 @@ pub(crate) fn blur(src: &[f64], rows: usize, cols: usize, k: &[f64], (r0, r1, c0
     out
 }
 
+/// [`blur`] on the box where it can be nonzero only: the image there,
+/// row-major, and the box `(y0, y1, x0, x1)`.
+fn blur_box(src: &[f64], rows: usize, cols: usize, k: &[f64], (r0, r1, c0, c1): (usize, usize, usize, usize)) -> (Vec<f64>, (usize, usize, usize, usize)) {
+    if r0 >= r1 || c0 >= c1 {
+        return (Vec::new(), (0, 0, 0, 0));
+    }
+    let rad = k.len() / 2;
+    let (y0, y1) = (r0.saturating_sub(rad), (r1 + rad).min(rows));
+    let (x0, x1) = (c0.saturating_sub(rad), (c1 + rad).min(cols));
+    let taps = |i: usize, lo: usize, hi: usize| (lo + rad).saturating_sub(i)..(hi + rad).saturating_sub(i).min(k.len());
+    let (mw, bw) = (c1 - c0, x1 - x0);
+    let mut mid = vec![0.0; (y1 - y0) * mw];
+    for i in y0..y1 {
+        let row = &mut mid[(i - y0) * mw..(i - y0 + 1) * mw];
+        for t in taps(i, r0, r1) {
+            let (src_row, kv) = ((i + t - rad) * cols, k[t]);
+            for (m, s) in row.iter_mut().zip(&src[src_row + c0..src_row + c1]) {
+                *m += kv * s;
+            }
+        }
+    }
+    let mut out = vec![0.0; (y1 - y0) * bw];
+    for i in y0..y1 {
+        let row = &mid[(i - y0) * mw..(i - y0 + 1) * mw];
+        for j in x0..x1 {
+            out[(i - y0) * bw + j - x0] = taps(j, c0, c1).map(|t| k[t] * row[j + t - rad - c0]).sum();
+        }
+    }
+    (out, (y0, y1, x0, x1))
+}
+
+/// `img` of [`blur_box`] at patch pixel `(r, c)`.
+fn at_box((img, b): &(Vec<f64>, (usize, usize, usize, usize)), r: usize, c: usize) -> f64 {
+    if r >= b.0 && r < b.1 && c >= b.2 && c < b.3 {
+        img[(r - b.0) * (b.3 - b.2) + c - b.2]
+    } else {
+        0.0
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct Stats {
     pub fits: usize,
@@ -773,8 +973,10 @@ pub struct Model<'a> {
     /// Flux bounds: from the frame maximum, so a fit never runs away.
     a_min: f64,
     a_max: f64,
-    /// The seed widths ([`detect::widths`]) and each one's unit-flux
-    /// profile along one axis.
+    /// The in-focus seed widths ([`detect::widths`] up to `slack.1 *
+    /// sigma`), where add rounds place emitters, and each one's unit-flux
+    /// profile along one axis. Out-of-focus components come from the seeds,
+    /// whose frame-wide score holds at every width.
     k1: Vec<(f64, Vec<f64>)>,
     pub ems: Vec<Emitter>,
     pub nodes: Nodes,
@@ -808,7 +1010,7 @@ impl<'a> Model<'a> {
     ) -> Self {
         assert_eq!(d.len(), h * w);
         let smax = d.iter().fold(f64::NEG_INFINITY, |a, &v| a.max(v)).max(1.0);
-        let a_max = 8.0 * smax / psf::peak_factor(s.sigma) * s.slack.1 * s.slack.1;
+        let a_max = 8.0 * smax / psf::peak_factor(s.sigma) * (detect::widest(s) / s.sigma).powi(2);
         let mut nodes = Nodes::new(h, w, tile(s));
         nodes.fit_map(bg0);
         let mut md = Self {
@@ -822,7 +1024,7 @@ impl<'a> Model<'a> {
             a_min: detect::A_MIN.max(detect::A_MIN_REL * a_max),
             a_max,
             var: phi * detect::median(bg0).max(BG_FLOOR),
-            k1: detect::widths(s).into_iter().map(|w| (w, detect::psf_kernel1d(w))).collect(),
+            k1: detect::widths(s).into_iter().filter(|&w| w <= s.slack.1 * s.sigma).map(|w| (w, detect::psf_kernel1d(w))).collect(),
             ems: e0.iter().map(|&e| Emitter { e, flags: 0, seen: e }).collect(),
             nodes,
             bg: Vec::new(),
@@ -849,6 +1051,21 @@ impl<'a> Model<'a> {
         for em in &self.ems {
             Stamp::new(&em.e, stamp_radius(&em.e, self.var), &frame).paint(&mut self.light, &frame, 1.0);
         }
+    }
+
+    /// Whether `e` is an in-focus emitter rather than out-of-focus light.
+    pub fn in_focus(&self, e: &Em) -> bool {
+        e.s <= self.s.slack.1 * self.s.sigma
+    }
+
+    /// The nodes' surface plus the light of every out-of-focus component.
+    pub fn background(&self) -> Vec<f64> {
+        let frame = self.frame();
+        let mut bg = self.bg.clone();
+        for em in self.ems.iter().filter(|em| !self.in_focus(&em.e)) {
+            Stamp::new(&em.e, stamp_radius(&em.e, self.var), &frame).paint(&mut bg, &frame, 1.0);
+        }
+        bg
     }
 
     /// `max(B + light, BG_FLOOR)`.
@@ -919,9 +1136,9 @@ impl<'a> Model<'a> {
         linalg::sym_eig_max(&mut s, 4).abs()
     }
 
-    /// Groups: union-find over pairs within [`PAIR_REACH`] widths, strongest
-    /// coupling first, joining two groups only while the union holds at
-    /// most [`KG`] and the coupling is at least [`RHO_MIN`].
+    /// Groups: union-find over pairs within [`PAIR_REACH`] of the wider's
+    /// width, strongest coupling first, joining two groups only while the
+    /// union holds at most [`KG`] and the coupling is at least [`RHO_MIN`].
     pub fn partition(&self) -> Vec<Vec<usize>> {
         let n = self.ems.len();
         let mut pairs = Vec::new();
@@ -938,7 +1155,7 @@ impl<'a> Model<'a> {
                     for dx in -1..=1 {
                         for &j in grid.get(&(cell(a.e.y) + dy, cell(a.e.x) + dx)).into_iter().flatten() {
                             let b = &self.ems[j];
-                            if j > i && (a.e.y - b.e.y).hypot(a.e.x - b.e.x) <= reach {
+                            if j > i && (a.e.y - b.e.y).hypot(a.e.x - b.e.x) <= PAIR_REACH * a.e.s.max(b.e.s) {
                                 pairs.push((i, j, self.rho2(&a.e, &b.e, &m)));
                             }
                         }
@@ -1026,7 +1243,7 @@ impl<'a> Model<'a> {
         for &i in g {
             Stamp::new(&self.ems[i].e, stamp_radius(&self.ems[i].e, self.var), &rc).paint(&mut halo, &rc, -1.0);
         }
-        let (sl, sh) = (self.s.slack.0 * self.s.sigma, self.s.slack.1 * self.s.sigma);
+        let (sl, sh) = (self.s.slack.0 * self.s.sigma, detect::widest(&self.s));
         Patch {
             rc,
             d,
@@ -1038,17 +1255,32 @@ impl<'a> Model<'a> {
         }
     }
 
-    /// Best pixel and width of `owned` for one more emitter, over the seed
-    /// widths, by `z` over the width's [`detect::proposal_factor`]:
-    /// `(z, row, col, one-step flux, width)`. `z = S / sqrt(I_eff)`,
-    /// where `S` is the score of its flux and `I_eff` its information less
-    /// the projection onto the nodes and the members. A member that has
-    /// absorbed a neighbour by widening leaves little of it in the residual,
-    /// and the projection is what finds it there.
-    fn score(&self, p: &Patch, ems: &[Em], owned: &[bool]) -> Option<(f64, usize, usize, f64, f64)> {
+    /// Candidates for more emitters, strongest first, as `(r, row, col,
+    /// one-step flux, width)`: `placeable` pixels where `r`, `z` over the
+    /// width's [`detect::proposal_factor`] maximised over the in-focus seed
+    /// widths, exceeds `ut` and is the largest of its `owned` 3x3
+    /// neighbours: a maximum of the score restricted to where the group may
+    /// add. An ROI only limits the placement, so a peak outside it is not
+    /// proposed at its edge.
+    /// `z = S_eff / sqrt(I_eff)`, the efficient score of the new emitter's
+    /// flux: `S` less its projection on the nodes' and the members' scores,
+    /// through their joint Newton step, and its information less the
+    /// projection onto the nodes and the members. A member that has absorbed
+    /// a neighbour by widening leaves little of it in the residual, and the
+    /// projection is what finds it there. The Newton step makes `z` exact for
+    /// a fit not yet converged: a template nearly collinear with the nodes or
+    /// a member would otherwise divide their leftover gradient by a vanishing
+    /// `I_eff`. Each candidate's `z` holds with the others absent; the refit
+    /// that takes them all in decides between them.
+    fn proposals(&self, p: &Patch, ems: &[Em], owned: &[bool], placeable: &[bool], ut: f64) -> Vec<(f64, usize, usize, f64, f64)> {
         let (rows, cols, n) = (p.rc.rows(), p.rc.cols(), p.rc.n());
+        let nbrs = |k: usize| {
+            let (r, c) = (k / cols, k % cols);
+            (r.saturating_sub(1)..(r + 2).min(rows)).flat_map(move |r| (c.saturating_sub(1)..(c + 2).min(cols)).map(move |c| r * cols + c))
+        };
         let st = p.stamps(ems);
         let m = p.model(&st);
+        let p = &Patch { loc: p.loc.at(&p.d, &m), ..p.clone() };
         let wt: Vec<f64> = m.iter().map(|m| 1.0 / (self.phi * m)).collect();
         let resid: Vec<f64> = (0..n).map(|k| (p.d[k] - m[k]) * wt[k]).collect();
         let all = (0, rows, 0, cols);
@@ -1091,40 +1323,97 @@ impl<'a> Model<'a> {
         let f: Vec<f64> = p.information(&st, &m).iter().map(|v| v / self.phi).collect();
         let mut chol = Chol::new(np.max(1));
         let proj = np > 0 && chol.factor(&f, np);
-        let (mut cq, mut x, mut bk, mut cb) = (vec![0.0; np], vec![0.0; np], vec![0.0; nk], vec![0.0; nk]);
+        // The nodes' Newton step at the patch's model (unit-free).
+        let wn = p.loc.w0.clone();
+        // The members' Newton step with the nodes profiled out.
+        let mut xm = vec![0.0; np];
+        if proj {
+            let (_, gm) = p.normal(&st, &m);
+            let rm: Vec<f64> = (0..np).map(|q| -gm[q] / self.phi - bj[q].iter().zip(&wn).map(|(a, b)| a * b).sum::<f64>()).collect();
+            chol.solve(&rm, &mut xm);
+        }
+        // The projection onto the members, cq^T F^-1 cq with cq = c_k - B cb
+        // (B the members' coupling to the nodes, cb the nodes' part), is
+        // expanded so that each pixel pays for the members whose template
+        // overlaps it and for the nodes, never for the whole group:
+        // F^-1, H = F^-1 B, K = B^T F^-1 B and B^T xm, once per call.
+        let mut finv = vec![0.0; np * np];
+        if proj {
+            let (mut e, mut col) = (vec![0.0; np], vec![0.0; np]);
+            for j in 0..np {
+                e.fill(0.0);
+                e[j] = 1.0;
+                chol.solve(&e, &mut col);
+                for i in 0..np {
+                    finv[i * np + j] = col[i];
+                }
+            }
+        }
+        let hb: Vec<Vec<f64>> = (0..np).map(|q| (0..nk).map(|l| (0..np).map(|r| finv[q * np + r] * bj[r][l]).sum()).collect()).collect();
+        let kb: Vec<f64> = (0..nk * nk).map(|lm| (0..np).map(|q| bj[q][lm / nk] * hb[q][lm % nk]).sum()).collect();
+        let bx: Vec<f64> = (0..nk).map(|l| (0..np).map(|q| bj[q][l] * xm[q]).sum()).collect();
+        let (mut bk, mut cb, mut hc) = (vec![0.0; nk], vec![0.0; nk], vec![0.0; nk]);
+        let mut act: Vec<usize> = Vec::with_capacity(np);
         let dot = |a: &[f64], b: &[f64]| a.iter().zip(b).map(|(u, v)| u * v).sum::<f64>();
-        let mut best: Option<(f64, usize, usize, f64, f64)> = None;
+        // Per pixel: the best r over widths, its one-step flux and width.
+        let mut best = vec![(f64::NEG_INFINITY, 0.0, 0.0); n];
         for (width, k1) in &self.k1 {
             let k2: Vec<f64> = k1.iter().map(|v| v * v).collect();
             let s = blur(&resid, rows, cols, k1, all);
             let igg = blur(&wt, rows, cols, &k2, all);
-            let bt: Vec<Vec<f64>> =
-                tents.iter().map(|(img, sup)| if sup.0 < sup.1 { blur(img, rows, cols, k1, *sup) } else { vec![0.0; n] }).collect();
-            // c[q][k] = sum_j g_k(j) J_q(j) wt(j), for each member column.
-            let c: Vec<Vec<f64>> = if proj { jw.iter().map(|(img, sup)| blur(img, rows, cols, k1, *sup)).collect() } else { Vec::new() };
+            let bt: Vec<_> = tents.iter().map(|(img, sup)| blur_box(img, rows, cols, k1, *sup)).collect();
+            // c[q] at k = sum_j g_k(j) J_q(j) wt(j), for each member column.
+            let c: Vec<_> = if proj { jw.iter().map(|(img, sup)| blur_box(img, rows, cols, k1, *sup)).collect() } else { Vec::new() };
+            let pf = detect::proposal_factor(*width);
+            let mut ck = vec![0.0; np];
             for k in (0..n).filter(|&k| owned[k]) {
+                let (r, cc) = (k / cols, k % cols);
                 for l in 0..nk {
-                    bk[l] = bt[l][k];
+                    bk[l] = at_box(&bt[l], r, cc);
                 }
                 // The nodes' inverse information, in these dispersion units.
                 p.loc.apply(&bk, &mut cb);
                 cb.iter_mut().for_each(|v| *v *= self.phi);
                 let mut ieff = igg[k] - dot(&bk, &cb);
+                let mut seff = s[k] - dot(&bk, &wn);
                 if proj {
-                    for q in 0..np {
-                        cq[q] = c[q][k] - dot(&bj[q], &cb);
+                    // Members whose blurred columns reach k.
+                    act.clear();
+                    for i in 0..np / 4 {
+                        let b = c[4 * i].1;
+                        if r >= b.0 && r < b.1 && cc >= b.2 && cc < b.3 {
+                            for a in 4 * i..4 * i + 4 {
+                                ck[a] = at_box(&c[a], r, cc);
+                                act.push(a);
+                            }
+                        }
                     }
-                    chol.solve(&cq, &mut x);
-                    ieff -= cq.iter().zip(&x).map(|(a, b)| a * b).sum::<f64>();
+                    for l in 0..nk {
+                        hc[l] = dot(&kb[l * nk..(l + 1) * nk], &cb);
+                    }
+                    let mut quad = dot(&cb, &hc);
+                    for &a in &act {
+                        let ca = ck[a];
+                        let inner: f64 = act.iter().map(|&b| finv[a * np + b] * ck[b]).sum();
+                        quad += ca * (inner - 2.0 * dot(&hb[a], &cb));
+                        seff -= ca * xm[a];
+                    }
+                    ieff -= quad;
+                    seff += dot(&cb, &bx);
                 }
                 let ieff = ieff.max(1e-12);
-                let z = s[k] / ieff.sqrt();
-                if best.is_none_or(|b| z / detect::proposal_factor(*width) > b.0 / detect::proposal_factor(b.4)) {
-                    best = Some((z, p.rc.r0 + k / cols, p.rc.c0 + k % cols, s[k] / ieff, *width));
+                let r = seff / ieff.sqrt() / pf;
+                if r > best[k].0 {
+                    best[k] = (r, seff / ieff, *width);
                 }
             }
         }
-        best
+        let mut out: Vec<(f64, usize, usize, f64, f64)> = (0..n)
+            .filter(|&k| placeable[k] && best[k].0 > ut && nbrs(k).filter(|&q| owned[q]).all(|q| if q < k { best[q].0 < best[k].0 } else { q == k || best[q].0 <= best[k].0 }))
+            .map(|k| (best[k].0, p.rc.r0 + k / cols, p.rc.c0 + k % cols, best[k].1, best[k].2))
+            .collect();
+        out.sort_by(|a, b| b.0.total_cmp(&a.0));
+        out
     }
 
     /// Background plus light on `rc`.
@@ -1162,7 +1451,7 @@ impl<'a> Model<'a> {
     /// One Gauss-Seidel round: every group refitted in turn against the
     /// current light of all others, then the nodes. With `test`, each group
     /// first drops emitters whose removal costs less than `u^2/2` nats, then
-    /// adds within `OWN` sigma of its members, at any seed width, at
+    /// adds within `OWN` sigma of its members, at any in-focus width, at
     /// `u * kappa`.
     /// Returns `(adds, removals, objective)`.
     #[allow(clippy::neg_cmp_op_on_partial_ord)]
@@ -1201,7 +1490,7 @@ impl<'a> Model<'a> {
             }
             let mut p = self.patch(g, rc);
             if testing {
-                p.loc = prof.as_ref().unwrap().local(&rc);
+                p.loc = prof.as_ref().unwrap().local(&rc, self.d);
             }
             let em0: Vec<Em> = g.iter().map(|&i| self.ems[i].e).collect();
             let mut state = if still {
@@ -1240,29 +1529,88 @@ impl<'a> Model<'a> {
                     origin.remove(k);
                     n_rem += 1;
                 }
+                // The adds are measured against a converged group, not a
+                // removal's truncated trial.
+                if origin.len() < g.len() {
+                    state = fit(&p, &state.ems, FIT_MAX_ITER, FIT_TOL);
+                    self.stats.fits += 1;
+                }
+                // Pixels the group may add on, and those in the ROI too.
                 let owned: Vec<bool> = (0..rc.n())
                     .map(|k| {
                         let (r, c) = (rc.r0 + k / rc.cols(), rc.c0 + k % rc.cols());
                         state.ems.iter().any(|e| (r as f64 - e.y).hypot(c as f64 - e.x) <= own_r)
-                            && self.roi.is_none_or(|m| m[r * self.w + c])
                     })
                     .collect();
-                while state.ems.len() < g.len() + K_MAX {
-                    let Some((z, r, c, a, width)) = self.score(&p, &state.ems, &owned) else { break };
-                    if !(z > ut * detect::proposal_factor(width)) {
-                        break;
-                    }
+                let placeable: Vec<bool> = (0..rc.n())
+                    .map(|k| owned[k] && self.roi.is_none_or(|m| m[(rc.r0 + k / rc.cols()) * self.w + rc.c0 + k % rc.cols()]))
+                    .collect();
+                let mut cands = self.proposals(&p, &state.ems, &owned, &placeable, ut);
+                cands.truncate((g.len() + K_MAX).saturating_sub(state.ems.len()));
+                if !cands.is_empty() {
                     let mut em = state.ems.clone();
-                    em.push(Em { a, y: r as f64, x: c as f64, s: width });
-                    let trial = fit(&p, &em, FIT_MAX_ITER, FIT_TOL);
+                    em.extend(cands.iter().map(|&(_, r, c, a, s)| Em { a, y: r as f64, x: c as f64, s }));
+                    let mut cur = fit(&p, &em, FIT_MAX_ITER, FIT_TOL);
                     self.stats.fits += 1;
-                    if !(p.profiled(&state.ems) - p.profiled(&trial.ems) > gain_add) {
-                        self.stats.lr_fail += 1;
-                        break;
+                    // fresh[j]: cur.ems[j] is a candidate.
+                    let mut fresh: Vec<bool> = (0..em.len()).map(|j| j >= state.ems.len()).collect();
+                    // A candidate stands for the emitter its score saw where
+                    // it was placed; one the fit carries farther than the
+                    // add radius, OWN sigma, has become some other source.
+                    let n0 = state.ems.len();
+                    let stray = |j: usize| (cur.ems[j].y - em[j].y).hypot(cur.ems[j].x - em[j].x) > own_r;
+                    if (n0..cur.ems.len()).any(stray) {
+                        let keep: Vec<usize> = (0..cur.ems.len()).filter(|&j| j < n0 || !stray(j)).collect();
+                        self.stats.lr_fail += cur.ems.len() - keep.len();
+                        fresh = keep.iter().map(|&j| j >= n0).collect();
+                        let em: Vec<Em> = keep.iter().map(|&j| cur.ems[j]).collect();
+                        cur = fit(&p, &em, FIT_MAX_ITER, FIT_TOL);
+                        self.stats.fits += 1;
                     }
-                    state = trial;
-                    origin.push(None);
-                    n_add += 1;
+                    // The candidates stay only if together they gain (u
+                    // kappa)^2 / 2 each, and each costs that much to drop,
+                    // the rest refitted: the objective less (u kappa)^2 / 2
+                    // per emitter then rises with every change a test
+                    // makes, so no sequence of adds and removals returns to
+                    // where it began. Wald costs understate the cost of
+                    // dropping one, so one that clears the bar is kept
+                    // untried; the weakest otherwise goes first.
+                    let base0 = p.profiled(&state.ems);
+                    loop {
+                        let k = fresh.iter().filter(|&&f| f).count();
+                        if k == 0 {
+                            break;
+                        }
+                        let short = base0 - p.profiled(&cur.ems) < gain_add * k as f64;
+                        let wc = wald_costs(&p, &cur);
+                        let doubt: Vec<usize> = (0..cur.ems.len()).filter(|&j| fresh[j] && (short || wc[j] < gain_add)).collect();
+                        if doubt.is_empty() {
+                            break;
+                        }
+                        let base = p.profiled(&cur.ems);
+                        let (cost, j, trial) = doubt
+                            .iter()
+                            .map(|&j| {
+                                let mut em = cur.ems.clone();
+                                em.remove(j);
+                                let t = fit(&p, &em, REMOVE_ITER, FIT_TOL);
+                                (p.profiled(&t.ems) - base, j, t)
+                            })
+                            .min_by(|a, b| a.0.total_cmp(&b.0))
+                            .unwrap();
+                        self.stats.fits += doubt.len();
+                        if !short && !(cost < gain_add) {
+                            break;
+                        }
+                        self.stats.lr_fail += 1;
+                        fresh.remove(j);
+                        cur = fit(&p, &trial.ems, FIT_MAX_ITER, FIT_TOL);
+                        self.stats.fits += 1;
+                    }
+                    let born_here = fresh.iter().filter(|&&f| f).count();
+                    origin.extend(std::iter::repeat_n(None, born_here));
+                    n_add += born_here;
+                    state = cur;
                 }
             }
             for &i in g {
@@ -1347,7 +1695,7 @@ impl<'a> Model<'a> {
             .map(|g| {
                 let rc = self.group_rect(&g);
                 let mut p = self.patch(&g, rc);
-                p.loc = prof.local(&rc);
+                p.loc = prof.local(&rc, self.d);
                 let st = p.stamps(&g.iter().map(|&i| self.ems[i].e).collect::<Vec<_>>());
                 let f = p.information(&st, &p.model(&st));
                 (g, f)

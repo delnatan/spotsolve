@@ -11,7 +11,9 @@
 //! 3. The joint model ([`Model`]) fits them together with a node
 //!    background, removes those not worth `u^2 / 2` nats and adds where the
 //!    residual asks for more.
-//! 4. Uncertainties from each final group's Fisher information.
+//! 4. Components wider than `slack.1 * sigma` are out of focus: their
+//!    light joins the background and they are not reported ([`widest`]).
+//! 5. Uncertainties from each final group's Fisher information.
 
 use crate::filters::{self, Mode};
 use crate::linalg::Chol;
@@ -19,8 +21,10 @@ use crate::model::{self, Em, Model, Rect};
 use crate::psf;
 use crate::statistics;
 
-/// Optimization bounds for fitted widths, as multiples of `sigma`.
-pub const SLACK: (f64, f64) = (1.0, 2.2);
+/// Widths of reported emitters, as multiples of `sigma`: the in-focus
+/// width up to the edge of the depth of focus. Wider components, up to
+/// [`widest`], are fitted as background.
+pub const SLACK: (f64, f64) = (1.0, 2.25);
 /// Default count knob: expected false emitters per 10^6 pixels of pure noise.
 pub const FP_PER_MPX: f64 = 16.0;
 /// Width ratio of adjacent seed templates: an emitter between two keeps at
@@ -78,11 +82,12 @@ pub struct Output {
     pub fisher_fraction: Vec<f64>,
     /// `N`: bitwise combination of `FLAG_*` diagnostics.
     pub flags: Vec<u8>,
-    /// Fitted background at each emitter's nearest pixel, excluding neighbours.
+    /// Fitted background at each emitter's nearest pixel, excluding
+    /// neighbours: the nodes plus out-of-focus light.
     pub fitted_background: Vec<f64>,
     /// Scalar dispersion: pixel variance per unit of signal, ADU.
     pub dispersion: f64,
-    /// `H*W`, ADU above the offset.
+    /// `H*W`, ADU above the offset: the nodes plus out-of-focus light.
     pub background: Vec<f64>,
     /// The score threshold used.
     pub u: f64,
@@ -96,12 +101,22 @@ pub struct Output {
     pub removed: usize,
     pub outer: usize,
     pub kappa: f64,
+    /// Out-of-focus components fitted and returned as background.
+    pub out_of_focus: usize,
+}
+
+/// px. The widest component the model fits: half the node spacing
+/// ([`model::tile`]), where the nodes carry most of a blob's light wherever
+/// it sits. Out-of-focus light narrower than this would otherwise have to
+/// be explained by emitters.
+pub fn widest(s: &Settings) -> f64 {
+    0.5 * model::tile(s) as f64
 }
 
 /// The seed templates' widths: geometric from `slack.0 * sigma` to
-/// `slack.1 * sigma`, adjacent ones at most [`WIDTH_STEP`] apart.
+/// [`widest`], adjacent ones at most [`WIDTH_STEP`] apart.
 pub fn widths(s: &Settings) -> Vec<f64> {
-    let (lo, hi) = (s.slack.0 * s.sigma, s.slack.1 * s.sigma);
+    let (lo, hi) = (s.slack.0 * s.sigma, widest(s));
     let n = ((hi / lo).ln() / WIDTH_STEP.ln() - 1e-9).ceil().max(0.0) as usize + 1;
     (0..n).map(|j| if n == 1 { lo } else { lo * (hi / lo).powf(j as f64 / (n - 1) as f64) }).collect()
 }
@@ -115,7 +130,7 @@ pub fn widths(s: &Settings) -> Vec<f64> {
 /// most `fp_per_mpx`. Solved on `u >= 1`, where the rate decreases, by
 /// bisection.
 pub fn threshold(s: &Settings) -> f64 {
-    let l = statistics::lkc(s.slack.0 * s.sigma, s.slack.1 * s.sigma, Some(model::tile(s)));
+    let l = statistics::lkc(s.slack.0 * s.sigma, widest(s), Some(model::tile(s)));
     let fp_per_mpx = s.fp_per_mpx;
     let rate = |u: f64| 1e6 * statistics::expected_ec(u, &l);
     let (mut lo, mut hi) = (1.0, 40.0);
@@ -256,12 +271,14 @@ pub(crate) fn psf_kernel1d(sigma: f64) -> Vec<f64> {
 }
 
 /// Frame-wide score z of one emitter of width `sigma` against the bilinear
-/// background on nodes `tile` px apart: the correlation of `r = d - B` (`B`
-/// the fitted nodes) with the profile `g`, over
-/// `sqrt(var |g - P g|^2)`, `P` the projection on the nodes' tents. That is
+/// background on nodes `tile` px apart: the correlation of `r` with the
+/// profile `g`, over `sqrt(var |g - P g|^2)`, `P` the projection on the
+/// nodes' tents. `r` must be orthogonal to the tents (the data less its
+/// node fit, or a fitted model's residual): then `<g, r> = <g - P g, d>`,
 /// the signed root of the likelihood ratio with the nodes profiled out, the
 /// statistic the count decisions test, taking `var` as constant across the
-/// profile. The frame has no pixels beyond its edge.
+/// profile. No estimate of the background enters its mean. The frame has
+/// no pixels beyond its edge.
 pub fn score_map(r: &[f64], var: &[f64], h: usize, w: usize, sigma: f64, tile: usize) -> Vec<f64> {
     let k1 = psf_kernel1d(sigma);
     let c = model::blur(r, h, w, &k1, (0, h, 0, w));
@@ -366,7 +383,7 @@ pub(crate) fn at_bound(value: f64, lo: f64, hi: f64) -> bool {
 /// (`(OWN + SUPPORT) sigma`), plus the median window and the widest score
 /// kernel that seed's background and z read.
 fn crop_margin(s: &Settings) -> usize {
-    let wide = s.slack.1 * s.sigma;
+    let wide = widest(s);
     let kernel = (4.0 * wide).ceil() as usize + wide.ceil() as usize;
     let pad = ((OWN + SUPPORT) * s.sigma).ceil() as usize;
     pad.max(kernel) + 1 + BG_WIN / 2 + 2
@@ -430,23 +447,23 @@ pub struct Start {
 }
 
 /// Seeds as emitters: local maxima over position and width of the score
-/// ([`score_map`]) against the nodes fitted to the median background, above
-/// `u` times [`proposal_factor`],
-/// strongest first, each at its template's width. `roi` (same shape as `d`) limits seeds. Seeds are
+/// ([`score_map`]) with the nodes profiled out, above `u` times
+/// [`proposal_factor`], strongest first, each at its template's width. `roi` (same shape as `d`) limits seeds. Seeds are
 /// proposals; the joint model's removal test decides them.
 pub fn start(d: &[f64], h: usize, w: usize, roi: Option<&[bool]>, s: &Settings) -> Start {
     assert_eq!(d.len(), h * w);
     let u = threshold(s);
     let bmap = median_background(d, h, w);
     let phi = dispersion(d, h, w);
-    // The nodes fitted to the median, which the emitters barely move: the
-    // background with every emitter in the model, as the score assumes.
+    // The score's mean needs the data less its projection on the tents; its
+    // variance, the background level, from the nodes fitted to the median,
+    // which the emitters barely move.
     let tile = model::tile(s);
     let mut nodes = model::Nodes::new(h, w, tile);
+    nodes.fit_map(d);
+    let resid: Vec<f64> = d.iter().zip(&nodes.surface()).map(|(a, b)| a - b).collect();
     nodes.fit_map(&bmap);
-    let bg = nodes.surface();
-    let resid: Vec<f64> = d.iter().zip(&bg).map(|(a, b)| a - b).collect();
-    let var: Vec<f64> = bg.iter().map(|b| phi * b.max(BG_FLOOR)).collect();
+    let var: Vec<f64> = nodes.surface().iter().map(|b| phi * b.max(BG_FLOOR)).collect();
     let ws = widths(s);
     let z: Vec<Vec<f64>> = ws.iter().map(|&sj| score_map(&resid, &var, h, w, sj, tile)).collect();
     let ems = find_seeds(&z, &ws, h, w, u)
@@ -488,26 +505,28 @@ pub fn localize(d: &[f64], h: usize, w: usize, roi: Option<&[bool]>, s: &Setting
     let first = start(dc, ch, cw, rc, s);
     let mut md = Model::new(dc, ch, cw, &first.ems, &first.background, first.dispersion, first.u, s, rc);
     md.run();
-    let mut out = report(&md, bb.r0, bb.c0, h, w);
+    let bg = md.background();
+    let mut out = report(&md, &bg, bb.r0, bb.c0, h, w);
     out.u = first.u;
     out.n_seeds = first.ems.len();
     // Outside the crop nothing was estimated: the map carries a fill there.
     out.background = if whole {
-        md.bg
+        bg
     } else {
-        let mut full = vec![median(&md.bg); h * w];
+        let mut full = vec![median(&bg); h * w];
         for r in 0..ch {
-            full[(bb.r0 + r) * w + bb.c0..(bb.r0 + r) * w + bb.c1].copy_from_slice(&md.bg[r * cw..(r + 1) * cw]);
+            full[(bb.r0 + r) * w + bb.c0..(bb.r0 + r) * w + bb.c1].copy_from_slice(&bg[r * cw..(r + 1) * cw]);
         }
         full
     };
     out
 }
 
-/// Output rows for the model's emitters, in its order, shifted by
-/// `(oy, ox)` into an `h x w` frame. SEs come from each final group's
-/// Fisher information with the background nodes profiled out.
-fn report(md: &Model, oy: usize, ox: usize, h: usize, w: usize) -> Output {
+/// Output rows for the model's in-focus emitters, in its order, shifted by
+/// `(oy, ox)` into an `h x w` frame; `bg` is [`Model::background`]. SEs
+/// come from each final group's Fisher information with the background
+/// nodes profiled out and every out-of-focus component free.
+fn report(md: &Model, bg: &[f64], oy: usize, ox: usize, h: usize, w: usize) -> Output {
     let n = md.ems.len();
     let mut out = Output {
         dispersion: md.phi,
@@ -517,12 +536,9 @@ fn report(md: &Model, oy: usize, ox: usize, h: usize, w: usize) -> Output {
         removed: md.stats.removed,
         outer: md.stats.outer,
         kappa: md.stats.kappa,
-        se: vec![f64::NAN; 3 * n],
-        se_sig: vec![f64::NAN; n],
-        fisher_fraction: vec![f64::NAN; 4 * n],
         ..Output::default()
     };
-    let mut se4 = vec![f64::NAN; 4 * n];
+    let (mut se4, mut ff4) = (vec![f64::NAN; 4 * n], vec![f64::NAN; 4 * n]);
     for (g, fisher) in md.group_information() {
         let p = fisher.len().isqrt();
         let mut var = vec![f64::NAN; p];
@@ -531,19 +547,22 @@ fn report(md: &Model, oy: usize, ox: usize, h: usize, w: usize) -> Output {
             chol.inv_diag(&mut var, &mut Vec::new());
         }
         let idx: Vec<u32> = g.iter().map(|&i| i as u32).collect();
-        store_uncertainties(&fisher, &var, &idx, &mut se4, &mut out.fisher_fraction);
+        store_uncertainties(&fisher, &var, &idx, &mut se4, &mut ff4);
     }
     let scale = md.phi.sqrt();
     for (i, em) in md.ems.iter().enumerate() {
         let e = em.e;
+        if !md.in_focus(&e) {
+            out.out_of_focus += 1;
+            continue;
+        }
         let (gy, gx) = (e.y + oy as f64, e.x + ox as f64);
         out.pos.extend_from_slice(&[gy, gx]);
         out.amp.push(e.a);
         out.sig.push(e.s);
-        for c in 0..3 {
-            out.se[3 * i + c] = se4[4 * i + c] * scale;
-        }
-        out.se_sig[i] = se4[4 * i + 3] * scale;
+        out.se.extend((0..3).map(|c| se4[4 * i + c] * scale));
+        out.se_sig.push(se4[4 * i + 3] * scale);
+        out.fisher_fraction.extend_from_slice(&ff4[4 * i..4 * i + 4]);
         let mut flag = em.flags;
         if edge_truncated(gy, gx, e.s, h, w) {
             flag |= FLAG_EDGE;
@@ -554,7 +573,7 @@ fn report(md: &Model, oy: usize, ox: usize, h: usize, w: usize) -> Output {
         out.flags.push(flag);
         let py = (e.y.round().max(0.0) as usize).min(md.h - 1);
         let px = (e.x.round().max(0.0) as usize).min(md.w - 1);
-        out.fitted_background.push(md.bg[py * md.w + px]);
+        out.fitted_background.push(bg[py * md.w + px]);
     }
     out
 }
@@ -660,7 +679,7 @@ mod tests {
         for (sigma, fp) in [(1.0, 2.0), (1.45, 16.0), (2.0, 100.0)] {
             let s = Settings { sigma, fp_per_mpx: fp, slack: SLACK };
             let u = threshold(&s);
-            let l = statistics::lkc(SLACK.0 * sigma, SLACK.1 * sigma, Some(model::tile(&s)));
+            let l = statistics::lkc(SLACK.0 * sigma, widest(&s), Some(model::tile(&s)));
             let rate = 1e6 * statistics::expected_ec(u, &l);
             assert!((rate / fp - 1.0).abs() < 1e-9, "sigma {sigma}: rate {rate}");
         }
@@ -670,9 +689,10 @@ mod tests {
     fn the_width_bank_spans_the_bounds_in_steps_no_wider_than_allowed() {
         let s = settings(1.2);
         let ws = widths(&s);
-        assert!((ws[0] - SLACK.0 * 1.2).abs() < 1e-12 && (ws[ws.len() - 1] - SLACK.1 * 1.2).abs() < 1e-12);
+        assert!((ws[0] - SLACK.0 * 1.2).abs() < 1e-12 && (ws[ws.len() - 1] - widest(&s)).abs() < 1e-12);
         assert!(ws.windows(2).all(|p| p[1] / p[0] <= WIDTH_STEP + 1e-12));
-        assert_eq!(widths(&Settings { slack: (1.0, 1.0), ..s }), vec![1.2]);
+        // Out-of-focus widths run to half the node spacing.
+        assert!(widest(&s) >= 4.0 * SLACK.1 * 1.2);
     }
 
     #[test]

@@ -80,8 +80,10 @@ def localize(frame, sigma, *, offset=0.0, roi=None, fp_per_mpx=FP_PER_MPX,
     """Localize one frame. Returns `Localizations`.
 
     `frame`, `offset`, flux and background use camera units (ADU). `sigma`
-    is the in-focus PSF width in pixels; `slack` bounds fitted widths as
-    multiples of `sigma`. Boundary solutions are flagged.
+    is the in-focus PSF width in pixels; `slack` bounds reported widths as
+    multiples of `sigma`. Components fitted wider than `slack[1] * sigma`
+    are out-of-focus light: returned in `background`, counted in
+    `info["out_of_focus"]`. Lower-bound solutions are flagged.
 
     One statistic proposes every emitter: the efficient score z for one more
     emitter, at any searched width, given everything already fitted nearby.
@@ -102,8 +104,7 @@ def localize(frame, sigma, *, offset=0.0, roi=None, fp_per_mpx=FP_PER_MPX,
     `removed` and `outer` (rounds).
 
     Every emitter is returned with `FitFlag` diagnostics; there are no
-    brightness or width cuts after fitting. Wide fits are kept as fitted,
-    so filter by width downstream. `images=False` skips `model_image` and
+    brightness cuts after fitting. `images=False` skips `model_image` and
     `residual`.
 
     `info['fisher_fraction']` is an (N, 4) array for `(flux, y, x, sigma)`:

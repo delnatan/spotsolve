@@ -68,6 +68,7 @@ fn give<'py>(py: Python<'py>, o: detect::Output, h: usize, w: usize) -> PyResult
     info.set_item("removed", o.removed)?;
     info.set_item("outer", o.outer)?;
     info.set_item("kappa", o.kappa)?;
+    info.set_item("out_of_focus", o.out_of_focus)?;
     info.set_item("fisher_fraction", o.fisher_fraction.into_pyarray(py).reshape([n, 4])?)?;
     Ok((
         o.pos.into_pyarray(py).reshape([n, 2])?.unbind(),

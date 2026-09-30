@@ -1,5 +1,27 @@
 # Changelog
 
+## Unreleased
+
+No API changes; detections differ from 0.3.0.
+
+- Components wider than `slack[1] * sigma` are out of focus: they are
+  fitted and tested like emitters, up to half the background node spacing,
+  but returned as background (`info["out_of_focus"]` counts them). The
+  default `slack` is `(1.0, 2.25)`.
+- Seeds are scored on the residual orthogonal to the background nodes, so
+  no background estimate enters their mean.
+- Additions are made in batches: every maximum of the efficient score in a
+  group becomes a candidate at once, one refit takes them all in, and each
+  must still cost the bar to drop while together they gain it apiece. The
+  efficient score projects out the nodes' and members' Newton steps.
+- Count decisions profile the background nodes exactly on the group's
+  patch instead of to second order, which stops adds and removals cycling
+  on dense or defocused frames.
+- On beads in 80% glycerol, precision 0.86 and recall 0.94 against hand
+  labels (0.3.0: 0.65 and 0.98). Slower than 0.3.0: about 2.1 s per
+  256x256 glycerol frame (0.7 s), and 1.5-4x on dense simulated frames,
+  mostly in the out-of-focus components and the add tests.
+
 ## 0.3.0
 
 No API changes; detections differ from 0.2.0.

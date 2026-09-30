@@ -129,7 +129,7 @@ def test_the_roi_crop_is_invisible_to_the_roi():
         roi = np.zeros(img.shape, dtype=bool)
         roi[y0:y0 + side, x0:x0 + side] = True
         full = L.localize(img, sigma=SIGMA, roi=roi)
-        p = 41 + 20                       # the margin, with slack
+        p = 70 + 20                       # the margin, with slack
         a, b = max(0, (y0 - p) // 12 * 12), max(0, (x0 - p) // 12 * 12)
         sy, sx = slice(a, y0 + side + p), slice(b, x0 + side + p)
         sub = L.localize(np.ascontiguousarray(img[sy, sx]), sigma=SIGMA,
