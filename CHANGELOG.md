@@ -31,6 +31,15 @@ measurements.
   `FitFlag.CONTEXT_UNSETTLED`. Added: `info["z"]` and the `z` table column
   (each emitter's `sqrt(2 * likelihood ratio)`), `info["seed"]`,
   `info["seed_positions"]`, `info["mixture"]`, `MAX_MIXTURES`, `WIDTH`.
+- `FitFlag.AT_BOUND` no longer marks a width on its lower bound, the
+  in-focus width, where about half of in-focus emitters fit (it marked 40%
+  of isolated emitters).
+- Mixtures merge copies of one emitter reported by two windows (each
+  fit's nearest component to the other, closer than `sigma`): about 1% of
+  reports at 0.04 / px^2, precision 0.95 to 0.96.
+- `info["z"]` of a window left with one component after removals is its
+  own gain, not a removed component's; the level-only null takes pixels
+  below the offset as 0, as the fits do.
 - `result.background` is the screening level, NaN outside the processed
   crop; each emitter's own fitted level is `info["fitted_background"]`.
 - Results are invariant to the camera gain, and identical across worker

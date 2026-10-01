@@ -23,10 +23,11 @@
 //!      components to 2 sigma, and the light of a neighbour farther off
 //!      then drags the fit.
 //! 4. Each component is reported by the fit of the seed nearest to it
-//!    ([`owned`]), so fits from neighbouring seeds report no emitter twice
-//!    (u-track merges copies within a fixed radius instead), and only those
+//!    ([`owned`]), so fits from neighbouring seeds seldom report an emitter
+//!    twice (u-track merges copies within a fixed radius instead), and only those
 //!    are tested for removal. A component held at a position bound is not
-//!    reported.
+//!    reported. Two fits can still each place one emitter on their own
+//!    seed's side; such copies are merged ([`merge`]).
 //! 5. Every component has its own width, so a wider emitter is one
 //!    component rather than two. Emitters are reported in `width * sigma`
 //!    (by default [`WIDTH`]); the tests search width as well as
@@ -79,6 +80,13 @@ pub const FIT_MAX_ITER: usize = 100;
 pub fn widest(sigma: f64) -> f64 {
     0.5 * (WINDOW * sigma).ceil()
 }
+
+/// Widths: two reports from different windows closer than this, each the
+/// other window's nearest component, are one emitter fitted twice
+/// ([`merge`]). Two fits of one emitter differ by how they share its
+/// neighbours' light, within a width; a pair one window resolved holds two
+/// components there and is never merged.
+pub const MERGE: f64 = 1.0;
 
 pub const FLAG_EDGE: u8 = 1;
 pub const FLAG_NOT_CONVERGED: u8 = 2;
@@ -136,8 +144,9 @@ pub struct Output {
     pub se_sig: Vec<f64>,
     /// `N`: bitwise combination of `FLAG_*` diagnostics.
     pub flags: Vec<u8>,
-    /// `N`: the signed root of each emitter's likelihood ratio at the
-    /// in-focus width, `sqrt(2 (I0 - I1) / phi)`; at least `u`.
+    /// `N`: the root of each emitter's likelihood ratio, the cost of
+    /// removing it with the rest of its window refitted, `sqrt(2 (I_without
+    /// - I) / phi)`; at least `u`.
     pub z: Vec<f64>,
     /// `N`: the fitted level of each emitter's window.
     pub fitted_background: Vec<f64>,
@@ -152,7 +161,8 @@ pub struct Output {
     pub weak: usize,
     pub unconfined: usize,
     /// Components fitted from a seed other than the one nearest to them, and
-    /// so reported by that one's fit instead.
+    /// so reported by that one's fit instead, and reports merged as copies
+    /// of another ([`merge`]).
     pub duplicates: usize,
     /// Mixture components added beyond each window's first, and removed again.
     pub added: usize,
@@ -215,6 +225,8 @@ struct Spot {
     z: f64,
     flags: u8,
     seed: usize,
+    /// Index of its window's fit in the frame's [`Fate`]s.
+    window: usize,
     /// The window it was fitted in, from 1, when that window holds more
     /// than one component; 0 alone.
     mixture: u32,
@@ -233,12 +245,18 @@ struct Fate {
     others: usize,
     /// Owned components wider than the reported widths: background.
     out_of_focus: usize,
+    /// Every component of the final fit, `(y, x)` in crop coordinates.
+    components: Vec<(f64, f64)>,
 }
 
-/// `I(d, c)` of the used pixels for a constant level alone, at its maximum
-/// likelihood `c = mean(d)`.
+/// `I(d, c)` of the used pixels for a constant level alone, at its minimum
+/// `c = mean(max(d, 0))`: `I` reads a pixel below the offset as 0 counts
+/// ([`crate::fit`]), so the fitted models do too. `mean(d)` there would
+/// leave the null above its minimum and add the difference to every first
+/// component's gain, as much as the bar itself at 1 photon of background
+/// and read noise 1.5.
 fn level_divergence(win: &Window) -> f64 {
-    let (n, sum) = win.d.iter().zip(&win.used).filter(|p| *p.1).fold((0.0, 0.0), |(n, s), (d, _)| (n + 1.0, s + d));
+    let (n, sum) = win.d.iter().zip(&win.used).filter(|p| *p.1).fold((0.0, 0.0), |(n, s), (d, _)| (n + 1.0, s + d.max(0.0)));
     let c = (sum / n).max(prefilter::LEVEL_FLOOR);
     win.d
         .iter()
@@ -463,26 +481,24 @@ fn fit_seed(d: &[f64], h: usize, w: usize, sc: &Screen, seed: usize, at: &[bool]
     };
     let removal = |fitter: &mut Fitter, theta: &[f64], j: usize, div: f64| {
         let k = k_of(theta);
-        if k == 1 {
-            return (null - div, None);
-        }
         let (lo, hi) = b.of(lay.with(k - 1));
         let mut start = theta.to_vec();
         start.drain(lay.at(j)..lay.at(j) + lay.stride());
         let f = fitter.fit(&win, &start, lay.with(k - 1), &lo, &hi, FIT_MAX_ITER, tol);
-        (f.divergence - div, Some(f))
+        (f.divergence - div, f)
     };
-    let mut cost: Vec<Option<f64>> = vec![None; k_of(&theta)];
-    if cost.len() == 1 {
-        cost[0] = Some(gains[0]);
-    }
+    // One component left costs its gain over the level alone, which every
+    // forward gain reaching the bar and every removal falling short of it
+    // keeps at least the bar.
+    let mut cost: Vec<Option<f64>>;
     loop {
         let k = k_of(&theta);
-        if k == 1 && cost[0].is_some() {
+        if k == 1 {
+            cost = vec![Some(null - div)];
             break;
         }
         cost = vec![None; k];
-        let mut weakest: Option<(f64, Option<crate::fit::Fit>)> = None;
+        let mut weakest: Option<(f64, crate::fit::Fit)> = None;
         for j in (0..k).filter(|&j| mine(&theta, j)) {
             let (c, f) = removal(fitter, &theta, j, div);
             cost[j] = Some(c);
@@ -491,13 +507,12 @@ fn fit_seed(d: &[f64], h: usize, w: usize, sc: &Screen, seed: usize, at: &[bool]
             }
         }
         match weakest {
-            Some((c, Some(f))) if c < bar => {
+            Some((c, f)) if c < bar => {
                 fate.removed += 1;
                 div = f.divergence;
                 theta = f.theta.clone();
                 fit = f;
             }
-            Some((c, None)) if c < bar => return fate,
             _ => break,
         }
     }
@@ -513,6 +528,7 @@ fn fit_seed(d: &[f64], h: usize, w: usize, sc: &Screen, seed: usize, at: &[bool]
     if fit.at_bound[0] {
         common |= FLAG_BOUND;
     }
+    fate.components = (0..lay.k).map(|j| (theta[lay.at(j) + 1] + y0 as f64, theta[lay.at(j) + 2] + x0 as f64)).collect();
     let var = fitter.variances(&win, &theta, lay, phi).filter(|v| v.iter().all(|&v| v > 0.0));
     for j in 0..lay.k {
         let q = lay.at(j);
@@ -527,8 +543,10 @@ fn fit_seed(d: &[f64], h: usize, w: usize, sc: &Screen, seed: usize, at: &[bool]
             fate.out_of_focus += 1;
             continue;
         }
+        // A reported width on a bound is on its floor, the in-focus width,
+        // where an in-focus emitter belongs: not flagged.
         let mut flags = common;
-        if (q..q + lay.stride()).any(|p| fit.at_bound[p]) {
+        if (q..q + 3).any(|p| fit.at_bound[p]) {
             flags |= FLAG_BOUND;
         }
         let (mut se, mut se_s) = ([f64::NAN; 3], f64::NAN);
@@ -554,6 +572,7 @@ fn fit_seed(d: &[f64], h: usize, w: usize, sc: &Screen, seed: usize, at: &[bool]
             z: (2.0 * cost[j].expect("an owned component's cost") / phi).sqrt(),
             flags,
             seed,
+            window: 0,
             mixture: if lay.k > 1 { seed as u32 + 1 } else { 0 },
         });
     }
@@ -580,6 +599,42 @@ fn owned(seed: usize, y: f64, x: f64, w: usize, h: usize, at: &[bool]) -> bool {
         }
     }
     true
+}
+
+/// Drop copies of one emitter reported by two windows: reports `a` and `b`
+/// from different fits, closer than `reach`, where `b`'s nearest component
+/// in `a`'s fit is `a` and `a`'s nearest in `b`'s is `b`. Of the two, the
+/// one whose seed is nearer their midpoint is kept, as ownership would on a
+/// position both fits agreed on. Returns how many were dropped.
+fn merge(spots: &mut Vec<Spot>, fates: &[Fate], w: usize, reach: f64) -> usize {
+    let d2 = |a: (f64, f64), b: (f64, f64)| (a.0 - b.0).powi(2) + (a.1 - b.1).powi(2);
+    let nearest_is = |fit: &[(f64, f64)], to: (f64, f64), me: (f64, f64)| fit.iter().all(|&c| d2(c, to) >= d2(me, to));
+    let seed_at = |s: usize| ((s / w) as f64, (s % w) as f64);
+    let mut order: Vec<usize> = (0..spots.len()).collect();
+    order.sort_by(|&i, &j| spots[i].y.total_cmp(&spots[j].y));
+    let mut drop = vec![false; spots.len()];
+    for (n, &i) in order.iter().enumerate() {
+        for &j in &order[n + 1..] {
+            let (a, b) = (&spots[i], &spots[j]);
+            if b.y - a.y >= reach {
+                break;
+            }
+            let (pa, pb) = ((a.y, a.x), (b.y, b.x));
+            if drop[i] || drop[j] || a.window == b.window || d2(pa, pb) >= reach * reach {
+                continue;
+            }
+            if !nearest_is(&fates[a.window].components, pb, pa) || !nearest_is(&fates[b.window].components, pa, pb) {
+                continue;
+            }
+            let mid = (0.5 * (a.y + b.y), 0.5 * (a.x + b.x));
+            let (da, db) = (d2(seed_at(a.seed), mid), d2(seed_at(b.seed), mid));
+            let a_stays = da < db || (da == db && a.seed < b.seed);
+            drop[if a_stays { j } else { i }] = true;
+        }
+    }
+    let kept: Vec<Spot> = spots.drain(..).zip(&drop).filter(|p| !*p.1).map(|p| p.0).collect();
+    *spots = kept;
+    drop.iter().filter(|&&d| d).count()
 }
 
 impl Output {
@@ -642,11 +697,14 @@ fn localize_with(d: &[f64], h: usize, w: usize, roi: Option<&[bool]>, s: &Settin
         at[i] = true;
     }
     let mut spots = Vec::new();
+    let mut fates = Vec::with_capacity(sc.seeds.len());
     for &seed in &sc.seeds {
-        let fate = fit_seed(&dc, ch, cw, &sc, seed, &at, s, phi, u, &k1, fitter);
+        let mut fate = fit_seed(&dc, ch, cw, &sc, seed, &at, s, phi, u, &k1, fitter);
         out.tally(&fate);
-        spots.extend(fate.spots);
+        spots.extend(fate.spots.drain(..).map(|p| Spot { window: fates.len(), ..p }));
+        fates.push(fate);
     }
+    out.duplicates += merge(&mut spots, &fates, cw, MERGE * s.sigma);
     spots.sort_by(|a, b| a.y.total_cmp(&b.y).then(a.x.total_cmp(&b.x)));
     for p in spots {
         let (gy, gx) = (p.y + r0 as f64, p.x + c0 as f64);
@@ -706,6 +764,28 @@ pub(crate) mod tests {
             ((state >> 11) as f64 + 0.5) / (1u64 << 53) as f64
         };
         (0..n).map(|_| (-2.0 * uni().ln()).sqrt() * (2.0 * std::f64::consts::PI * uni()).cos()).collect()
+    }
+
+    /// Two windows' copies of one emitter merge to the one whose seed is
+    /// nearer their midpoint; a pair one window resolved stays.
+    #[test]
+    fn copies_merge_and_resolved_pairs_stay() {
+        let w = 40;
+        let spot = |y: f64, x: f64, seed: usize, window: usize| Spot {
+            y, x, a: 1.0, s: 1.0, se: [0.0; 3], se_s: 0.0, c: 0.0, z: 5.0, flags: 0, seed, window, mixture: 0,
+        };
+        let fate = |c: Vec<(f64, f64)>| Fate { components: c, ..Fate::default() };
+        // One emitter near (10, 10.3), seeds at (10, 7) and (10, 14).
+        let (sa, sb) = (10 * w + 7, 10 * w + 14);
+        let mut spots = vec![spot(10.0, 10.1, sa, 0), spot(10.0, 10.6, sb, 1)];
+        let fates = [fate(vec![(10.0, 10.1)]), fate(vec![(10.0, 10.6)])];
+        assert_eq!(merge(&mut spots, &fates, w, 1.45), 1);
+        assert_eq!((spots.len(), spots[0].seed), (1, sa));
+        // Window 0 resolved two emitters there: neither is a copy.
+        let mut spots = vec![spot(10.0, 10.1, sa, 0), spot(10.0, 10.6, sb, 1)];
+        let fates = [fate(vec![(10.0, 10.1), (10.0, 10.7)]), fate(vec![(10.0, 10.6)])];
+        assert_eq!(merge(&mut spots, &fates, w, 1.45), 0);
+        assert_eq!(spots.len(), 2);
     }
 
     #[test]

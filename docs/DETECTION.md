@@ -65,9 +65,20 @@ and can only raise `phi`.
      u-track confines components to `2 sigma`, and a neighbour 2-4 sigma
      away then drags the fit.
 4. **Ownership.** Each component is reported by the fit of the seed
-   nearest to it, so neighbouring windows report no emitter twice (u-track
-   merges copies within 0.25 px), and only those components are tested for
-   removal. A component held on a position bound is not reported.
+   nearest to it, and only those components are tested for removal. A
+   component held on a position bound is not reported. Two windows can
+   still each place one emitter on their own seed's side of the line
+   between their seeds: an emitter without a seed of its own, nearly
+   equidistant from two. Reports from different windows closer than
+   `sigma`, each the other window's nearest component, are therefore one
+   emitter fitted twice, and the copy whose seed is nearer their midpoint
+   is kept. A pair one window resolved holds two components there and is
+   never merged. u-track merges every copy within 0.25 px, keeping the
+   least residual sum of squares, which compares windows of different
+   pixels; copies here lie 0.1-1.4 px apart (fields at 0.04 / px^2: 58
+   merged in 16 frames, 9 of them where two emitters under `sigma` apart
+   lay within 1 px, which no window had resolved). Merged copies are
+   counted in `info["duplicates"]`.
 5. **Widths.** Emitters are reported within `width * sigma`, by default
    `sigma` to `1.5 sigma`: just above `sqrt(2) sigma`, where a defocused
    emitter's peak has halved (the edge of the PSF's axial FWHM), with room
@@ -185,8 +196,8 @@ serial, Apple M5):
 | Isolated, flux 800: rms error, ms/frame | 0.125 px, 2.3 | 0.125 px, 5.1 | 0.125 px, 139 |
 | Equal pairs at 1.5 / 2 / 3 sigma: both found | 0 / 0 / 0 | 0.93 / 1.00 / 1.00 | 0.90 / 1.00 / 1.00 |
 | Fields 0.005 / px^2: recall, precision | 0.71, 0.96 | 0.96, 0.99 | 0.97, 1.00 |
-| Fields 0.02 / px^2 | 0.33, 0.89 | 0.85, 0.98 | 0.87, 0.99 |
-| Fields 0.04 / px^2 | 0.14, 0.83 | 0.66, 0.95 | 0.72, 0.97 |
+| Fields 0.02 / px^2 | 0.33, 0.89 | 0.85, 0.99 | 0.87, 0.99 |
+| Fields 0.04 / px^2 | 0.14, 0.83 | 0.66, 0.96 | 0.72, 0.97 |
 | Fields 0.02 / 0.04: ms/frame | 6 / 8 | 136 / 398 | 568 / 1673 |
 
 The field scenarios have exact widths, where searching widths costs a few

@@ -106,7 +106,8 @@ def localize(frame, sigma, *, offset=0.0, roi=None, fp_per_mpx=FP_PER_MPX,
     the window, kept while each refit gains `u^2 / 2` nats, up to
     `max_mixtures`; then the weakest is removed while removing it, the rest
     refitted, costs less. Neighbours inside a window are fitted with it, and
-    each component is reported by the fit of the seed nearest to it.
+    each component is reported by the fit of the seed nearest to it; copies
+    of one emitter from two windows are merged.
     `info["mixture"]` numbers the windows that held several components (0:
     fitted alone). Use mixtures wherever spots come closer than about
     `4 sigma`; alone, a fit is biased by a neighbour's light.
