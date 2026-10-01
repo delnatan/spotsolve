@@ -20,10 +20,19 @@ E(i; y, s) = 0.5 * [erf((i-y+0.5)/(s*sqrt(2))) - erf((i-y-0.5)/(s*sqrt(2)))]
 I(d,m) = sum_pixels [d*log(d/m) - (d-m)]
 ```
 
-Camera pixels are not Poisson in ADU. One scalar dispersion `phi` (variance
-per unit mean, from the median squared fourth difference of the frame)
-converts: `I/phi` is the log-likelihood in nats. No gain or read-noise
-calibration is needed; fluxes scale with gain, positions and decisions do not.
+Camera pixels are not Poisson in ADU. One scalar dispersion `phi`, the
+variance per unit mean, converts: `I/phi` is the log-likelihood in nats. No
+gain or read-noise calibration is needed; fluxes scale with gain, positions
+and decisions do not.
+
+`phi` is measured on the frame itself. The fourth difference `b` of the frame
+(the separable `[1, -4, 6, -4, 1]`) has variance `70^2 phi mbar`, `mbar` the
+local mean under the weights `k^2 / 70^2`, wherever the light is smooth on
+its 5-pixel scale; `phi` is the median of `b^2 / mbar` over the frame, over
+the median of `70^2 chi2_1`. Variance and mean come from the same pixels with
+the same weights, so a background that varies across the frame, or an
+emitter's light, raises both alike. An emitter's curvature adds to `b` alone
+and can only raise `phi`.
 
 ## Algorithm
 
@@ -92,20 +101,26 @@ widths, so the field's metric is
 ds^2 = (dy^2 + dx^2) / (2 v) + dtau^2
 ```
 
-a slab of hyperbolic space (Siegmund & Worsley 1995, *Ann. Stat.* 23:608).
-With `a = 1/v(lo)`, `b = 1/v(hi)` over the reported widths, the expected
-number of maxima above `u` per pixel is the Euler-characteristic density
-(Adler & Taylor 2007):
+which is hyperbolic space of curvature -1, with width as height (Siegmund &
+Worsley 1995, *Ann. Stat.* 23:608). Widths are searched from `lo` up to the window's
+half-side, and only maxima at `lo` to `hi` are reported: the region is a slab
+whose one face, at `lo`, is a horosphere (both principal curvatures 1); at
+`hi` the search goes on. With `a = 1/v(lo)`, `b = 1/v(hi)`, the expected
+number of reported maxima above `u` per pixel is the Euler-characteristic
+density (Adler & Taylor 2007), its terms the slab's volume and curvature and
+the face's area and curvature:
 
 ```text
 EC(u) = L3 rho3(u) + L2 rho2(u) + L1 rho1(u)
-L3 = (a - b) / 4,   L2 = (a + b) / 4,   L1 = (a - b) / (8 pi)
+L3 = (a - b) / 4,   L2 = a / 4,   L1 = a / (2 pi) - 3 (a - b) / (8 pi)
 ```
 
 and `u` solves `10^6 EC(u) = fp_per_mpx`. With fixed widths it reduces to the
-2-D density `u exp(-u^2/2) / (2 pi)^(3/2) / (2 v)`. Counting false maxima per
-area rather than false pixels is the peak-based view of Cheng & Schwartzman
-(2017, *Ann. Stat.* 45:529).
+2-D density `u exp(-u^2/2) / (2 pi)^(3/2) / (2 v)`. A face at `hi`, as if
+widths stopped there, would add 13%: with one counted, free widths gave
+0.89-0.92 of the false emitters fixed widths gave at the same
+`fp_per_mpx`, where this formula predicts 0.88-0.89. Counting false maxima per area rather than false pixels is the peak-based
+view of Cheng & Schwartzman (2017, *Ann. Stat.* 45:529).
 
 Every decision (the first component, each addition, each removal) uses the
 same `u^2/2`, so each false component costs the same budget. A per-test
@@ -133,44 +148,64 @@ calibration on isolated and crowded fields and to its false-positive rate on
 noise. `scripts/benchmark_detection.py` scores any version on seeded
 scenarios (sigma 1.45, background 20, 128x128).
 
-On 6.5 Mpx of Poisson noise per condition, at the default `fp_per_mpx = 16`:
+On 26 Mpx of Poisson noise per condition, at the default `fp_per_mpx = 16`:
 
 | Photons/px | Gain | Single fits | Mixtures |
 |---:|---:|---:|---:|
-| 2 | 1 | 13.3 | 13.4 |
-| 6.7 | 3 | 15.0 | 14.8 |
-| 20 | 1 | 16.5 | 16.2 |
-| 200 | 1 | 16.2 | 15.9 |
+| 2 | 1 | 11.5 | 11.4 |
+| 6.7 | 3 | 16.1 | 15.6 |
+| 20 | 1 | 16.8 | 16.5 |
+| 200 | 1 | 18.4 | 18.3 |
+
+Another seed gave 16.6 at 20 photons and 16.8 at 200. With the true `phi`
+those frames give 0.92-0.96 of the target, seeds sitting on the pixel grid;
+`phi` measured per frame scatters by 3.6%, and a frame measured low admits
+more than one measured high excludes. At 2 photons per pixel noise in `mbar`
+raises `phi` by 3%, and fewer are admitted. Noise more symmetric than
+Poisson's admits fewer still, since the signed root of the likelihood ratio
+corrects for a skew that is not there: with 1.6 photons of read noise at 6.7
+photons per pixel, 8 per 10^6 pixels; Gaussian noise of the same variance,
+0.8 of Poisson's count. On a background rising from 3 to 40 photons across
+the frame, 18 per 10^6 pixels.
+
+`phi` against its definition: on spot fields of 0.005-0.04 / px^2 it reads
+0.99-1.02 of the true value, and on a 3-40 photon gradient 1.00. On a real
+GEM movie whose frame differences are spatially white, it reads 2.41
+against 2.42 from the pixels' frame-to-frame variance. Taken instead as the
+median squared fourth difference over the median pixel, it read 0.84 on the
+gradient (49 false emitters per 10^6 pixels), 1.11-1.31 on spot fields, and
+2.22 on that movie.
 
 Against the 0.3.0 joint frame model (`benchmark_detection.py`; times are
 serial, Apple M5):
 
 | Scenario | Single fits | Mixtures | 0.3.0 joint |
 |---|---|---|---|
-| Isolated, flux 100: recall | 0.36 | 0.36 | 0.41 |
-| Isolated, flux 800: rms error, ms/frame | 0.125 px, 2.1 | 0.125 px, 5.3 | 0.125 px, 139 |
-| Equal pairs at 1.5 / 2 / 3 sigma: both found | 0 / 0 / 0 | 0.92 / 1.00 / 1.00 | 0.90 / 1.00 / 1.00 |
+| Isolated, flux 100: recall | 0.38 | 0.38 | 0.41 |
+| Isolated, flux 800: rms error, ms/frame | 0.125 px, 2.3 | 0.125 px, 5.1 | 0.125 px, 139 |
+| Equal pairs at 1.5 / 2 / 3 sigma: both found | 0 / 0 / 0 | 0.93 / 1.00 / 1.00 | 0.90 / 1.00 / 1.00 |
 | Fields 0.005 / px^2: recall, precision | 0.71, 0.96 | 0.96, 0.99 | 0.97, 1.00 |
-| Fields 0.02 / px^2 | 0.32, 0.89 | 0.83, 0.98 | 0.87, 0.99 |
-| Fields 0.04 / px^2 | 0.14, 0.83 | 0.65, 0.96 | 0.72, 0.97 |
-| Fields 0.02 / 0.04: ms/frame | 6 / 8 | 117 / 391 | 568 / 1673 |
+| Fields 0.02 / px^2 | 0.33, 0.89 | 0.85, 0.98 | 0.87, 0.99 |
+| Fields 0.04 / px^2 | 0.14, 0.83 | 0.66, 0.95 | 0.72, 0.97 |
+| Fields 0.02 / 0.04: ms/frame | 6 / 8 | 136 / 398 | 568 / 1673 |
 
 The field scenarios have exact widths, where searching widths costs a few
 points of recall; `width=(1, 1)` recovers them. With widths spread +-20%,
 fixed-width mixtures split wider emitters (precision 0.88), free widths do
 not (0.97-1.00). On 256x256 fields at 0.03 / px^2 with widths spread +-20%
-(sigma 1.2), mixtures find 0.825 of emitters at precision 0.979 in 1.0 s;
+(sigma 1.2), mixtures find 0.841 of emitters at precision 0.977 in 0.9 s;
 the joint model found 0.829 at 0.985 in 5.2 s. Adding defocused blobs 3-6
-sigma wide raises mixtures' false emitters from 2.1 to 3.9 per 128x128 frame
-(the joint model: 1.8 to 3.0); 0.75 per frame are pieces of blobs, the rest
-close pairs reported as one emitter between them. A window sees only part
-of such a blob, which fits as a `1.5-2 sigma` component on a raised level:
-under the true blobs these components have no evidence. The default width
-bound is what keeps them out: at `2 sigma` 1.6 per frame were reported, at
-equal recall. On a real 39x39 bead image mixtures and the joint model
-report the same 70 beads. On real GEM and glycerol frames 10-12% of
-emitters fit wider than `1.5 sigma`, three quarters of them faint (`z <=
-8`) and on diffuse light; the default leaves them out.
+sigma wide raises mixtures' false emitters from 2.8 to 4.4 per 128x128 frame
+(the joint model: 1.8 to 3.0); 1.1 per frame lie on blobs, away from any
+emitter, and most of the rest are close pairs reported as one emitter
+between them. A window sees only part of such a blob, which fits as a
+`1.5-2 sigma` component on a raised level: under the true blobs these
+components have no evidence. The default width bound is what keeps them
+out: at `2 sigma` 2.1 per frame lay on blobs, at equal recall. On a real
+39x39 bead image mixtures and the joint model report the same 70 beads. On
+real GEM and glycerol frames 9-12% of emitters fit wider than `1.5 sigma`,
+70-75% of them faint (`z <= 8`) and on diffuse light; the default leaves
+them out.
 
 Measured and not kept: a second, DAOPHOT-style pass on the residual (+2
 points of recall in dense fields, but it fitted PSF misfit beside bright
@@ -192,8 +227,12 @@ fits it reads crowding as misfit (2.1 on a dense exact field).
 The PSF model is a Gaussian, and each window's level is a constant. Real PSF
 wings, haze and defocused light wider than the window are misfit, and the
 tests read misfit as signal: within the width bound, some haze is reported
-as emitters. Single fits are biased by any
-neighbour within a window and lose emitters closer than about `4 sigma`; use
+as emitters. Single fits are biased by any neighbour within a window and
+lose emitters closer than about `4 sigma`: at `3 sigma` a pair fits as one
+component wider than the reported widths, and neither is reported. Use
 mixtures wherever spots crowd. Emitters closer than about `sigma` are
 reported as one. Mixtures cost one window per seed, each refitting its
-neighbours: on dense frames that is most of the time.
+neighbours: on dense frames that is most of the time. `phi` is one number
+per frame, read at the frame's finest scale: it takes pixels to be
+independent, and read noise, whose variance does not grow with the mean,
+makes it depend on the level.

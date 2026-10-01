@@ -186,34 +186,40 @@ pub fn screen(d: &[f64], h: usize, w: usize, sigma: f64, phi: f64, bank: &[(f64,
 }
 
 /// Expected local maxima above `u`, per pixel, of the likelihood-ratio
-/// field of one emitter of width `s` in `[lo, hi]` on noise, its centre and
-/// width searched.
+/// field of one emitter on noise, its centre and width searched, that lie
+/// at widths `s` in `[lo, hi]`. The search stops at `lo` but runs past
+/// `hi`: wider components are out-of-focus light, not reported.
 ///
 /// The field's signed root is a smooth unit Gaussian field over position
 /// and `tau = log s`. Two emitters' scores correlate as the profiles do:
 /// `exp(-r^2 / (4 v))` at offset `r`, `v = s^2 + 1/12` the pixel-integrated
 /// profile's variance, and `2 sqrt(v1 v2) / (v1 + v2)` across widths. The
-/// metric is therefore `(dy^2 + dx^2) / (2 v) + dtau^2`: a slab of
-/// hyperbolic space (Siegmund & Worsley 1995, *Ann. Stat.* 23:608). Its
-/// Lipschitz-Killing curvatures per unit area, with `a = 1 / v(lo)` and
-/// `b = 1 / v(hi)`, are
+/// metric is therefore `(dy^2 + dx^2) / (2 v) + dtau^2`: hyperbolic space,
+/// curvature -1, with widths as height (Siegmund & Worsley 1995, *Ann.
+/// Stat.* 23:608). For high `u` the expected number of maxima above `u` is
+/// the Euler characteristic density `L3 rho3(u) + L2 rho2(u) + L1 rho1(u)`
+/// (Adler & Taylor 2007), its terms local: the volume and curvature of the
+/// slab between `lo` and `hi`, and the face at `lo`, a horosphere with both
+/// principal curvatures 1. With `a = 1 / v(lo)` and `b = 1 / v(hi)`, per
+/// unit area,
 ///
 /// ```text
-/// L3 = (a - b) / 4,  L2 = (a + b) / 4,  L1 = (a - b) / (8 pi)
+/// L3 = (a - b) / 4,  L2 = a / 4,  L1 = a / (2 pi) - 3 (a - b) / (8 pi)
 /// ```
 ///
-/// and for high `u` the expected number of maxima above `u` is the Euler
-/// characteristic density `L3 rho3(u) + L2 rho2(u) + L1 rho1(u)` (Adler &
-/// Taylor 2007). At `lo = hi` it is the 2-D density `u exp(-u^2 / 2) /
-/// (2 pi)^(3/2) / (2 v)`. The frame's edge adds a term of relative size
-/// `1 / (sqrt(a) * side)`, left out.
+/// With equal bounds the width is fixed and the field 2-D, of density
+/// `u exp(-u^2 / 2) / (2 pi)^(3/2) / (2 v)`. The frame's edge adds a term
+/// of relative size `1 / (sqrt(a) * side)`, left out.
 pub fn false_rate(u: f64, lo: f64, hi: f64) -> f64 {
     let (a, b) = (1.0 / (lo * lo + 1.0 / 12.0), 1.0 / (hi * hi + 1.0 / 12.0));
     let e = (-0.5 * u * u).exp();
-    let rho1 = e / (2.0 * PI);
     let rho2 = u * e / (2.0 * PI).powf(1.5);
+    if lo >= hi {
+        return 0.5 * a * rho2;
+    }
+    let rho1 = e / (2.0 * PI);
     let rho3 = (u * u - 1.0) * e / (4.0 * PI * PI);
-    0.25 * (a - b) * rho3 + 0.25 * (a + b) * rho2 + (a - b) / (8.0 * PI) * rho1
+    0.25 * (a - b) * rho3 + 0.25 * a * rho2 + (a / (2.0 * PI) - 3.0 * (a - b) / (8.0 * PI)) * rho1
 }
 
 /// The `u >= 1` at which [`false_rate`] over widths `[lo, hi]` is
@@ -236,25 +242,42 @@ pub fn threshold(fp_per_mpx: f64, lo: f64, hi: f64) -> f64 {
     0.5 * (lo + hi)
 }
 
-/// Scalar `phi = pixel variance / mean`. The separable fourth difference
-/// `[1, -4, 6, -4, 1]` of white noise has variance `var * 70^2`, and its
-/// square has median `var * 70^2 * CHI2_1_MEDIAN`; the median pixel is taken
-/// to be background. Frames too small to filter are taken as Poisson.
+/// Scalar `phi = pixel variance / mean`, the median over pixels of a local
+/// ratio. The separable fourth difference `b = sum k_ij d_ij`, `k = [1, -4,
+/// 6, -4, 1]`, of pixels of variance `phi m_ij` has variance `phi sum k_ij^2
+/// m_ij = 70^2 phi mbar`, `mbar` the mean under the weights `k_ij^2 / 70^2`.
+/// So `b^2 / mbar` is `70^2 phi chi2_1`, with median `70^2 phi
+/// CHI2_1_MEDIAN`, wherever the light is smooth on the scale of `k`.
+///
+/// Variance and mean come from the same pixels with the same weights, so a
+/// background that varies across the frame, or an emitter's light, raises
+/// both alike; an emitter's curvature adds to `b` alone, and can only raise
+/// `phi`. A mean over a wider square would spread an emitter's light past
+/// the pixels its variance reaches and lower `phi`, by 16% in a field of
+/// 0.02 emitters per px^2. Noise in `mbar` raises `phi` by about `0.07 phi /
+/// m` (4% at 2 photons per pixel). A median of the frame as the mean would
+/// be shifted by skewed or integer counts, and taken from other pixels than
+/// the variance.
+///
+/// Frames too small to filter are taken as Poisson.
 pub fn dispersion(d: &[f64], h: usize, w: usize) -> f64 {
     if h < 5 || w < 5 {
         return 1.0;
     }
     const K: [f64; 5] = [1.0, -4.0, 6.0, -4.0, 1.0];
-    let mut a = vec![0.0; h * w];
-    let mut b = vec![0.0; h * w];
-    filters::convolve1d(d, &mut a, h, w, &K, 0, Mode::Reflect);
-    filters::convolve1d(&a, &mut b, h, w, &K, 1, Mode::Reflect);
-    let sq: Vec<f64> = (2..h - 2)
-        .flat_map(|r| (2..w - 2).map(move |c| (r, c)))
-        .map(|(r, c)| b[r * w + c] * b[r * w + c])
+    const K2: [f64; 5] = [1.0 / 70.0, 16.0 / 70.0, 36.0 / 70.0, 16.0 / 70.0, 1.0 / 70.0];
+    let sep = |k: &[f64]| {
+        let (mut a, mut b) = (vec![0.0; h * w], vec![0.0; h * w]);
+        filters::convolve1d(d, &mut a, h, w, k, 0, Mode::Reflect);
+        filters::convolve1d(&a, &mut b, h, w, k, 1, Mode::Reflect);
+        b
+    };
+    let (b, m) = (sep(&K), sep(&K2));
+    let ratio: Vec<f64> = (2..h - 2)
+        .flat_map(|r| (2..w - 2).map(move |c| r * w + c))
+        .map(|i| b[i] * b[i] / m[i].max(LEVEL_FLOOR))
         .collect();
-    let var = median(&sq) / (statistics::CHI2_1_MEDIAN * 70.0 * 70.0);
-    var / median(d).max(1e-6)
+    median(&ratio) / (statistics::CHI2_1_MEDIAN * 70.0 * 70.0)
 }
 
 pub(crate) fn median(v: &[f64]) -> f64 {
@@ -348,6 +371,23 @@ mod tests {
         assert!((phi - 0.18).abs() < 0.01, "phi {phi}");
         let d7: Vec<f64> = d.iter().map(|v| 7.0 * v).collect();
         assert!((dispersion(&d7, h, w) - 7.0 * phi).abs() < 1e-9 * phi);
+    }
+
+    /// Variance per unit mean, not the median variance over the median
+    /// level: on a level rising from 3 to 40 across the frame, with variance
+    /// equal to the mean, the latter reads 0.84.
+    #[test]
+    fn the_dispersion_holds_on_a_varying_background() {
+        let (h, w) = (200, 180);
+        let z = crate::detect::tests::normals(h * w, 5);
+        let d: Vec<f64> = (0..h * w)
+            .map(|i| {
+                let m = 3.0 + 37.0 * (i % w) as f64 / (w - 1) as f64;
+                m + m.sqrt() * z[i]
+            })
+            .collect();
+        let phi = dispersion(&d, h, w);
+        assert!((phi - 1.0).abs() < 0.04, "phi {phi}");
     }
 
     #[test]

@@ -100,14 +100,14 @@ native frame workers. Results stay in frame order and are identical across
 worker counts. `images=False` avoids returning model/residual images; it is
 the default except for single-frame `localize`.
 
-On a 10-core Apple M5, real 256x256 GEM frames (about 210 spots per frame
-single, 575 with mixtures; best of three runs):
+On a 10-core Apple M5, real 256x256 GEM frames (about 205 spots per frame
+single, 550 with mixtures; best of three runs):
 
 | Workload | Single fits | Mixtures | 0.3.0 joint model |
 |---|---:|---:|---:|
-| First five frames, serial | 0.09 s | 1.34 s | 8.26 s |
-| First five frames, five workers | 0.03 s | 0.33 s | 2.15 s |
-| All 49 frames, ten workers | 0.17 s | 2.12 s | 13.3 s |
+| First five frames, serial | 0.09 s | 1.19 s | 8.26 s |
+| First five frames, five workers | 0.02 s | 0.30 s | 2.15 s |
+| All 49 frames, ten workers | 0.16 s | 1.90 s | 13.3 s |
 
 ## Choose a detection width
 

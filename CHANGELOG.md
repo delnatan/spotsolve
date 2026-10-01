@@ -13,8 +13,14 @@ measurements.
   proposals; `max_mixtures` caps the components.
 - Every decision is a likelihood ratio at one threshold `u` from
   `fp_per_mpx`, now a closed-form Euler-characteristic density over
-  position and width. Measured false emitters on noise: 13-17 per 10^6
-  pixels at the default 16.
+  position and width, reported widths only (wider maxima are out-of-focus
+  light). Measured false emitters on noise: 11-18 per 10^6 pixels at the
+  default 16.
+- The dispersion is the median of the squared fourth difference over the
+  local mean under the same weights, not over the frame's median pixel. The
+  old pairing read 0.84 of the true value on a background rising 3-40
+  photons across the frame (3x the false emitters), and 1.1-1.3 on fields
+  of emitters (lost recall).
 - `slack` is replaced by `width=(lo, hi)`, the reported widths as multiples
   of `sigma` (default `(1, 1.5)`); equal bounds fix the
   width. Wider light is fitted as out-of-focus background and counted in
@@ -29,10 +35,10 @@ measurements.
   crop; each emitter's own fitted level is `info["fitted_background"]`.
 - Results are invariant to the camera gain, and identical across worker
   counts.
-- Speed on real 256x256 GEM frames, serial: 19 ms per frame with single
-  fits, 0.27 s with mixtures (0.3.0: 1.7 s). On simulated fields mixtures
+- Speed on real 256x256 GEM frames, serial: 18 ms per frame with single
+  fits, 0.24 s with mixtures (0.3.0: 1.7 s). On simulated fields mixtures
   come within a few points of the joint model's recall (0.96 at 0.005 /
-  px^2, 0.83 at 0.02) and resolve pairs from 1.5 sigma; on a real bead
+  px^2, 0.85 at 0.02) and resolve pairs from 1.5 sigma; on a real bead
   image they report the same beads.
 - Scripts take `--mixtures`; `scripts/benchmark_detection.py` scores any
   version on seeded scenarios.
