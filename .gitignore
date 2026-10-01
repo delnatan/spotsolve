@@ -9,6 +9,8 @@ dist/
 .pytest_cache/
 .ruff_cache/
 .DS_Store
+# development
+tmp/
 
 # --- Rust ---
 rust/target/
