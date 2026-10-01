@@ -1,56 +1,41 @@
 # Changelog
 
-## Unreleased (0.4.0)
+## 0.4.0 (2026-10-01)
 
-The detector is rebuilt after u-track's `pointSourceDetection`. Breaking
-API changes; see [detection](docs/DETECTION.md) for the method and its
-measurements.
+The detector is rebuilt after u-track's `pointSourceDetection`; see
+[detection](docs/DETECTION.md). Breaking API changes.
 
 - `localize` / `localize_stack` screen the frame by a Poisson score test,
   seed at LoG maxima and fit each seed on its own `ceil(4 sigma)` window.
-  `fit_mixtures=True` (u-track's FitMixtures) fits several emitters per
-  window, with neighbours as nuisance components and efficient-score
-  proposals; `max_mixtures` caps the components.
+  `fit_mixtures=True` fits several emitters per window, with neighbours as
+  nuisance components; `max_mixtures` caps the components. Copies of one
+  emitter from two windows are merged.
 - Every decision is a likelihood ratio at one threshold `u` from
-  `fp_per_mpx`, now a closed-form Euler-characteristic density over
-  position and width, reported widths only (wider maxima are out-of-focus
-  light). Measured false emitters on noise: 11-18 per 10^6 pixels at the
-  default 16.
-- The dispersion is the median of the squared fourth difference over the
-  local mean under the same weights, not over the frame's median pixel. The
-  old pairing read 0.84 of the true value on a background rising 3-40
-  photons across the frame (3x the false emitters), and 1.1-1.3 on fields
-  of emitters (lost recall).
+  `fp_per_mpx`, a closed-form Euler-characteristic density over position
+  and width.
+- The dispersion pairs the squared fourth difference with the local mean
+  under the same weights, so a varying background or emitter light no
+  longer biases it.
 - `slack` is replaced by `width=(lo, hi)`, the reported widths as multiples
-  of `sigma` (default `(1, 1.5)`); equal bounds fix the
-  width. Wider light is fitted as out-of-focus background and counted in
+  of `sigma` (default `(1, 1.5)`); equal bounds fix the width. Wider light
+  is fitted as out-of-focus background and counted in
   `info["out_of_focus"]`.
-- Removed: the joint frame model, `localize_aguet` /
-  `localize_aguet_stack` (the spotfitlm port), `SLACK`,
-  `info["fisher_fraction"]` and the `fisher_*` table columns, and
-  `FitFlag.CONTEXT_UNSETTLED`. Added: `info["z"]` and the `z` table column
-  (each emitter's `sqrt(2 * likelihood ratio)`), `info["seed"]`,
-  `info["seed_positions"]`, `info["mixture"]`, `MAX_MIXTURES`, `WIDTH`.
 - `FitFlag.AT_BOUND` no longer marks a width on its lower bound, the
-  in-focus width, where about half of in-focus emitters fit (it marked 40%
-  of isolated emitters).
-- Mixtures merge copies of one emitter reported by two windows (each
-  fit's nearest component to the other, closer than `sigma`): about 1% of
-  reports at 0.04 / px^2, precision 0.95 to 0.96.
-- `info["z"]` of a window left with one component after removals is its
-  own gain, not a removed component's; the level-only null takes pixels
-  below the offset as 0, as the fits do.
+  in-focus width.
+- Removed: the joint frame model, `localize_aguet` /
+  `localize_aguet_stack`, `SLACK`, `info["fisher_fraction"]` and the
+  `fisher_*` table columns, `FitFlag.CONTEXT_UNSETTLED`, and the PSF
+  Jacobians in `spotsolve.psf`. Added: `info["z"]` and the `z` table
+  column, `info["seed"]`, `info["seed_positions"]`, `info["mixture"]`,
+  `MAX_MIXTURES`, `WIDTH`.
 - `result.background` is the screening level, NaN outside the processed
   crop; each emitter's own fitted level is `info["fitted_background"]`.
 - Results are invariant to the camera gain, and identical across worker
   counts.
 - Speed on real 256x256 GEM frames, serial: 18 ms per frame with single
-  fits, 0.24 s with mixtures (0.3.0: 1.7 s). On simulated fields mixtures
-  come within a few points of the joint model's recall (0.96 at 0.005 /
-  px^2, 0.85 at 0.02) and resolve pairs from 1.5 sigma; on a real bead
-  image they report the same beads.
-- Scripts take `--mixtures`; `scripts/benchmark_detection.py` scores any
-  version on seeded scenarios.
+  fits, 0.24 s with mixtures (0.3.0: 1.7 s).
+- Scripts take `--mixtures`; `scripts/benchmark_detection.py` scores the
+  detector on seeded scenarios.
 
 ## 0.3.0
 
