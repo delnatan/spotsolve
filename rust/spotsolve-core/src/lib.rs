@@ -26,6 +26,7 @@ pub mod aguet;
 pub mod detect;
 mod frames;
 pub mod filters;
+pub mod fit;
 pub mod lap;
 pub mod linalg;
 pub mod model;
