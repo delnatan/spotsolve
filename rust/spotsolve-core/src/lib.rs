@@ -30,6 +30,7 @@ pub mod fit;
 pub mod lap;
 pub mod linalg;
 pub mod model;
+pub mod prefilter;
 pub mod psf;
 pub mod render;
 pub mod statistics;

@@ -148,16 +148,7 @@ pub fn threshold(s: &Settings) -> f64 {
     0.5 * (lo + hi)
 }
 
-pub(crate) fn median(v: &[f64]) -> f64 {
-    let mut s = v.to_vec();
-    s.sort_by(f64::total_cmp);
-    let n = s.len();
-    if n % 2 == 0 {
-        0.5 * (s[n / 2 - 1] + s[n / 2])
-    } else {
-        s[n / 2]
-    }
-}
+pub(crate) use crate::prefilter::median;
 
 /// `scipy.ndimage.median_filter(np.rint(d), size=BG_WIN, mode="reflect")`.
 ///
@@ -239,36 +230,9 @@ pub fn median_background(d: &[f64], h: usize, w: usize) -> Vec<f64> {
     out
 }
 
-/// Scalar `phi = pixel variance / mean`. The separable fourth difference
-/// `[1, -4, 6, -4, 1]` of white noise has variance `var * 70^2`, and its
-/// square has median `var * 70^2 * CHI2_1_MEDIAN`; the median pixel is taken
-/// to be background. Frames too small to filter are taken as Poisson.
-pub fn dispersion(d: &[f64], h: usize, w: usize) -> f64 {
-    if h < 5 || w < 5 {
-        return 1.0;
-    }
-    const K: [f64; 5] = [1.0, -4.0, 6.0, -4.0, 1.0];
-    let mut a = vec![0.0; h * w];
-    let mut b = vec![0.0; h * w];
-    filters::convolve1d(d, &mut a, h, w, &K, 0, Mode::Reflect);
-    filters::convolve1d(&a, &mut b, h, w, &K, 1, Mode::Reflect);
-    let sq: Vec<f64> = (2..h - 2)
-        .flat_map(|r| (2..w - 2).map(move |c| (r, c)))
-        .map(|(r, c)| b[r * w + c] * b[r * w + c])
-        .collect();
-    let var = median(&sq) / (statistics::CHI2_1_MEDIAN * 70.0 * 70.0);
-    var / median(d).max(1e-6)
-}
+pub use crate::prefilter::dispersion;
 
-/// The centred pixel-integrated unit-flux PSF along one axis, radius
-/// `ceil(4 sigma)`; the 2-D kernel is its outer product.
-pub(crate) fn psf_kernel1d(sigma: f64) -> Vec<f64> {
-    let r = (4.0 * sigma).ceil() as isize;
-    let t: Vec<f64> = (-r..=r).map(|v| v as f64).collect();
-    let mut k = vec![0.0; t.len()];
-    psf::shape_axis(&t, &[0.0], sigma, &mut k);
-    k
-}
+pub(crate) use crate::prefilter::psf_kernel1d;
 
 /// Frame-wide score z of one emitter of width `sigma` against the bilinear
 /// background on nodes `tile` px apart: the correlation of `r` with the
