@@ -148,12 +148,12 @@ serial, Apple M5):
 | Scenario | Single fits | Mixtures | 0.3.0 joint |
 |---|---|---|---|
 | Isolated, flux 100: recall | 0.36 | 0.36 | 0.41 |
-| Isolated, flux 800: rms error, ms/frame | 0.125 px, 2.6 | 0.125 px, 6.7 | 0.125 px, 139 |
+| Isolated, flux 800: rms error, ms/frame | 0.125 px, 2.1 | 0.125 px, 5.3 | 0.125 px, 139 |
 | Equal pairs at 1.5 / 2 / 3 sigma: both found | 0 / 0 / 0 | 0.92 / 1.00 / 1.00 | 0.90 / 1.00 / 1.00 |
-| Fields 0.005 / px^2: recall, precision | 0.71, 0.93 | 0.96, 0.99 | 0.97, 1.00 |
-| Fields 0.02 / px^2 | 0.33, 0.82 | 0.83, 0.98 | 0.87, 0.99 |
-| Fields 0.04 / px^2 | 0.16, 0.76 | 0.66, 0.95 | 0.72, 0.97 |
-| Fields 0.02 / 0.04: ms/frame | 7 / 10 | 160 / 528 | 568 / 1673 |
+| Fields 0.005 / px^2: recall, precision | 0.71, 0.96 | 0.96, 0.99 | 0.97, 1.00 |
+| Fields 0.02 / px^2 | 0.32, 0.89 | 0.83, 0.98 | 0.87, 0.99 |
+| Fields 0.04 / px^2 | 0.14, 0.83 | 0.65, 0.96 | 0.72, 0.97 |
+| Fields 0.02 / 0.04: ms/frame | 6 / 8 | 117 / 391 | 568 / 1673 |
 
 The field scenarios have exact widths, where searching widths costs a few
 points of recall; `width=(1, 1)` recovers them. With widths spread +-20%,

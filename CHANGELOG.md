@@ -29,8 +29,8 @@ measurements.
   crop; each emitter's own fitted level is `info["fitted_background"]`.
 - Results are invariant to the camera gain, and identical across worker
   counts.
-- Speed on real 256x256 GEM frames, serial: 24 ms per frame with single
-  fits, 0.39 s with mixtures (0.3.0: 1.7 s). On simulated fields mixtures
+- Speed on real 256x256 GEM frames, serial: 19 ms per frame with single
+  fits, 0.27 s with mixtures (0.3.0: 1.7 s). On simulated fields mixtures
   come within a few points of the joint model's recall (0.96 at 0.005 /
   px^2, 0.83 at 0.02) and resolve pairs from 1.5 sigma; on a real bead
   image they report the same beads.

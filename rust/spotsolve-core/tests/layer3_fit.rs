@@ -1,7 +1,7 @@
 //! LAYER 3: the window fit ([`spotsolve_core::fit`]).
 //!
 //! Derivatives against finite differences; on simulated Poisson windows,
-//! position and flux errors against the reported covariance; bounds, masked
+//! position and flux errors against the reported variances; bounds, masked
 //! pixels and two-component recovery, at one width and at each its own.
 
 use spotsolve_core::fit::{Fitter, Layout, Window};
@@ -62,7 +62,8 @@ fn derivatives_match_finite_differences() {
     let used: Vec<bool> = (0..rows * cols).map(|q| q % 7 != 3).collect();
     let w = Window::new(rows, cols, d, used.clone());
     let mut f = Fitter::default();
-    let (g, info) = f.gradient_and_information(&w, &theta, lay);
+    let lin = f.linearize(&w, &theta, lay);
+    let (g, info) = (&lin.g, &lin.f);
     let n = lay.n();
     let mut dm = Vec::new();
     for a in 0..n {
@@ -74,6 +75,11 @@ fn derivatives_match_finite_differences() {
         assert!((g[a] - fd).abs() <= 1e-6 * (1.0 + fd.abs()), "gradient {a}: {} vs {fd}", g[a]);
         let (mp, mq) = (clean(rows, cols, &p, lay), clean(rows, cols, &q, lay));
         dm.push(mp.iter().zip(&mq).map(|(x, y)| (x - y) / (2.0 * h)).collect::<Vec<_>>());
+        for q in 0..rows * cols {
+            let want = if used[q] { dm[a][q] } else { 0.0 };
+            let got = lin.jac[a * rows * cols + q];
+            assert!((got - want).abs() <= 1e-5 * (1.0 + want.abs()), "jacobian {a} at {q}: {got} vs {want}");
+        }
     }
     for a in 0..n {
         for b in 0..n {
@@ -107,9 +113,9 @@ fn error_spread(lay: Layout, trials: usize) -> Vec<(f64, f64)> {
         let (lo, hi) = bounds(lay, c, 2.0);
         let fit = f.fit(&w, &start, lay, &lo, &hi, 100, 1e-6);
         assert!(fit.converged && !fit.stalled, "fit did not converge: {fit:?}");
-        let cov = f.covariance(&w, &fit.theta, lay, 1.0).expect("covariance");
+        let var = f.variances(&w, &fit.theta, lay, 1.0).expect("variances");
         for q in 0..n {
-            z[q].push((fit.theta[q] - truth[q]) / cov[q * n + q].sqrt());
+            z[q].push((fit.theta[q] - truth[q]) / var[q].sqrt());
         }
     }
     z.iter()
@@ -150,9 +156,9 @@ fn bounds_hold_and_are_reported() {
     // level is found.
     let w = Window::new(SIDE, SIDE, vec![20.0; SIDE * SIDE], vec![true; SIDE * SIDE]);
     let fit = f.fit(&w, &[15.0, 500.0, c, c], lay, &lo, &hi, 100, 1e-6);
-    let cov = f.covariance(&w, &fit.theta, lay, 1.0).unwrap();
-    assert!(fit.converged && fit.theta[1] < 0.1 * cov[5].sqrt(), "{fit:?}");
-    assert!((fit.theta[0] - 20.0).abs() < 0.1 * cov[0].sqrt(), "{fit:?}");
+    let var = f.variances(&w, &fit.theta, lay, 1.0).unwrap();
+    assert!(fit.converged && fit.theta[1] < 0.1 * var[1].sqrt(), "{fit:?}");
+    assert!((fit.theta[0] - 20.0).abs() < 0.1 * var[0].sqrt(), "{fit:?}");
 }
 
 #[test]

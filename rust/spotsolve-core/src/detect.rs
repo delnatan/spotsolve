@@ -293,59 +293,63 @@ impl Bounds {
 /// positive.
 fn propose(win: &Window, fitter: &mut Fitter, theta: &[f64], lay: Layout, k1: &[f64], (y0, y1, x0, x1): (f64, f64, f64, f64)) -> Option<Vec<f64>> {
     let (rows, cols, n) = (win.rows, win.cols, lay.n());
-    let (m, jac) = fitter.jacobian(win, theta, lay);
-    let (g, f) = fitter.gradient_and_information(win, theta, lay);
+    let p = rows * cols;
+    let lin = fitter.linearize(win, theta, lay);
+    // With `F = L L^T`, `b^T F^-1 v = (L^-1 b) . (L^-1 v)`. Without a
+    // factorization nothing is projected out: the plain score.
     let mut chol = crate::linalg::Chol::new(n);
-    let finv: Vec<f64> = if chol.factor(&f, n) {
-        let mut inv = vec![0.0; n * n];
-        for c in 0..n {
-            let mut col = vec![0.0; n];
-            col[c] = 1.0;
-            chol.solve_in_place(&mut col);
-            for r in 0..n {
-                inv[r * n + c] = col[r];
-            }
-        }
-        inv
-    } else {
-        // No projection possible: the plain score.
-        vec![0.0; n * n]
-    };
-    let weighted = |v: &dyn Fn(usize) -> f64| -> Vec<f64> { (0..rows * cols).map(|q| if win.used[q] { v(q) / m[q] } else { 0.0 }).collect() };
+    let projected = chol.factor(&lin.f, n);
+    let mut lg = lin.g.clone();
+    if projected {
+        chol.forward_in_place(&mut lg);
+    }
+    let weighted = |v: &dyn Fn(usize) -> f64| -> Vec<f64> { (0..p).map(|q| if win.used[q] { v(q) / lin.m[q] } else { 0.0 }).collect() };
     let k2: Vec<f64> = k1.iter().map(|v| v * v).collect();
-    let u_map = prefilter::correlate(&weighted(&|q| win.d[q] - m[q]), rows, cols, k1);
+    let u_map = prefilter::correlate(&weighted(&|q| win.d[q] - lin.m[q]), rows, cols, k1);
     let i_map = prefilter::correlate(&weighted(&|_| 1.0), rows, cols, &k2);
-    let b_maps: Vec<Vec<f64>> = (0..n).map(|a| prefilter::correlate(&weighted(&|q| jac[q * n + a]), rows, cols, k1)).collect();
-    let fg: Vec<f64> = (0..n).map(|r| (0..n).map(|c| finv[r * n + c] * g[c]).sum()).collect();
+    let b_maps: Vec<Vec<f64>> = (0..n).map(|a| prefilter::correlate(&weighted(&|q| lin.jac[a * p + q]), rows, cols, k1)).collect();
     let (ry0, ry1) = (y0.ceil().max(0.0) as usize, (y1.floor().max(0.0) as usize).min(rows - 1));
     let (rx0, rx1) = (x0.ceil().max(0.0) as usize, (x1.floor().max(0.0) as usize).min(cols - 1));
-    let mut best: Option<(f64, usize, Vec<f64>)> = None;
-    let mut x = vec![0.0; n];
+    // The best pixel: its score, the new flux's Newton estimate, and L^-1 b.
+    let mut best: Option<(f64, usize, f64, Vec<f64>)> = None;
+    let mut lb = vec![0.0; n];
     for py in ry0..=ry1 {
         for px in rx0..=rx1 {
             let q = py * cols + px;
             if !win.used[q] {
                 continue;
             }
-            let b: Vec<f64> = b_maps.iter().map(|bm| bm[q]).collect();
-            for r in 0..n {
-                x[r] = (0..n).map(|c| finv[r * n + c] * b[c]).sum();
+            let (mut u_eff, mut i_eff) = (u_map[q], i_map[q]);
+            if projected {
+                for (v, bm) in lb.iter_mut().zip(&b_maps) {
+                    *v = bm[q];
+                }
+                chol.forward_in_place(&mut lb);
+                i_eff -= lb.iter().map(|v| v * v).sum::<f64>();
+                u_eff += lb.iter().zip(&lg).map(|(u, v)| u * v).sum::<f64>();
             }
-            let i_eff = i_map[q] - b.iter().zip(&x).map(|(u, v)| u * v).sum::<f64>();
             if !(i_eff > 1e-9 * i_map[q]) {
                 continue;
             }
-            let u_eff = u_map[q] + b.iter().zip(&fg).map(|(u, v)| u * v).sum::<f64>();
             let z = u_eff / i_eff.sqrt();
             if z > best.as_ref().map_or(0.0, |b| b.0) {
-                let a = u_eff / i_eff;
-                let mut start: Vec<f64> = (0..n).map(|r| theta[r] - fg[r] - x[r] * a).collect();
-                start.extend([a, py as f64, px as f64]);
-                best = Some((z, q, start));
+                best = Some((z, q, u_eff / i_eff, lb.clone()));
             }
         }
     }
-    best.map(|b| b.2)
+    let (_, q, a, lb) = best?;
+    // The joint Newton step: the new flux `a`, the rest moved by
+    // `-F^-1 (g + b a)`.
+    let mut start = theta.to_vec();
+    if projected {
+        let mut step: Vec<f64> = lg.iter().zip(&lb).map(|(g, b)| g + b * a).collect();
+        chol.back_in_place(&mut step);
+        for (t, d) in start.iter_mut().zip(&step) {
+            *t -= d;
+        }
+    }
+    start.extend([a, (q / cols) as f64, (q % cols) as f64]);
+    Some(start)
 }
 
 /// Fit one seed's window: components are added while each refit gains
@@ -509,8 +513,7 @@ fn fit_seed(d: &[f64], h: usize, w: usize, sc: &Screen, seed: usize, at: &[bool]
     if fit.at_bound[0] {
         common |= FLAG_BOUND;
     }
-    let n = lay.n();
-    let cov = fitter.covariance(&win, &theta, lay, phi).filter(|c| (0..n).all(|q| c[q * n + q] > 0.0));
+    let var = fitter.variances(&win, &theta, lay, phi).filter(|v| v.iter().all(|&v| v > 0.0));
     for j in 0..lay.k {
         let q = lay.at(j);
         if fit.at_bound[q + 1] || fit.at_bound[q + 2] {
@@ -529,13 +532,13 @@ fn fit_seed(d: &[f64], h: usize, w: usize, sc: &Screen, seed: usize, at: &[bool]
             flags |= FLAG_BOUND;
         }
         let (mut se, mut se_s) = ([f64::NAN; 3], f64::NAN);
-        match &cov {
-            Some(c) => {
+        match &var {
+            Some(v) => {
                 for (i, p) in (q..q + 3).enumerate() {
-                    se[i] = c[p * n + p].sqrt();
+                    se[i] = v[p].sqrt();
                 }
                 if lay.sigma.is_none() {
-                    se_s = c[(q + 3) * n + q + 3].sqrt();
+                    se_s = v[q + 3].sqrt();
                 }
             }
             None => flags |= FLAG_COVARIANCE,

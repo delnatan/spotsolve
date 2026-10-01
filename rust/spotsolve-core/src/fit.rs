@@ -17,8 +17,8 @@
 //! their bounds, and a coordinate's step shrinks with its distance to the
 //! bound it heads for, so a flux cannot collapse onto its floor in one step
 //! while the positions have yet to adapt. `I / phi` is the log-likelihood
-//! in nats for a camera of dispersion `phi`; [`Fitter::covariance`] is the
-//! inverse expected Fisher information scaled by `phi`.
+//! in nats for a camera of dispersion `phi`; [`Fitter::variances`] are the
+//! diagonal of the inverse expected Fisher information scaled by `phi`.
 
 use crate::linalg::Chol;
 use crate::psf;
@@ -29,6 +29,8 @@ pub const INTERIOR_FRAC: f64 = 1e-10;
 pub const STEP_IN: f64 = 0.995;
 /// Relative distance to a bound at which a parameter counts as on it.
 pub const BOUND_TOL: f64 = 1e-6;
+/// Side of the register blocks the information matrix is summed in.
+const BLOCK: usize = 4;
 
 /// The pixels of one fit, row-major `rows x cols`.
 #[derive(Clone, Debug)]
@@ -46,10 +48,6 @@ impl Window {
         assert_eq!(d.len(), rows * cols);
         assert_eq!(used.len(), rows * cols);
         Self { rows, cols, d, used }
-    }
-
-    pub fn n_used(&self) -> usize {
-        self.used.iter().filter(|&&u| u).count()
     }
 }
 
@@ -87,6 +85,17 @@ impl Layout {
     }
 }
 
+/// A fit linearized at one `theta` ([`Fitter::linearize`]).
+pub struct Linear {
+    /// The model, row-major.
+    pub m: Vec<f64>,
+    /// `dm / dtheta`, `n x pixels`.
+    pub jac: Vec<f64>,
+    /// Gradient of `I` and its expected Fisher information, `n x n`.
+    pub g: Vec<f64>,
+    pub f: Vec<f64>,
+}
+
 /// A finished fit.
 #[derive(Clone, Debug)]
 pub struct Fit {
@@ -119,10 +128,19 @@ pub struct Fitter {
     dex: Vec<f64>,
     sex: Vec<f64>,
     m: Vec<f64>,
-    jac: Vec<f64>,
+    /// The used pixels (row-major indices), and the Jacobian `dm / dtheta`
+    /// on them parameter-major, `jt[a * used + q]`, with its rows weighted
+    /// by `1 / m` in `jw`. Rows are padded to a multiple of [`BLOCK`].
+    pix: Vec<usize>,
+    /// On the used pixels: `1 / m` and the score residual `1 - d / m`.
+    wt: Vec<f64>,
+    res: Vec<f64>,
+    jt: Vec<f64>,
+    jw: Vec<f64>,
     f: Vec<f64>,
     g: Vec<f64>,
     chol: Chol,
+    scratch: Vec<f64>,
 }
 
 impl Default for Fitter {
@@ -137,10 +155,15 @@ impl Default for Fitter {
             dex: Vec::new(),
             sex: Vec::new(),
             m: Vec::new(),
-            jac: Vec::new(),
+            pix: Vec::new(),
+            wt: Vec::new(),
+            res: Vec::new(),
+            jt: Vec::new(),
+            jw: Vec::new(),
             f: Vec::new(),
             g: Vec::new(),
             chol: Chol::new(1),
+            scratch: Vec::new(),
         }
     }
 }
@@ -209,54 +232,89 @@ impl Fitter {
         total
     }
 
-    /// Gradient of `I` and expected Fisher information `J^T diag(1/m) J` at
-    /// the last evaluated `theta`, into `self.g` and `self.f`.
-    /// Row `(r, c)` of the Jacobian `dm / dtheta` at the last evaluated
-    /// `theta`, into `j`.
-    #[allow(clippy::too_many_arguments)]
-    fn jac_row(&self, theta: &[f64], lay: Layout, rows: usize, cols: usize, r: usize, c: usize, j: &mut [f64]) {
-        let free = lay.sigma.is_none();
-        j[0] = 1.0;
+    /// The Jacobian `dm / dtheta` at the last evaluated `theta` on the used
+    /// pixels, parameter-major, into `self.pix` and `self.jt`; rows past
+    /// `n` up to the next multiple of [`BLOCK`] are zero.
+    fn fill_jacobian(&mut self, w: &Window, theta: &[f64], lay: Layout) {
+        let (rows, cols, n) = (w.rows, w.cols, lay.n());
+        self.pix.clear();
+        self.pix.extend((0..rows * cols).filter(|&q| w.used[q]));
+        let nu = self.pix.len();
+        self.jt.resize(n.div_ceil(BLOCK) * BLOCK * nu, 0.0);
+        self.jt[..nu].fill(1.0);
+        self.jt[n * nu..].fill(0.0);
         for i in 0..lay.k {
             let p = lay.at(i);
             let a = theta[p];
-            let (ey, ex) = (self.ey[i * rows + r], self.ex[i * cols + c]);
-            j[p] = ey * ex;
-            j[p + 1] = a * self.dey[i * rows + r] * ex;
-            j[p + 2] = a * ey * self.dex[i * cols + c];
-            if free {
-                j[p + 3] = a * (self.sey[i * rows + r] * ex + ey * self.sex[i * cols + c]);
+            let (ey, dey, sey) = (&self.ey[i * rows..(i + 1) * rows], &self.dey[i * rows..(i + 1) * rows], &self.sey[i * rows..(i + 1) * rows]);
+            let (ex, dex, sex) = (&self.ex[i * cols..(i + 1) * cols], &self.dex[i * cols..(i + 1) * cols], &self.sex[i * cols..(i + 1) * cols]);
+            let (jf, tail) = self.jt[p * nu..].split_at_mut(nu);
+            let (jy, tail) = tail.split_at_mut(nu);
+            let (jx, js) = tail.split_at_mut(nu);
+            let mut k = 0;
+            for r in 0..rows {
+                for c in 0..cols {
+                    if !w.used[r * cols + c] {
+                        continue;
+                    }
+                    jf[k] = ey[r] * ex[c];
+                    jy[k] = a * dey[r] * ex[c];
+                    jx[k] = a * ey[r] * dex[c];
+                    if lay.sigma.is_none() {
+                        js[k] = a * (sey[r] * ex[c] + ey[r] * sex[c]);
+                    }
+                    k += 1;
+                }
             }
         }
     }
 
+    /// Gradient of `I` and expected Fisher information `J^T diag(1/m) J` at
+    /// the last evaluated `theta`, into `self.g` and `self.f`. Every entry
+    /// is one sum over the used pixels in raster order; the information is
+    /// summed in `BLOCK x BLOCK` tiles held in registers.
+    #[allow(clippy::needless_range_loop)]
     fn normal(&mut self, w: &Window, theta: &[f64], lay: Layout) {
-        let (rows, cols, n) = (w.rows, w.cols, lay.n());
-        self.f.clear();
-        self.f.resize(n * n, 0.0);
+        let n = lay.n();
+        self.fill_jacobian(w, theta, lay);
+        let nu = self.pix.len();
+        let np = n.div_ceil(BLOCK) * BLOCK;
+        self.jw.resize(np * nu, 0.0);
+        self.jw[n * nu..].fill(0.0);
         self.g.clear();
         self.g.resize(n, 0.0);
-        let mut j = std::mem::take(&mut self.jac);
-        j.resize(n, 0.0);
-        for r in 0..rows {
-            for c in 0..cols {
-                let q = r * cols + c;
-                if !w.used[q] {
-                    continue;
-                }
-                self.jac_row(theta, lay, rows, cols, r, c, &mut j);
-                let m = self.m[q];
-                let (wt, res) = (1.0 / m, 1.0 - w.d[q].max(0.0) / m);
-                for a in 0..n {
-                    self.g[a] += j[a] * res;
-                    let ja = j[a] * wt;
-                    for b in a..n {
-                        self.f[a * n + b] += ja * j[b];
+        self.wt.clear();
+        self.res.clear();
+        for &q in &self.pix {
+            let m = self.m[q];
+            self.wt.push(1.0 / m);
+            self.res.push(1.0 - w.d[q].max(0.0) / m);
+        }
+        for a in 0..n {
+            let j = &self.jt[a * nu..(a + 1) * nu];
+            self.g[a] = j.iter().zip(&self.res).fold(0.0, |s, (j, r)| s + j * r);
+            for ((o, j), wt) in self.jw[a * nu..(a + 1) * nu].iter_mut().zip(j).zip(&self.wt) {
+                *o = j * wt;
+            }
+        }
+        self.f.clear();
+        self.f.resize(n * n, 0.0);
+        for a0 in (0..n).step_by(BLOCK) {
+            for b0 in (a0..n).step_by(BLOCK) {
+                let x: [&[f64]; BLOCK] = std::array::from_fn(|i| &self.jw[(a0 + i) * nu..(a0 + i + 1) * nu]);
+                let y: [&[f64]; BLOCK] = std::array::from_fn(|j| &self.jt[(b0 + j) * nu..(b0 + j + 1) * nu]);
+                let acc = tile(x, y, nu);
+                // Indexed: an iterator over `acc` moves the tile out of
+                // registers.
+                for i in 0..BLOCK.min(n - a0) {
+                    for j in 0..BLOCK.min(n - b0) {
+                        if b0 + j >= a0 + i {
+                            self.f[(a0 + i) * n + b0 + j] = acc[i][j];
+                        }
                     }
                 }
             }
         }
-        self.jac = j;
         for a in 0..n {
             for b in 0..a {
                 self.f[a * n + b] = self.f[b * n + a];
@@ -264,29 +322,20 @@ impl Fitter {
         }
     }
 
-    /// The model and the Jacobian `dm / dtheta` at `theta`, row-major
-    /// `pixels x n`; rows of unused pixels are zero.
-    pub fn jacobian(&mut self, w: &Window, theta: &[f64], lay: Layout) -> (Vec<f64>, Vec<f64>) {
-        self.evaluate(w, theta, lay);
-        let n = lay.n();
-        let mut jac = vec![0.0; w.rows * w.cols * n];
-        for r in 0..w.rows {
-            for c in 0..w.cols {
-                let q = r * w.cols + c;
-                if w.used[q] {
-                    self.jac_row(theta, lay, w.rows, w.cols, r, c, &mut jac[q * n..(q + 1) * n]);
-                }
-            }
-        }
-        (self.m.clone(), jac)
-    }
-
-    /// Gradient of `I` and expected Fisher information at `theta`
-    /// (`n` and `n x n`, row-major), in `I` units.
-    pub fn gradient_and_information(&mut self, w: &Window, theta: &[f64], lay: Layout) -> (Vec<f64>, Vec<f64>) {
+    /// The fit linearized at `theta`: the model, the Jacobian `dm / dtheta`
+    /// parameter-major over every pixel (zero on unused ones), and the
+    /// gradient and expected Fisher information of `I`.
+    pub fn linearize(&mut self, w: &Window, theta: &[f64], lay: Layout) -> Linear {
         self.evaluate(w, theta, lay);
         self.normal(w, theta, lay);
-        (self.g.clone(), self.f.clone())
+        let (n, p, nu) = (lay.n(), w.rows * w.cols, self.pix.len());
+        let mut jac = vec![0.0; n * p];
+        for a in 0..n {
+            for (k, &q) in self.pix.iter().enumerate() {
+                jac[a * p + q] = self.jt[a * nu + k];
+            }
+        }
+        Linear { m: self.m.clone(), jac, g: self.g.clone(), f: self.f.clone() }
     }
 
     /// Minimize `I` from `theta0` within `[lo, hi]`, until no parameter can
@@ -383,10 +432,10 @@ impl Fitter {
         Fit { theta: t, divergence: cur, iterations, converged, stalled, at_bound }
     }
 
-    /// Inverse expected Fisher information at `theta`, times `phi`: the
-    /// covariance of the estimates, `n x n` row-major. `None` when the
+    /// The variances of the estimates: the diagonal of the inverse expected
+    /// Fisher information at `theta`, times `phi`. `None` when the
     /// information cannot be factored.
-    pub fn covariance(&mut self, w: &Window, theta: &[f64], lay: Layout, phi: f64) -> Option<Vec<f64>> {
+    pub fn variances(&mut self, w: &Window, theta: &[f64], lay: Layout, phi: f64) -> Option<Vec<f64>> {
         let n = lay.n();
         self.evaluate(w, theta, lay);
         self.normal(w, theta, lay);
@@ -394,18 +443,38 @@ impl Fitter {
         if !self.chol.factor(&self.f, n) {
             return None;
         }
-        let mut cov = vec![0.0; n * n];
-        let mut col = vec![0.0; n];
-        for j in 0..n {
-            col.fill(0.0);
-            col[j] = 1.0;
-            self.chol.solve_in_place(&mut col);
-            for i in 0..n {
-                cov[i * n + j] = phi * col[i];
+        let mut var = vec![0.0; n];
+        self.chol.inv_diag(&mut var, &mut self.scratch);
+        var.iter_mut().for_each(|v| *v *= phi);
+        Some(var)
+    }
+}
+
+/// `acc[i][j] = sum_k x[i][k] y[j][k]`, as two interleaved partial sums
+/// (even and odd `k`) added at the end: a fixed order, so the result does
+/// not depend on the machine, that maps onto two-lane vector registers.
+#[inline(always)]
+fn tile(x: [&[f64]; BLOCK], y: [&[f64]; BLOCK], nu: usize) -> [[f64; BLOCK]; BLOCK] {
+    let mut acc = [[[0.0f64; 2]; BLOCK]; BLOCK];
+    let pairs = nu / 2;
+    for p in 0..pairs {
+        let k = 2 * p;
+        let xk: [[f64; 2]; BLOCK] = std::array::from_fn(|i| [x[i][k], x[i][k + 1]]);
+        let yk: [[f64; 2]; BLOCK] = std::array::from_fn(|j| [y[j][k], y[j][k + 1]]);
+        for i in 0..BLOCK {
+            for j in 0..BLOCK {
+                for l in 0..2 {
+                    acc[i][j][l] += xk[i][l] * yk[j][l];
+                }
             }
         }
-        Some(cov)
     }
+    std::array::from_fn(|i| {
+        std::array::from_fn(|j| {
+            let tail = if nu % 2 == 1 { x[i][nu - 1] * y[j][nu - 1] } else { 0.0 };
+            acc[i][j][0] + acc[i][j][1] + tail
+        })
+    })
 }
 
 /// The most any one parameter can lower the objective's quadratic model by

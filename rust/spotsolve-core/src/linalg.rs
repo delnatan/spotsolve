@@ -151,6 +151,14 @@ impl Chol {
     ///
     /// Reuses the LM step buffer without allocating a second right-hand side.
     pub fn solve_in_place(&self, v: &mut [f64]) {
+        self.forward_in_place(v);
+        self.back_in_place(v);
+    }
+
+    /// `L^-1 v`, in place: then `u^T A^-1 v` is the dot product of `L^-1 u`
+    /// and `L^-1 v`, with no inverse formed.
+    pub fn forward_in_place(&self, v: &mut [f64]) {
+        debug_assert!(self.ok);
         let n = self.n;
         for i in 0..n {
             let mut sum = v[i];
@@ -159,6 +167,12 @@ impl Chol {
             }
             v[i] = sum / self.l[i * n + i];
         }
+    }
+
+    /// `L^-T v`, in place; after [`Chol::forward_in_place`], `A^-1 v`.
+    pub fn back_in_place(&self, v: &mut [f64]) {
+        debug_assert!(self.ok);
+        let n = self.n;
         for i in (0..n).rev() {
             let mut sum = v[i];
             for k in (i + 1)..n {
