@@ -2,7 +2,7 @@
 //!
 //! Derivatives against finite differences; on simulated Poisson windows,
 //! position and flux errors against the reported covariance; bounds, masked
-//! pixels and two-component recovery.
+//! pixels and two-component recovery, at one width and at each its own.
 
 use spotsolve_core::fit::{Fitter, Layout, Window};
 
@@ -43,10 +43,10 @@ fn bounds(lay: Layout, centre: f64, reach: f64) -> (Vec<f64>, Vec<f64>) {
     for _ in 0..lay.k {
         lo.extend([0.0, centre - reach, centre - reach]);
         hi.extend([1e6, centre + reach, centre + reach]);
-    }
-    if lay.sigma.is_none() {
-        lo.push(0.5 * SIGMA);
-        hi.push(3.0 * SIGMA);
+        if lay.sigma.is_none() {
+            lo.push(0.5 * SIGMA);
+            hi.push(3.0 * SIGMA);
+        }
     }
     (lo, hi)
 }
@@ -55,7 +55,7 @@ fn bounds(lay: Layout, centre: f64, reach: f64) -> (Vec<f64>, Vec<f64>) {
 fn derivatives_match_finite_differences() {
     let (rows, cols) = (11, 13);
     let lay = Layout { k: 2, sigma: None };
-    let theta = [17.0, 420.0, 4.3, 5.1, 260.0, 6.2, 8.4, 1.6];
+    let theta = [17.0, 420.0, 4.3, 5.1, 1.6, 260.0, 6.2, 8.4, 1.3];
     let mut rng = Rng(7);
     let m0 = clean(rows, cols, &theta, lay);
     let d: Vec<f64> = m0.iter().map(|&m| rng.poisson(m) - 2.0).collect();
@@ -179,16 +179,22 @@ fn unused_pixels_do_not_enter() {
 
 #[test]
 fn two_components_recover_a_close_pair() {
-    let lay = Layout { k: 2, sigma: Some(SIGMA) };
     let c = HALF as f64;
     let sep = 2.0 * SIGMA;
-    let truth = [20.0, 700.0, c - 0.5 * sep, c + 0.2, 500.0, c + 0.5 * sep, c - 0.1];
+    for lay in [Layout { k: 2, sigma: Some(SIGMA) }, Layout { k: 2, sigma: None }] {
+    let (truth, start) = if lay.sigma.is_some() {
+        (vec![20.0, 700.0, c - 0.5 * sep, c + 0.2, 500.0, c + 0.5 * sep, c - 0.1],
+         vec![15.0, 400.0, c - 0.7, c + 0.6, 400.0, c + 1.5, c - 0.6])
+    } else {
+        (vec![20.0, 700.0, c - 0.5 * sep, c + 0.2, 1.3, 500.0, c + 0.5 * sep, c - 0.1, 1.7],
+         vec![15.0, 400.0, c - 0.7, c + 0.6, SIGMA, 400.0, c + 1.5, c - 0.6, SIGMA])
+    };
     let d = clean(SIDE, SIDE, &truth, lay);
     let (lo, hi) = bounds(lay, c, 3.0);
-    let start = [15.0, 400.0, c - 0.7, c + 0.6, 400.0, c + 1.5, c - 0.6];
     let fit = Fitter::default().fit(&Window::new(SIDE, SIDE, d, vec![true; SIDE * SIDE]), &start, lay, &lo, &hi, 100, 1e-12);
     assert!(fit.converged, "{fit:?}");
-    for (got, want) in fit.theta.iter().zip(truth) {
+    for (got, want) in fit.theta.iter().zip(&truth) {
         assert!((got - want).abs() < 1e-4 * want.abs().max(1.0), "{:?} vs {truth:?}", fit.theta);
+    }
     }
 }

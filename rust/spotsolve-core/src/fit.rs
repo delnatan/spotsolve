@@ -1,16 +1,16 @@
 //! One window's Poisson fit: a constant background and `k` pixel-integrated
-//! Gaussians of one width,
+//! Gaussians,
 //!
 //! ```text
-//! m[r, c] = c0 + sum_k A_k E(r; y_k, s) E(c; x_k, s)
+//! m[r, c] = c0 + sum_k A_k E(r; y_k, s_k) E(c; x_k, s_k)
 //! I(d, m) = sum_used [d log(d / m) - (d - m)]
 //! ```
 //!
 //! in window-local pixels (`[0, 0]` is the window's first pixel). Pixels not
 //! `used` are left out of the likelihood, as u-track sets them to NaN.
-//! `theta = [c0, A_1, y_1, x_1, ..., A_k, y_k, x_k]`, with the shared width
-//! `s` appended when it is free ([`Layout`]); with `k = 1` and a free width
-//! this is [`psf::pack_var`]'s layout.
+//! `theta = [c0, A_1, y_1, x_1, (s_1), ..., A_k, y_k, x_k, (s_k)]`: each
+//! component's width is its own parameter, or one fixed width for all
+//! ([`Layout`]). With free widths this is [`psf::pack_var`]'s layout.
 //!
 //! [`Fitter::fit`] minimizes `I` by bounded Levenberg-Marquardt (Fisher
 //! scoring) with Coleman-Li affine scaling: parameters stay strictly inside
@@ -53,8 +53,8 @@ impl Window {
     }
 }
 
-/// How `theta` is laid out: `k` components, and the width fixed at
-/// `Some(s)` or free (`None`, the last parameter).
+/// How `theta` is laid out: `k` components, each with its own free width
+/// (`sigma: None`) or all at one fixed width (`Some(s)`).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Layout {
     pub k: usize,
@@ -62,12 +62,28 @@ pub struct Layout {
 }
 
 impl Layout {
-    pub fn n(&self) -> usize {
-        1 + 3 * self.k + self.sigma.is_none() as usize
+    /// Parameters per component.
+    pub fn stride(&self) -> usize {
+        3 + self.sigma.is_none() as usize
     }
 
-    pub fn sigma(&self, theta: &[f64]) -> f64 {
-        self.sigma.unwrap_or_else(|| theta[theta.len() - 1])
+    pub fn n(&self) -> usize {
+        1 + self.stride() * self.k
+    }
+
+    /// Index of component `j`'s flux; its `y`, `x` (and width) follow.
+    pub fn at(&self, j: usize) -> usize {
+        1 + self.stride() * j
+    }
+
+    /// Width of component `j`.
+    pub fn sigma(&self, theta: &[f64], j: usize) -> f64 {
+        self.sigma.unwrap_or_else(|| theta[self.at(j) + 3])
+    }
+
+    /// The layout of the same components with `k` changed.
+    pub fn with(&self, k: usize) -> Self {
+        Self { k, ..*self }
     }
 }
 
@@ -102,7 +118,6 @@ pub struct Fitter {
     ex: Vec<f64>,
     dex: Vec<f64>,
     sex: Vec<f64>,
-    centres: Vec<f64>,
     m: Vec<f64>,
     jac: Vec<f64>,
     f: Vec<f64>,
@@ -121,7 +136,6 @@ impl Default for Fitter {
             ex: Vec::new(),
             dex: Vec::new(),
             sex: Vec::new(),
-            centres: Vec::new(),
             m: Vec::new(),
             jac: Vec::new(),
             f: Vec::new(),
@@ -148,17 +162,16 @@ impl Fitter {
         for v in [&mut self.ex, &mut self.dex, &mut self.sex] {
             v.resize(k * cols, 0.0);
         }
-        let s = lay.sigma(theta);
-        self.centres.clear();
-        self.centres.extend((0..k).map(|i| theta[2 + 3 * i]));
-        psf::factors_axis_sigma(&self.ay, &self.centres, s, &mut self.ey, &mut self.dey, &mut self.sey);
-        self.centres.clear();
-        self.centres.extend((0..k).map(|i| theta[3 + 3 * i]));
-        psf::factors_axis_sigma(&self.ax, &self.centres, s, &mut self.ex, &mut self.dex, &mut self.sex);
+        for i in 0..k {
+            let (q, s) = (lay.at(i), lay.sigma(theta, i));
+            let (ry, rx) = (i * rows..(i + 1) * rows, i * cols..(i + 1) * cols);
+            psf::factors_axis_sigma(&self.ay, &theta[q + 1..q + 2], s, &mut self.ey[ry.clone()], &mut self.dey[ry.clone()], &mut self.sey[ry]);
+            psf::factors_axis_sigma(&self.ax, &theta[q + 2..q + 3], s, &mut self.ex[rx.clone()], &mut self.dex[rx.clone()], &mut self.sex[rx]);
+        }
         self.m.clear();
         self.m.resize(rows * cols, theta[0]);
         for i in 0..k {
-            let a = theta[1 + 3 * i];
+            let a = theta[lay.at(i)];
             let ex = &self.ex[i * cols..(i + 1) * cols];
             for r in 0..rows {
                 let ay = a * self.ey[i * rows + r];
@@ -198,35 +211,40 @@ impl Fitter {
 
     /// Gradient of `I` and expected Fisher information `J^T diag(1/m) J` at
     /// the last evaluated `theta`, into `self.g` and `self.f`.
-    fn normal(&mut self, w: &Window, theta: &[f64], lay: Layout) {
-        let (rows, cols, k, n) = (w.rows, w.cols, lay.k, lay.n());
+    /// Row `(r, c)` of the Jacobian `dm / dtheta` at the last evaluated
+    /// `theta`, into `j`.
+    #[allow(clippy::too_many_arguments)]
+    fn jac_row(&self, theta: &[f64], lay: Layout, rows: usize, cols: usize, r: usize, c: usize, j: &mut [f64]) {
         let free = lay.sigma.is_none();
+        j[0] = 1.0;
+        for i in 0..lay.k {
+            let p = lay.at(i);
+            let a = theta[p];
+            let (ey, ex) = (self.ey[i * rows + r], self.ex[i * cols + c]);
+            j[p] = ey * ex;
+            j[p + 1] = a * self.dey[i * rows + r] * ex;
+            j[p + 2] = a * ey * self.dex[i * cols + c];
+            if free {
+                j[p + 3] = a * (self.sey[i * rows + r] * ex + ey * self.sex[i * cols + c]);
+            }
+        }
+    }
+
+    fn normal(&mut self, w: &Window, theta: &[f64], lay: Layout) {
+        let (rows, cols, n) = (w.rows, w.cols, lay.n());
         self.f.clear();
         self.f.resize(n * n, 0.0);
         self.g.clear();
         self.g.resize(n, 0.0);
-        self.jac.resize(n, 0.0);
+        let mut j = std::mem::take(&mut self.jac);
+        j.resize(n, 0.0);
         for r in 0..rows {
             for c in 0..cols {
                 let q = r * cols + c;
                 if !w.used[q] {
                     continue;
                 }
-                let j = &mut self.jac;
-                j[0] = 1.0;
-                if free {
-                    j[n - 1] = 0.0;
-                }
-                for i in 0..k {
-                    let a = theta[1 + 3 * i];
-                    let (ey, ex) = (self.ey[i * rows + r], self.ex[i * cols + c]);
-                    j[1 + 3 * i] = ey * ex;
-                    j[2 + 3 * i] = a * self.dey[i * rows + r] * ex;
-                    j[3 + 3 * i] = a * ey * self.dex[i * cols + c];
-                    if free {
-                        j[n - 1] += a * (self.sey[i * rows + r] * ex + ey * self.sex[i * cols + c]);
-                    }
-                }
+                self.jac_row(theta, lay, rows, cols, r, c, &mut j);
                 let m = self.m[q];
                 let (wt, res) = (1.0 / m, 1.0 - w.d[q].max(0.0) / m);
                 for a in 0..n {
@@ -238,11 +256,29 @@ impl Fitter {
                 }
             }
         }
+        self.jac = j;
         for a in 0..n {
             for b in 0..a {
                 self.f[a * n + b] = self.f[b * n + a];
             }
         }
+    }
+
+    /// The model and the Jacobian `dm / dtheta` at `theta`, row-major
+    /// `pixels x n`; rows of unused pixels are zero.
+    pub fn jacobian(&mut self, w: &Window, theta: &[f64], lay: Layout) -> (Vec<f64>, Vec<f64>) {
+        self.evaluate(w, theta, lay);
+        let n = lay.n();
+        let mut jac = vec![0.0; w.rows * w.cols * n];
+        for r in 0..w.rows {
+            for c in 0..w.cols {
+                let q = r * w.cols + c;
+                if w.used[q] {
+                    self.jac_row(theta, lay, w.rows, w.cols, r, c, &mut jac[q * n..(q + 1) * n]);
+                }
+            }
+        }
+        (self.m.clone(), jac)
     }
 
     /// Gradient of `I` and expected Fisher information at `theta`
@@ -254,8 +290,8 @@ impl Fitter {
     }
 
     /// Minimize `I` from `theta0` within `[lo, hi]`, until no parameter can
-    /// gain more than `tol` (in `I` units: nats times `phi`) by moving one
-    /// conditional standard error, or `max_iter` steps.
+    /// lower it by more than `tol` (in `I` units: nats times `phi`) moving
+    /// alone ([`coordinate_gain`]), or `max_iter` steps.
     #[allow(clippy::too_many_arguments)]
     pub fn fit(
         &mut self,
@@ -280,11 +316,10 @@ impl Fitter {
         let (mut converged, mut stalled, mut iterations) = (false, false, 0);
         let mut a = vec![0.0; n * n];
         let (mut step, mut t2, mut v) = (vec![0.0; n], vec![0.0; n], vec![0.0; n]);
-        let gate = (2.0 * tol).sqrt();
         loop {
             // self.m is the model at t here.
             self.normal(w, &t, lay);
-            if projected_score(&t, &self.g, &self.f, lo, hi) <= gate {
+            if coordinate_gain(&t, &self.g, &self.f, lo, hi) <= tol {
                 converged = true;
                 break;
             }
@@ -298,9 +333,12 @@ impl Fitter {
             }
             let mut accepted = false;
             while lam < 1e12 {
+                // Coleman-Li's |g| / v and Marquardt's lambda F_qq: both scale
+                // with each parameter's information, so the path does not
+                // depend on parameter units or the camera gain.
                 a.copy_from_slice(&self.f);
                 for q in 0..n {
-                    a[q * n + q] += self.g[q].abs() / v[q] + lam / v[q];
+                    a[q * n + q] += self.g[q].abs() / v[q] + lam * self.f[q * n + q];
                 }
                 if !self.chol.factor(&a, n) {
                     lam *= 10.0;
@@ -370,14 +408,19 @@ impl Fitter {
     }
 }
 
-/// Largest feasible, information-scaled gradient component: each parameter
-/// may move one conditional standard error, or to its bound, downhill.
-fn projected_score(t: &[f64], g: &[f64], f: &[f64], lo: &[f64], hi: &[f64]) -> f64 {
+/// The most any one parameter can lower the objective's quadratic model by
+/// moving alone, downhill and within its bounds: `g^2 / (2 F)` when the
+/// Newton step fits, else `g r - F r^2 / 2` with `r` the room to the bound.
+/// In the objective's units, so the test against `tol` does not depend on
+/// parameter units or the camera gain.
+fn coordinate_gain(t: &[f64], g: &[f64], f: &[f64], lo: &[f64], hi: &[f64]) -> f64 {
     let p = t.len();
     (0..p)
         .map(|q| {
-            let room = if g[q] >= 0.0 { t[q] - lo[q] } else { hi[q] - t[q] };
-            g[q].abs() * room.max(0.0).min(1.0 / f[q * p + q].max(1e-30).sqrt())
+            let room = if g[q] >= 0.0 { t[q] - lo[q] } else { hi[q] - t[q] }.max(0.0);
+            let (gq, fq) = (g[q].abs(), f[q * p + q].max(1e-300));
+            let step = gq / fq;
+            if step <= room { 0.5 * gq * step } else { gq * room - 0.5 * fq * room * room }
         })
         .fold(0.0, f64::max)
 }

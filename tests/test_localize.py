@@ -19,19 +19,51 @@ def _sim(seed, density=0.034, spread=0.2, **kw):
                     sigma_spread=spread, seed=seed, **kw)
 
 
-@pytest.mark.parametrize("free_sigma", [False, True])
-def test_separated_emitters_are_recovered(free_sigma):
+# Floors five points under what mixtures achieve; widths spread +-20-40%,
+# so the default free widths. The old joint model held 0.723/0.919,
+# 0.785/0.913 and 0.512/0.759 on these cells.
+@pytest.mark.parametrize("seed,density,spread,recall,precision",
+                         [(17, 0.015, 0.4, 0.894, 0.933),
+                          (18, 0.034, 0.2, 0.794, 0.955),
+                          (19, 0.055, 0.4, 0.610, 0.897)])
+def test_referee_cells_hold_their_recall_and_precision(seed, density, spread,
+                                                       recall, precision):
+    sim = _sim(seed, density, spread)
+    res = L.localize(sim.image, sigma=SIGMA, fit_mixtures=True)
+    m = match(sim.positions, res.positions, radius=1.0)
+    assert m.recall >= recall - 0.05
+    assert m.precision >= precision - 0.05
+    assert np.all(np.isfinite(res.se)) and np.all(res.se > 0)
+    assert np.all(np.isfinite(res.sigma_se)) and np.all(res.sigma_se > 0)
+
+
+@pytest.mark.parametrize("width", [(1.0, 1.0), (0.8, float("inf"))])
+def test_separated_emitters_are_recovered(width):
     sim = simulate(shape=(96, 96), n_emitters=30, amplitude_range=(300.0, 3000.0),
                    sigma=SIGMA, sigma_spread=0.1, min_separation=10.0, seed=5)
-    res = L.localize(sim.image, sigma=SIGMA, free_sigma=free_sigma)
+    res = L.localize(sim.image, sigma=SIGMA, width=width)
     m = match(sim.positions, res.positions, radius=1.0)
     assert m.recall == 1.0 and m.precision == 1.0
     assert np.all(np.isfinite(res.se)) and np.all(res.se > 0)
     assert np.all(res.info["z"] >= res.info["u"])
-    if free_sigma:
+    if width[0] < width[1]:
         assert np.all(np.isfinite(res.sigma_se)) and np.all(res.sigma_se > 0)
     else:
         assert np.all(res.fit_sigma == SIGMA) and np.all(np.isnan(res.sigma_se))
+
+
+@pytest.mark.parametrize("separation", [1.5, 2.0, 3.0])
+def test_mixtures_resolve_a_pair_that_single_fits_merge(separation):
+    from spotsolve import psf
+    yy, xx = np.mgrid[:48, :48]
+    d = separation * SIGMA
+    truth = np.array([[24.0, 24.0 - d / 2], [24.3, 24.0 + d / 2]])
+    mean = psf.model(psf.pack(20., [1500., 1200.], truth[:, 0], truth[:, 1]), yy, xx, SIGMA)
+    image = np.random.default_rng(9).poisson(mean).astype(float)
+    mixed = L.localize(image, SIGMA, fit_mixtures=True)
+    m = match(truth, mixed.positions, radius=min(1.0, d / 2))
+    assert m.recall == 1.0 and len(mixed) == 2
+    assert np.all(mixed.info["mixture"] > 0)
 
 
 def test_read_noise_needs_no_model():
@@ -152,6 +184,7 @@ def test_diagnostics_follow_all_returned_rows():
     assert len(result) == len(raw[0])
     info = result.info
     assert info["seeds"] == len(result) + info["weak"] + info["unconfined"] + info["duplicates"]
+    assert np.all(info["mixture"] == 0)
 
 
 def test_narrow_broad_and_bright_sources_keep_their_measurements():
@@ -163,7 +196,7 @@ def test_narrow_broad_and_bright_sources_keep_their_measurements():
     theta = psf.pack_var_sigma(30., flux, truth[:, 0], truth[:, 1], widths)
     mean = psf.model_var_sigma(theta, yy, xx)
     image = np.random.default_rng(73).poisson(mean).astype(float)
-    result = L.localize(image, 1.0, free_sigma=True)
+    result = L.localize(image, 1.0, width=(0.6, float("inf")))
     distance, found = cKDTree(result.positions).query(truth)
     assert np.all(distance < .1)
     np.testing.assert_allclose(result.amplitudes[found], flux, rtol=.05)

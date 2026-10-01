@@ -54,6 +54,22 @@ fn grid(rng: &mut Rng, side: usize, sigma: f64, spread: f64) -> (Vec<f64>, Vec<[
     (m.iter().map(|&v| rng.poisson(v)).collect(), truth)
 }
 
+/// A Poisson frame on a flat background of 20 with `n` emitters at least
+/// 4 px from the edge, flux 150-3000 ADU, width `sigma` +- 20%.
+fn field(rng: &mut Rng, h: usize, w: usize, n: usize, sigma: f64) -> (Vec<f64>, Vec<[f64; 2]>) {
+    let mut theta = vec![20.0];
+    let mut truth = Vec::with_capacity(n);
+    for _ in 0..n {
+        let y = 4.0 + rng.uni() * (h as f64 - 9.0);
+        let x = 4.0 + rng.uni() * (w as f64 - 9.0);
+        theta.extend_from_slice(&[150.0 + 2850.0 * rng.uni(), y, x, sigma * (0.8 + 0.4 * rng.uni())]);
+        truth.push([y, x]);
+    }
+    let mut m = vec![0.0; h * w];
+    psf::model_var_sigma_ax(&theta, &psf::local_axis(h), &psf::local_axis(w), None, &mut psf::Factors::new(h, w, n), &mut m);
+    (m.iter().map(|&v| rng.poisson(v)).collect(), truth)
+}
+
 /// Greedy one-to-one matching within 1 px: `(recall, precision, rms error
 /// in px, median error in units of the reported SE)`. The error in SE units
 /// is `sqrt((zy^2 + zx^2) / 2)`, whose median is `sqrt(ln 2)` when the SEs
@@ -91,11 +107,12 @@ fn score(o: &bs::Output, truth: &[[f64; 2]]) -> (f64, f64, f64, f64) {
 fn isolated_emitters_are_recovered_with_calibrated_errors() {
     let (side, sigma) = (128, 1.2);
     let mut rng = Rng(2026);
-    // Fixed width at the true width, and free width over a +-20% spread.
+    // Fixed width at the true width, and free widths over a +-20% spread
+    // (bounds admitting the narrowest).
     // The median position error is sqrt(ln 2) = 0.83 SE when the SEs are
     // right.
-    for (free_sigma, spread) in [(false, 0.0), (true, 0.2)] {
-        let s = Settings { free_sigma, ..Settings::new(sigma) };
+    for (width, spread) in [((1.0, 1.0), 0.0), ((0.75, f64::INFINITY), 0.2)] {
+        let s = Settings { width, ..Settings::new(sigma) };
         let (mut found, mut kept, mut total, mut zs) = (0.0, 0.0, 0.0, Vec::new());
         for _ in 0..6 {
             let (d, truth) = grid(&mut rng, side, sigma, spread);
@@ -109,8 +126,29 @@ fn isolated_emitters_are_recovered_with_calibrated_errors() {
         let (rec, prec) = (found / total, found / kept);
         zs.sort_by(f64::total_cmp);
         let medz = zs[zs.len() / 2];
-        println!("free_sigma {free_sigma}: recall {rec:.4} precision {prec:.4}, median {medz:.2} SE");
-        assert!(rec >= 0.995 && prec >= 0.995 && (0.73..0.93).contains(&medz), "free_sigma {free_sigma}: {rec} {prec} {medz}");
+        println!("width {width:?}: recall {rec:.4} precision {prec:.4}, median {medz:.2} SE");
+        assert!(rec >= 0.995 && prec >= 0.995 && (0.73..0.93).contains(&medz), "width {width:?}: {rec} {prec} {medz}");
+    }
+}
+
+#[test]
+fn crowded_fields_are_recovered_with_mixtures() {
+    let (h, w, sigma) = (128, 128, 1.2);
+    let mut rng = Rng(2026);
+    // Widths spread +-20%, so free widths admitting the narrowest; with one
+    // fixed width, mixtures split the wider emitters. Floors a few points
+    // under what is achieved; the old joint model held (0.97, 0.98), (0.86,
+    // 0.97) and (0.84, 0.97) here.
+    {
+        let s = Settings { fit_mixtures: true, width: (0.75, f64::INFINITY), ..Settings::new(sigma) };
+        for (density, rec_min, prec_min) in [(0.005, 0.95, 0.96), (0.015, 0.85, 0.96), (0.03, 0.82, 0.94)] {
+            let n = (density * (h * w) as f64).round() as usize;
+            let (d, truth) = field(&mut rng, h, w, n, sigma);
+            let o = bs::localize(&d, h, w, None, &s);
+            let (rec, prec, rmse, medz) = score(&o, &truth);
+            println!("density {density}: N {} of {n}, recall {rec:.3} precision {prec:.3} rmse {rmse:.3} px, median {medz:.2} SE", o.amp.len());
+            assert!(rec >= rec_min && prec >= prec_min, "density {density}: {rec} {prec} {rmse} {medz}");
+        }
     }
 }
 

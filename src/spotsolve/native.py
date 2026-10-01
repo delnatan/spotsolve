@@ -21,9 +21,10 @@ except ImportError as error:          # pragma: no cover - build problem
         "spotsolve needs its bundled Rust extension; reinstall a compatible wheel "
         "or run `maturin develop --release` from the repository root") from error
 
-__all__ = ["localize", "localize_stack", "FP_PER_MPX"]
+__all__ = ["localize", "localize_stack", "FP_PER_MPX", "MAX_MIXTURES"]
 
 FP_PER_MPX = float(_rs.DETECT_FP_PER_MPX)
+MAX_MIXTURES = int(_rs.DETECT_MAX_MIXTURES)
 """Default expected false emitters per 10^6 pixels of pure noise."""
 
 
@@ -48,19 +49,22 @@ def _roi(roi, shape):
     return roi
 
 
-def _kw(sigma, offset, roi, shape, fp_per_mpx, free_sigma):
+def _kw(sigma, offset, roi, shape, fp_per_mpx, width, fit_mixtures, max_mixtures):
     sigma = float(sigma)
     if not np.isfinite(sigma) or not 0 < sigma <= max(shape):
         raise ValueError("sigma must be positive, finite and no larger than the frame")
     return dict(sigma=sigma, offset=float(offset), roi=_roi(roi, shape),
-                fp_per_mpx=float(fp_per_mpx), free_sigma=bool(free_sigma))
+                fp_per_mpx=float(fp_per_mpx), width=tuple(map(float, width)),
+                fit_mixtures=bool(fit_mixtures),
+                max_mixtures=_positive_int(max_mixtures, "max_mixtures"))
 
 
 def _result(out, raw, kw, images):
     pos, amp, sig, se, sig_se, flags, bmap, info = out
     dispersion = info.pop("dispersion")
     sigma = kw["sigma"]
-    info.update(method="detect", fp_per_mpx=kw["fp_per_mpx"], free_sigma=kw["free_sigma"])
+    info.update(method="detect", fp_per_mpx=kw["fp_per_mpx"], width=kw["width"],
+                fit_mixtures=kw["fit_mixtures"])
     model = residual = None
     if images:
         model = _rs.detect_render(pos, amp, sig, bmap)
@@ -73,7 +77,8 @@ def _result(out, raw, kw, images):
 
 
 def localize(frame, sigma, *, offset=0.0, roi=None, fp_per_mpx=FP_PER_MPX,
-             free_sigma=False, images=True):
+             width=(1.0, float("inf")), fit_mixtures=False, max_mixtures=MAX_MIXTURES,
+             images=True):
     """Localize one frame. Returns `Localizations`.
 
     `frame`, `offset`, flux and background use camera units (ADU). `sigma`
@@ -82,14 +87,25 @@ def localize(frame, sigma, *, offset=0.0, roi=None, fp_per_mpx=FP_PER_MPX,
     The frame is screened by the Poisson score of one emitter at each pixel;
     local maxima of the Laplacian of Gaussian where that score is high
     enough become seeds. Each seed is fitted alone on a window of
-    `ceil(4 sigma)` px around it: a constant level plus one emitter of width
-    `sigma`, held within `2 sigma` of the seed, with the pixels of other
-    significant spots left out. An emitter is kept if its likelihood ratio
-    against the level alone, in nats scaled by the frame's measured
-    dispersion, reaches `u^2 / 2`. `fp_per_mpx` sets `u`: the expected
-    number of false emitters per 10^6 pixels of noise. With `free_sigma`,
-    kept emitters are refitted with their width free and that fit is
-    reported; the decision is still made at `sigma`.
+    `ceil(4 sigma)` px around it: a constant level plus one emitter, held
+    within `2 sigma` of the seed, with the pixels of other significant spots
+    left out. Each emitter's width is fitted within `width` (multiples of
+    `sigma`; the upper bound is capped at half the window's half-side, about
+    `2 sigma`). Equal bounds fix the width. An emitter is kept if its
+    likelihood ratio against the level alone, in nats scaled by the frame's
+    measured dispersion, reaches `u^2 / 2`. `fp_per_mpx` sets `u`: the
+    expected number of false emitters per 10^6 pixels of noise, for a search
+    over position and width.
+
+    With `fit_mixtures`, after u-track's FitMixtures, a window takes more
+    components: each next one where the residual's score peaks anywhere in
+    the window, kept while each refit gains `u^2 / 2` nats, up to
+    `max_mixtures`; then the weakest is removed while removing it, the rest
+    refitted, costs less. Neighbours inside a window are fitted with it, and
+    each component is reported by the fit of the seed nearest to it.
+    `info["mixture"]` numbers the windows that held several components (0:
+    fitted alone). Use mixtures wherever spots come closer than about
+    `4 sigma`; alone, a fit is biased by a neighbour's light.
 
     `info["z"]` is each emitter's `sqrt(2 * likelihood ratio)`, at least
     `info["u"]`. Every emitter is returned with `FitFlag` diagnostics.
@@ -98,12 +114,13 @@ def localize(frame, sigma, *, offset=0.0, roi=None, fp_per_mpx=FP_PER_MPX,
     raw = np.ascontiguousarray(frame, dtype=float)
     if raw.ndim != 2:
         raise ValueError(f"expected a 2-D frame, got shape {raw.shape}")
-    kw = _kw(sigma, offset, roi, raw.shape, fp_per_mpx, free_sigma)
+    kw = _kw(sigma, offset, roi, raw.shape, fp_per_mpx, width, fit_mixtures, max_mixtures)
     return _result(_rs.detect_localize(raw, **kw), raw, kw, images)
 
 
 def localize_stack(stack, sigma, *, offset=0.0, roi=None, fp_per_mpx=FP_PER_MPX,
-                   free_sigma=False, n_threads=None, images=False):
+                   width=(1.0, float("inf")), fit_mixtures=False, max_mixtures=MAX_MIXTURES,
+                   n_threads=None, images=False):
     """Localize every frame of a `(T, H, W)` stack, in parallel.
 
     Returns one `Localizations` per frame, in frame order, each what
@@ -115,7 +132,7 @@ def localize_stack(stack, sigma, *, offset=0.0, roi=None, fp_per_mpx=FP_PER_MPX,
     raw = np.ascontiguousarray(stack, dtype=float)
     if raw.ndim != 3:
         raise ValueError(f"expected a (T, H, W) stack, got shape {raw.shape}")
-    kw = _kw(sigma, offset, roi, raw.shape[1:], fp_per_mpx, free_sigma)
+    kw = _kw(sigma, offset, roi, raw.shape[1:], fp_per_mpx, width, fit_mixtures, max_mixtures)
     outs = _rs.detect_localize_stack(
         raw, **kw, n_threads=_positive_int((os.cpu_count() or 1) if n_threads is None else n_threads,
                                 "n_threads"))

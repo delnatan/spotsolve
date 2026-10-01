@@ -62,7 +62,7 @@ pub fn psf_kernel1d(sigma: f64) -> Vec<f64> {
 
 /// Correlation of `src` with the separable symmetric kernel `k (x) k`, zero
 /// outside the frame.
-fn correlate(src: &[f64], h: usize, w: usize, k: &[f64]) -> Vec<f64> {
+pub(crate) fn correlate(src: &[f64], h: usize, w: usize, k: &[f64]) -> Vec<f64> {
     let r = k.len() / 2;
     let mut mid = vec![0.0; h * w];
     for y in 0..h {
@@ -163,13 +163,20 @@ pub fn label(mask: &[bool], h: usize, w: usize) -> Vec<u32> {
     labels
 }
 
-/// Screen a frame `d` (ADU above the offset) of dispersion `phi` for
-/// emitters of width `sigma`, at the score `z_min`. Seeds are confined to
-/// `roi`.
-pub fn screen(d: &[f64], h: usize, w: usize, sigma: f64, phi: f64, z_min: f64, roi: Option<&[bool]>) -> Screen {
+/// Screen a frame `d` (ADU above the offset) of dispersion `phi`: the mask
+/// holds every pixel whose score at some width of `bank`, `(width, bar)`
+/// pairs, reaches that width's bar. Score, flux and level are reported at
+/// `sigma`, which also sets the LoG. Seeds are confined to `roi`.
+pub fn screen(d: &[f64], h: usize, w: usize, sigma: f64, phi: f64, bank: &[(f64, f64)], roi: Option<&[bool]>) -> Screen {
     assert_eq!(d.len(), h * w);
     let (z, amplitude, background) = score(d, h, w, sigma, phi);
-    let mask: Vec<bool> = z.iter().map(|&v| v >= z_min).collect();
+    let mut mask = vec![false; h * w];
+    for &(width, bar) in bank {
+        let zw = if width == sigma { z.clone() } else { score(d, h, w, width, phi).0 };
+        for (m, v) in mask.iter_mut().zip(zw) {
+            *m |= v >= bar;
+        }
+    }
     let neg_log: Vec<f64> = filters::gaussian_laplace(d, h, w, sigma, Mode::Reflect).into_iter().map(|v| -v).collect();
     let size = 2 * sigma.ceil() as usize + 1;
     let local_max = filters::maximum_filter(&neg_log, h, w, size, Mode::Reflect);
@@ -178,24 +185,42 @@ pub fn screen(d: &[f64], h: usize, w: usize, sigma: f64, phi: f64, z_min: f64, r
     Screen { z, amplitude, background, mask, labels, seeds }
 }
 
-/// Expected local maxima above `u`, per pixel, of the score of one emitter
-/// of width `sigma` on noise. The score is a smooth unit Gaussian field
-/// whose covariance is the PSF correlated with itself: a Gaussian of
-/// variance `2 (sigma^2 + 1/12)` per axis, pixel integration adding the
-/// `1/12`. Its second-derivative matrix is `lambda I`, `lambda = 1 / (2
-/// (sigma^2 + 1/12))`, and for high `u` the expected number of maxima
-/// above `u` is the Euler characteristic density
-/// `lambda u exp(-u^2 / 2) / (2 pi)^(3/2)`. The frame's edge adds a term
-/// of relative size `1 / (sqrt(lambda) * side)`, left out.
-pub fn false_rate(u: f64, sigma: f64) -> f64 {
-    let lambda = 0.5 / (sigma * sigma + 1.0 / 12.0);
-    lambda * u * (-0.5 * u * u).exp() / (2.0 * PI).powf(1.5)
+/// Expected local maxima above `u`, per pixel, of the likelihood-ratio
+/// field of one emitter of width `s` in `[lo, hi]` on noise, its centre and
+/// width searched.
+///
+/// The field's signed root is a smooth unit Gaussian field over position
+/// and `tau = log s`. Two emitters' scores correlate as the profiles do:
+/// `exp(-r^2 / (4 v))` at offset `r`, `v = s^2 + 1/12` the pixel-integrated
+/// profile's variance, and `2 sqrt(v1 v2) / (v1 + v2)` across widths. The
+/// metric is therefore `(dy^2 + dx^2) / (2 v) + dtau^2`: a slab of
+/// hyperbolic space (Siegmund & Worsley 1995, *Ann. Stat.* 23:608). Its
+/// Lipschitz-Killing curvatures per unit area, with `a = 1 / v(lo)` and
+/// `b = 1 / v(hi)`, are
+///
+/// ```text
+/// L3 = (a - b) / 4,  L2 = (a + b) / 4,  L1 = (a - b) / (8 pi)
+/// ```
+///
+/// and for high `u` the expected number of maxima above `u` is the Euler
+/// characteristic density `L3 rho3(u) + L2 rho2(u) + L1 rho1(u)` (Adler &
+/// Taylor 2007). At `lo = hi` it is the 2-D density `u exp(-u^2 / 2) /
+/// (2 pi)^(3/2) / (2 v)`. The frame's edge adds a term of relative size
+/// `1 / (sqrt(a) * side)`, left out.
+pub fn false_rate(u: f64, lo: f64, hi: f64) -> f64 {
+    let (a, b) = (1.0 / (lo * lo + 1.0 / 12.0), 1.0 / (hi * hi + 1.0 / 12.0));
+    let e = (-0.5 * u * u).exp();
+    let rho1 = e / (2.0 * PI);
+    let rho2 = u * e / (2.0 * PI).powf(1.5);
+    let rho3 = (u * u - 1.0) * e / (4.0 * PI * PI);
+    0.25 * (a - b) * rho3 + 0.25 * (a + b) * rho2 + (a - b) / (8.0 * PI) * rho1
 }
 
-/// The `u >= 1` at which [`false_rate`] is `fp_per_mpx` per 10^6 pixels,
-/// by bisection; the rate falls with `u` there.
-pub fn threshold(fp_per_mpx: f64, sigma: f64) -> f64 {
-    let rate = |u: f64| 1e6 * false_rate(u, sigma);
+/// The `u >= 1` at which [`false_rate`] over widths `[lo, hi]` is
+/// `fp_per_mpx` per 10^6 pixels, by bisection; the rate falls with `u`
+/// there.
+pub fn threshold(fp_per_mpx: f64, lo: f64, hi: f64) -> f64 {
+    let rate = |u: f64| 1e6 * false_rate(u, lo, hi);
     let (mut lo, mut hi) = (1.0, 40.0);
     if rate(lo) <= fp_per_mpx {
         return lo;
@@ -286,8 +311,8 @@ mod tests {
     #[test]
     fn noise_seeds_meet_the_false_rate() {
         let (side, frames, sigma, fp) = (128, 24, 1.45, 300.0);
-        let u = threshold(fp, sigma);
-        assert!((1e6 * false_rate(u, sigma) - fp).abs() < 1e-6 * fp);
+        let u = threshold(fp, sigma, sigma);
+        assert!((1e6 * false_rate(u, sigma, sigma) - fp).abs() < 1e-6 * fp);
         let mut state = 99u64;
         let mut uni = || {
             state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
@@ -308,7 +333,7 @@ mod tests {
                 })
                 .collect();
             let phi = dispersion(&d, side, side);
-            seeds += screen(&d, side, side, sigma, phi, u, None).seeds.len();
+            seeds += screen(&d, side, side, sigma, phi, &[(sigma, u)], None).seeds.len();
         }
         let per_mpx = seeds as f64 * 1e6 / (frames * side * side) as f64;
         assert!(per_mpx > fp / 1.5 && per_mpx < fp * 1.5, "{per_mpx} per Mpx at u = {u}");

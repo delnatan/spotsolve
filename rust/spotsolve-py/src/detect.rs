@@ -17,14 +17,20 @@ type Arr2 = Py<PyArray2<f64>>;
 /// `(positions, amplitudes, sigmas, se, sigma_se, flags, background, info)`.
 type Frame<'py> = (Arr2, Arr1, Arr1, Arr2, Arr1, Py<PyArray1<u8>>, Arr2, Bound<'py, PyDict>);
 
-fn settings(sigma: f64, fp_per_mpx: f64, free_sigma: bool) -> PyResult<detect::Settings> {
+fn settings(sigma: f64, fp_per_mpx: f64, width: (f64, f64), fit_mixtures: bool, max_mixtures: usize) -> PyResult<detect::Settings> {
+    if !(width.0 > 0.0 && width.0.is_finite() && width.0 <= width.1) {
+        return Err(PyValueError::new_err("`width` must be 0 < lo <= hi"));
+    }
+    if max_mixtures == 0 {
+        return Err(PyValueError::new_err("`max_mixtures` must be at least 1"));
+    }
     if !(sigma.is_finite() && sigma > 0.0) {
         return Err(PyValueError::new_err("`sigma` must be positive"));
     }
     if !(fp_per_mpx.is_finite() && fp_per_mpx > 0.0) {
         return Err(PyValueError::new_err("`fp_per_mpx` must be positive and finite"));
     }
-    Ok(detect::Settings { sigma, fp_per_mpx, free_sigma })
+    Ok(detect::Settings { sigma, fp_per_mpx, width, fit_mixtures, max_mixtures })
 }
 
 fn check_offset(offset: f64) -> PyResult<()> {
@@ -63,6 +69,14 @@ fn give<'py>(py: Python<'py>, o: detect::Output, h: usize, w: usize) -> PyResult
     info.set_item("weak", o.weak)?;
     info.set_item("unconfined", o.unconfined)?;
     info.set_item("duplicates", o.duplicates)?;
+    info.set_item("added", o.added)?;
+    info.set_item("residual_seeds", o.residual_seeds)?;
+    info.set_item("residual_found", o.residual_found)?;
+    info.set_item("removed", o.removed)?;
+    info.set_item("mixture", o.mixture.into_pyarray(py))?;
+    info.set_item("seed", o.seed.into_pyarray(py).reshape([n, 2])?)?;
+    let ns = o.seeds.len() / 2;
+    info.set_item("seed_positions", o.seeds.into_pyarray(py).reshape([ns, 2])?)?;
     Ok((
         o.pos.into_pyarray(py).reshape([n, 2])?.unbind(),
         o.amp.into_pyarray(py).unbind(),
@@ -78,7 +92,7 @@ fn give<'py>(py: Python<'py>, o: detect::Output, h: usize, w: usize) -> PyResult
 /// Localize one raw frame. Everything is in ADU above `offset`; the
 /// background and dispersion are measured from the frame.
 #[pyfunction]
-#[pyo3(signature = (raw, sigma, offset=0.0, *, roi=None, fp_per_mpx=detect::FP_PER_MPX, free_sigma=false))]
+#[pyo3(signature = (raw, sigma, offset=0.0, *, roi=None, fp_per_mpx=detect::FP_PER_MPX, width=(1.0, f64::INFINITY), fit_mixtures=false, max_mixtures=detect::MAX_MIXTURES))]
 #[allow(clippy::too_many_arguments)]
 fn detect_localize<'py>(
     py: Python<'py>,
@@ -87,7 +101,9 @@ fn detect_localize<'py>(
     offset: f64,
     roi: Option<PyReadonlyArray2<'_, bool>>,
     fp_per_mpx: f64,
-    free_sigma: bool,
+    width: (f64, f64),
+    fit_mixtures: bool,
+    max_mixtures: usize,
 ) -> PyResult<Frame<'py>> {
     let (h, w) = (raw.shape()[0], raw.shape()[1]);
     let r = raw
@@ -99,7 +115,7 @@ fn detect_localize<'py>(
     }
     check_offset(offset)?;
     let roi = roi_slice(&roi, h, w)?.map(|m| m.to_vec());
-    let s = settings(sigma, fp_per_mpx, free_sigma)?;
+    let s = settings(sigma, fp_per_mpx, width, fit_mixtures, max_mixtures)?;
     let o = py.detach(|| detect::localize_raw(&r, h, w, offset, roi.as_deref(), &s));
     give(py, o, h, w)
 }
@@ -108,7 +124,7 @@ fn detect_localize<'py>(
 /// each frame exactly as `detect_localize` would. Returns one tuple per frame,
 /// in frame order.
 #[pyfunction]
-#[pyo3(signature = (raw, sigma, offset=0.0, *, roi=None, fp_per_mpx=detect::FP_PER_MPX, free_sigma=false, n_threads=1))]
+#[pyo3(signature = (raw, sigma, offset=0.0, *, roi=None, fp_per_mpx=detect::FP_PER_MPX, width=(1.0, f64::INFINITY), fit_mixtures=false, max_mixtures=detect::MAX_MIXTURES, n_threads=1))]
 #[allow(clippy::too_many_arguments)]
 fn detect_localize_stack<'py>(
     py: Python<'py>,
@@ -117,7 +133,9 @@ fn detect_localize_stack<'py>(
     offset: f64,
     roi: Option<PyReadonlyArray2<'_, bool>>,
     fp_per_mpx: f64,
-    free_sigma: bool,
+    width: (f64, f64),
+    fit_mixtures: bool,
+    max_mixtures: usize,
     n_threads: usize,
 ) -> PyResult<Vec<Frame<'py>>> {
     let sh = raw.shape();
@@ -130,7 +148,7 @@ fn detect_localize_stack<'py>(
     }
     check_offset(offset)?;
     let roi = roi_slice(&roi, h, w)?.map(|m| m.to_vec());
-    let s = settings(sigma, fp_per_mpx, free_sigma)?;
+    let s = settings(sigma, fp_per_mpx, width, fit_mixtures, max_mixtures)?;
     let r = r.to_vec();
     let outs = py.detach(|| {
         detect::localize_stack(&r, n, h, w, offset, roi.as_deref(), &s, n_threads.max(1))
@@ -173,5 +191,6 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // The detector's defaults, read by `spotsolve.native` so Python states
     // no second copy of them.
     m.add("DETECT_FP_PER_MPX", detect::FP_PER_MPX)?;
+    m.add("DETECT_MAX_MIXTURES", detect::MAX_MIXTURES)?;
     Ok(())
 }
