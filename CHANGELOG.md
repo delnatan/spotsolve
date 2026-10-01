@@ -9,8 +9,8 @@ measurements.
 - `localize` / `localize_stack` screen the frame by a Poisson score test,
   seed at LoG maxima and fit each seed on its own `ceil(4 sigma)` window.
   `fit_mixtures=True` (u-track's FitMixtures) fits several emitters per
-  window, with neighbours as nuisance components, efficient-score
-  proposals and a residual pass; `max_mixtures` caps the components.
+  window, with neighbours as nuisance components and efficient-score
+  proposals; `max_mixtures` caps the components.
 - Every decision is a likelihood ratio at one threshold `u` from
   `fp_per_mpx`, now a closed-form Euler-characteristic density over
   position and width. Measured false emitters on noise: 13-17 per 10^6
@@ -30,9 +30,10 @@ measurements.
 - Results are invariant to the camera gain, and identical across worker
   counts.
 - Speed on real 256x256 GEM frames, serial: 24 ms per frame with single
-  fits, 0.6 s with mixtures (0.3.0: 1.7 s). On simulated fields mixtures
-  match the joint model's recall (0.97 at 0.005 / px^2, 0.85 at 0.02) and
-  resolve pairs from 1.5 sigma.
+  fits, 0.39 s with mixtures (0.3.0: 1.7 s). On simulated fields mixtures
+  come within a few points of the joint model's recall (0.96 at 0.005 /
+  px^2, 0.83 at 0.02) and resolve pairs from 1.5 sigma; on a real bead
+  image they report the same beads.
 - Scripts take `--mixtures`; `scripts/benchmark_detection.py` scores any
   version on seeded scenarios.
 

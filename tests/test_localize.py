@@ -23,9 +23,9 @@ def _sim(seed, density=0.034, spread=0.2, **kw):
 # so the default free widths. The old joint model held 0.723/0.919,
 # 0.785/0.913 and 0.512/0.759 on these cells.
 @pytest.mark.parametrize("seed,density,spread,recall,precision",
-                         [(17, 0.015, 0.4, 0.894, 0.933),
-                          (18, 0.034, 0.2, 0.794, 0.955),
-                          (19, 0.055, 0.4, 0.610, 0.897)])
+                         [(17, 0.015, 0.4, 0.894, 0.977),
+                          (18, 0.034, 0.2, 0.785, 0.966),
+                          (19, 0.055, 0.4, 0.558, 0.950)])
 def test_referee_cells_hold_their_recall_and_precision(seed, density, spread,
                                                        recall, precision):
     sim = _sim(seed, density, spread)

@@ -71,8 +71,6 @@ fn give<'py>(py: Python<'py>, o: detect::Output, h: usize, w: usize) -> PyResult
     info.set_item("duplicates", o.duplicates)?;
     info.set_item("added", o.added)?;
     info.set_item("out_of_focus", o.out_of_focus)?;
-    info.set_item("residual_seeds", o.residual_seeds)?;
-    info.set_item("residual_found", o.residual_found)?;
     info.set_item("removed", o.removed)?;
     info.set_item("mixture", o.mixture.into_pyarray(py))?;
     info.set_item("seed", o.seed.into_pyarray(py).reshape([n, 2])?)?;

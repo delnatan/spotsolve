@@ -35,14 +35,7 @@
 //!    out-of-focus light (defocused emitters, haze), which narrower
 //!    components would otherwise split up; it is counted, not reported.
 //!    Equal bounds fix the width, as u-track does.
-//! 6. With mixtures, a second pass after DAOPHOT's subtract-and-re-find
-//!    (Stetson 1987): the residual of the emitters found is screened again,
-//!    for dim emitters a bright neighbour hid from the first screen's
-//!    level, and each new seed's window starts with the emitters found in
-//!    it as components, refitted but neither tested nor reported there. A
-//!    new component within `sigma` of a known emitter reshapes that emitter
-//!    rather than finding a hidden one, and is not reported.
-//! 7. Standard errors from the reported fit's Fisher information, scaled by
+//! 6. Standard errors from the reported fit's Fisher information, scaled by
 //!    `phi`.
 
 use crate::fit::{Fitter, Layout, Window};
@@ -167,10 +160,6 @@ pub struct Output {
     /// Components wider than the reported widths, fitted as out-of-focus
     /// light and returned as background.
     pub out_of_focus: usize,
-    /// With mixtures: seeds of the second, residual pass, and the emitters
-    /// it added.
-    pub residual_seeds: usize,
-    pub residual_found: usize,
 }
 
 /// Correlation of the scores of two unit pixel-integrated profiles of
@@ -354,11 +343,9 @@ fn propose(win: &Window, fitter: &mut Fitter, theta: &[f64], lay: Layout, k1: &[
 
 /// Fit one seed's window: components are added while each refit gains
 /// `u^2 / 2` nats, then the weakest is removed while removing it, the rest
-/// refitted, costs less than that. Without mixtures, at most one. `known`
-/// emitters inside the window start as components of it: refitted with the
-/// rest, never tested or reported here.
+/// refitted, costs less than that. Without mixtures, at most one.
 #[allow(clippy::too_many_arguments)]
-fn fit_seed(d: &[f64], h: usize, w: usize, sc: &Screen, seed: usize, at: &[bool], known: &[Spot], s: &Settings, phi: f64, u: f64, k1: &[f64], fitter: &mut Fitter) -> Fate {
+fn fit_seed(d: &[f64], h: usize, w: usize, sc: &Screen, seed: usize, at: &[bool], s: &Settings, phi: f64, u: f64, k1: &[f64], fitter: &mut Fitter) -> Fate {
     let mut fate = Fate::default();
     let (sy, sx) = (seed / w, seed % w);
     let r = s.radius();
@@ -404,30 +391,16 @@ fn fit_seed(d: &[f64], h: usize, w: usize, sc: &Screen, seed: usize, at: &[bool]
         (0..lay.k).any(|j| at[lay.at(j) + 1] || at[lay.at(j) + 2])
     };
 
-    // The known emitters in the window, fitted with the level first.
     let mut theta = vec![sc.background[seed].clamp(b.level.0, b.level.1)];
-    // The level alone: the null every first component is tested against.
+    // The level alone: the null the first component is tested against.
     let null = level_divergence(&win);
-    for p in known.iter().filter(|p| p.y >= y0 as f64 - 0.5 && p.y < y1 as f64 - 0.5 && p.x >= x0 as f64 - 0.5 && p.x < x1 as f64 - 0.5) {
-        theta.extend([p.a, p.y - y0 as f64, p.x - x0 as f64]);
-        if lay.sigma.is_none() {
-            theta.push(p.s);
-        }
-    }
-    let n_known = (theta.len() - 1) / lay.stride();
     let mut div = null;
-    if n_known > 0 {
-        let (lo, hi) = b.of(lay.with(n_known));
-        let f = fitter.fit(&win, &theta, lay.with(n_known), &lo, &hi, FIT_MAX_ITER, tol);
-        div = f.divergence;
-        theta = f.theta;
-    }
 
     // Forward: each new component where the efficient score peaks.
     let mut gains: Vec<f64> = Vec::new();
     let mut fit = None;
-    while n_known + gains.len() < max_k.max(n_known + 1) {
-        let k = n_known + gains.len();
+    while gains.len() < max_k {
+        let k = gains.len();
         // Alone, the component starts at its seed. In a mixture the seed
         // only centres the window: every component, the first too, starts
         // where the efficient score peaks, and ownership decides which are
@@ -465,7 +438,7 @@ fn fit_seed(d: &[f64], h: usize, w: usize, sc: &Screen, seed: usize, at: &[bool]
         fit = Some(f);
     }
     let Some(mut fit) = fit else {
-        fate.weak = n_known == 0 && !fate.unconfined;
+        fate.weak = !fate.unconfined;
         return fate;
     };
     fate.added = gains.len() - 1;
@@ -475,7 +448,7 @@ fn fit_seed(d: &[f64], h: usize, w: usize, sc: &Screen, seed: usize, at: &[bool]
     let k_of = |theta: &[f64]| (theta.len() - 1) / lay.stride();
     let mine = |theta: &[f64], j: usize| {
         let q = lay.at(j);
-        j >= n_known && owned(seed, theta[q + 1] + y0 as f64, theta[q + 2] + x0 as f64, w, h, at)
+        owned(seed, theta[q + 1] + y0 as f64, theta[q + 2] + x0 as f64, w, h, at)
     };
     let removal = |fitter: &mut Fitter, theta: &[f64], j: usize, div: f64| {
         let k = k_of(theta);
@@ -489,7 +462,7 @@ fn fit_seed(d: &[f64], h: usize, w: usize, sc: &Screen, seed: usize, at: &[bool]
         (f.divergence - div, Some(f))
     };
     let mut cost: Vec<Option<f64>> = vec![None; k_of(&theta)];
-    if cost.len() == 1 && n_known == 0 {
+    if cost.len() == 1 {
         cost[0] = Some(gains[0]);
     }
     loop {
@@ -537,7 +510,7 @@ fn fit_seed(d: &[f64], h: usize, w: usize, sc: &Screen, seed: usize, at: &[bool]
             continue;
         }
         if !mine(&theta, j) {
-            fate.others += (j >= n_known) as usize;
+            fate.others += 1;
             continue;
         }
         if lay.sigma(&theta, j) > w_hi {
@@ -571,7 +544,7 @@ fn fit_seed(d: &[f64], h: usize, w: usize, sc: &Screen, seed: usize, at: &[bool]
             z: (2.0 * cost[j].expect("an owned component's cost") / phi).sqrt(),
             flags,
             seed,
-            mixture: if lay.k > 1 { (seed + if n_known > 0 { h * w } else { 0 }) as u32 + 1 } else { 0 },
+            mixture: if lay.k > 1 { seed as u32 + 1 } else { 0 },
         });
     }
     fate
@@ -608,19 +581,6 @@ impl Output {
         self.duplicates += fate.others;
         self.out_of_focus += fate.out_of_focus;
     }
-}
-
-/// The light of `spots` on an `h x w` crop, each at its own width.
-fn render(spots: &[Spot], h: usize, w: usize) -> Vec<f64> {
-    let mut theta = vec![0.0];
-    for p in spots {
-        theta.extend([p.a, p.y, p.x, p.s]);
-    }
-    let mut m = vec![0.0; h * w];
-    if !spots.is_empty() {
-        psf::model_var_sigma_ax(&theta, &psf::local_axis(h), &psf::local_axis(w), None, &mut psf::Factors::new(h, w, spots.len()), &mut m);
-    }
-    m
 }
 
 /// The ROI's bounding box grown by the context its seeds need: a fit
@@ -673,39 +633,9 @@ fn localize_with(d: &[f64], h: usize, w: usize, roi: Option<&[bool]>, s: &Settin
     }
     let mut spots = Vec::new();
     for &seed in &sc.seeds {
-        let fate = fit_seed(&dc, ch, cw, &sc, seed, &at, &[], s, phi, u, &k1, fitter);
+        let fate = fit_seed(&dc, ch, cw, &sc, seed, &at, s, phi, u, &k1, fitter);
         out.tally(&fate);
         spots.extend(fate.spots);
-    }
-    if s.fit_mixtures {
-        // A second pass, after DAOPHOT (Stetson 1987, PASP 99:191): screen
-        // what the emitters found leave, where a bright neighbour hid a
-        // dim one from the first screen's level, and fit each new seed's
-        // window with the emitters found as components of it.
-        let light = render(&spots, ch, cw);
-        let rest: Vec<f64> = dc.iter().zip(&light).map(|(d, l)| d - l).collect();
-        let sc2 = prefilter::screen(&rest, ch, cw, s.sigma, phi, &bank(w_lo, w_hi, u), rc.as_deref());
-        let seeds2: Vec<usize> = sc2.seeds.iter().copied().filter(|&i| !at[i]).collect();
-        let mut at2 = vec![false; ch * cw];
-        for &i in &seeds2 {
-            at2[i] = true;
-        }
-        out.residual_seeds = seeds2.len();
-        let mut found = Vec::new();
-        for &seed in &seeds2 {
-            let fate = fit_seed(&dc, ch, cw, &Screen { labels: sc.labels.clone(), ..sc2.clone() }, seed, &at2, &spots, s, phi, u, &k1, fitter);
-            out.tally(&fate);
-            found.extend(fate.spots);
-        }
-        // A new component within `sigma` of a known emitter reshapes it
-        // rather than finding a hidden one (pairs that close are rarely
-        // resolved); the first pass's report of it stands.
-        let r2 = s.sigma * s.sigma;
-        let before = found.len();
-        found.retain(|p| spots.iter().all(|q| (p.y - q.y).powi(2) + (p.x - q.x).powi(2) >= r2));
-        out.duplicates += before - found.len();
-        out.residual_found = found.len();
-        spots.extend(found);
     }
     spots.sort_by(|a, b| a.y.total_cmp(&b.y).then(a.x.total_cmp(&b.x)));
     for p in spots {

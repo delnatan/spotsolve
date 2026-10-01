@@ -66,14 +66,7 @@ calibration is needed; fluxes scale with gain, positions and decisions do not.
    defocused emitters and haze that narrower components would otherwise
    split up. It is counted in `info["out_of_focus"]`, not reported.
    `width=(1, 1)` fixes every width at `sigma`, as u-track does.
-6. **Residual pass** (mixtures only), after DAOPHOT's subtract-and-re-find
-   (Stetson 1987, *PASP* 99:191): the residual of the emitters found is
-   screened again, for dim emitters a bright neighbour hid from the first
-   screen's level. Each new seed's window starts with the emitters found in
-   it as components, refitted but neither tested nor reported there. A new
-   component within `sigma` of a known emitter reshapes it rather than
-   finding a hidden one, and is not reported.
-7. **Uncertainties.** Standard errors from the inverse expected Fisher
+6. **Uncertainties.** Standard errors from the inverse expected Fisher
    information `J^T diag(1/m) J` of each emitter's final window fit, every
    component and the level free, scaled by `phi`.
 
@@ -152,21 +145,32 @@ serial, Apple M5):
 | Scenario | Single fits | Mixtures | 0.3.0 joint |
 |---|---|---|---|
 | Isolated, flux 100: recall | 0.36 | 0.36 | 0.41 |
-| Isolated, flux 800: rms error, ms/frame | 0.125 px, 2.6 | 0.125 px, 8.0 | 0.125 px, 139 |
+| Isolated, flux 800: rms error, ms/frame | 0.125 px, 2.6 | 0.125 px, 6.7 | 0.125 px, 139 |
 | Equal pairs at 1.5 / 2 / 3 sigma: both found | 0 / 0 / 0 | 0.92 / 1.00 / 1.00 | 0.90 / 1.00 / 1.00 |
-| Fields 0.005 / px^2: recall, precision | 0.71, 0.93 | 0.97, 0.99 | 0.97, 1.00 |
-| Fields 0.02 / px^2 | 0.33, 0.82 | 0.85, 0.98 | 0.87, 0.99 |
-| Fields 0.04 / px^2 | 0.16, 0.76 | 0.68, 0.94 | 0.72, 0.97 |
-| Fields 0.02 / 0.04: ms/frame | 7 / 10 | 187 / 744 | 568 / 1673 |
+| Fields 0.005 / px^2: recall, precision | 0.71, 0.93 | 0.96, 0.99 | 0.97, 1.00 |
+| Fields 0.02 / px^2 | 0.33, 0.82 | 0.83, 0.98 | 0.87, 0.99 |
+| Fields 0.04 / px^2 | 0.16, 0.76 | 0.66, 0.95 | 0.72, 0.97 |
+| Fields 0.02 / 0.04: ms/frame | 7 / 10 | 160 / 528 | 568 / 1673 |
 
 The field scenarios have exact widths, where searching widths costs a few
 points of recall; `width=(1, 1)` recovers them. With widths spread +-20%,
 fixed-width mixtures split wider emitters (precision 0.88), free widths do
 not (0.97-1.00). On 256x256 fields at 0.03 / px^2 with widths spread +-20%
-(sigma 1.2), mixtures find 0.84 of emitters at precision 0.97 in 1.3 s; the
-joint model found 0.83 at 0.985 in 5.2 s. Adding defocused blobs 3-6 sigma
-wide raises mixtures' false emitters from 3.0 to 7.1 per 128x128 frame (the
-joint model: 1.8 to 3.0).
+(sigma 1.2), mixtures find 0.825 of emitters at precision 0.979 in 1.0 s;
+the joint model found 0.829 at 0.985 in 5.2 s. Adding defocused blobs 3-6
+sigma wide raises mixtures' false emitters from 2.5 to 5.5 per 128x128 frame
+(the joint model: 1.8 to 3.0). On a real 39x39 bead image mixtures and the
+joint model report the same 70 beads.
+
+Measured and not kept: a second, DAOPHOT-style pass on the residual (+2
+points of recall in dense fields, but it fitted PSF misfit beside bright
+beads as emitters and cost 37% of the time); a window dispersion
+(quasi-likelihood F test, u-track's test in Poisson form), which raised the
+bar beside bright beads until 18 of 70 real beads were lost; fitting each
+mask cluster jointly (DAOPHOT's NSTAR groups), whose large clusters misfit a
+single level and ran 30x slower; plane and quadratic window levels (no gain
+at an equal false rate); and 3-sigma windows (2x faster, 2 points less
+recall, 4 of 70 beads lost).
 
 ## Limits
 
