@@ -3,16 +3,14 @@
 `localize` / `localize_stack` follow u-track's pointSourceDetection: a
 Poisson significance screen, one window fit per seed, and a likelihood-ratio
 decision whose one knob, `fp_per_mpx`, is the expected false positives per
-10^6 noise pixels. `localize_aguet` /
-`localize_aguet_stack` provide the independent-fit spotfitlm sparse baseline.
-Both return `Localizations`; stack functions process frames in native workers.
+10^6 noise pixels. `fit_mixtures=True` fits overlapping spots jointly.
+Each returns `Localizations`; stack functions process frames in native workers.
 
     locs = localize(frame, sigma=1.45, offset=100)
-    sparse = localize_aguet(frame, sigma=1.45, offset=100)
+    dense = localize(frame, sigma=1.45, offset=100, fit_mixtures=True)
 
 Positions are (y, x) pixels, amplitudes are flux above the offset, and `se`
-columns are (flux, y, x). Noise models and diagnostics differ by detector;
-see docs/DETECTION.md and docs/AGUET_BASELINE.md.
+columns are (flux, y, x). See docs/DETECTION.md.
 
 `loctable` converts results to tables; `link` joins their rows into tracks
 frame to frame, by least squared displacement within a search radius.
@@ -21,11 +19,11 @@ frame to frame, by least squared displacement within a search radius.
 
 from .native import (  # noqa: F401
     FP_PER_MPX,
+    MAX_MIXTURES,
     localize,
     localize_stack,
 )
 from .results import FitFlag, Localizations  # noqa: F401
-from .aguet import localize_aguet, localize_aguet_stack  # noqa: F401
 from .tracking import link  # noqa: F401
 
 __version__ = "0.3.0"
@@ -33,11 +31,10 @@ __version__ = "0.3.0"
 __all__ = [
     "localize",
     "localize_stack",
-    "localize_aguet",
-    "localize_aguet_stack",
     "Localizations",
     "FitFlag",
     "link",
     "FP_PER_MPX",
+    "MAX_MIXTURES",
     "__version__",
 ]

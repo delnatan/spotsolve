@@ -183,7 +183,8 @@ def test_diagnostics_follow_all_returned_rows():
     np.testing.assert_array_equal(result.flags, raw[5])
     assert len(result) == len(raw[0])
     info = result.info
-    assert info["seeds"] == len(result) + info["weak"] + info["unconfined"] + info["duplicates"]
+    assert info["seeds"] == (len(result) + info["weak"] + info["unconfined"]
+                             + info["duplicates"] + info["out_of_focus"])
     assert np.all(info["mixture"] == 0)
 
 

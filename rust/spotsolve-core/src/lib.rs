@@ -11,8 +11,7 @@
 //! The rest are the layers it is built from: [`psf`] (the
 //! pixel-integrated Gaussian and its derivatives), [`linalg`] (Cholesky),
 //! [`filters`] (`scipy.ndimage`'s filters, matched exactly), [`render`]
-//! (model images) and [`statistics`]. [`aguet`] is the spotfitlm baseline,
-//! to be folded into [`detect`]. The linker is [`track`], on the exact
+//! (model images) and [`statistics`]. The linker is [`track`], on the exact
 //! assignment in [`lap`].
 //!
 //! # Portability
@@ -23,7 +22,6 @@
 //! `-C target-cpu=native`: FMA contraction would change f64 results between
 //! machines.
 
-pub mod aguet;
 pub mod detect;
 mod frames;
 pub mod filters;

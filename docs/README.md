@@ -1,33 +1,30 @@
 # Documentation
 
-Start with the [README](../README.md) for installation, detector choice,
-API examples and linking.
+Start with the [README](../README.md) for installation, API examples and
+linking.
 
 | Guide | Contents |
 |---|---|
 | [Building and distribution](BUILDING.md) | Platform wheels, CI checks, source builds and releases |
-| [Localization quality](LOCALIZATION_QUALITY.md) | A small common filter, on-demand diagnostics, and how to choose cuts |
-| [Multi-emitter detection](DETECTION.md) | Image/noise model, the joint model, count rule, widths and uncertainties |
-| [Aguet / spotfitlm baseline](AGUET_BASELINE.md) | Sparse screening/fitting, reference parity, uncertainties and speed |
+| [Detection](DETECTION.md) | The model, the algorithm and its departures from u-track, the threshold, validation and limits |
+| [Localization quality](LOCALIZATION_QUALITY.md) | Flags, uncertainties, `z`, and how to choose cuts |
 | [Tracking](TRACKING.md) | Motion model, assignment, parameters, benchmarks and limits |
 
 ## Implementation
 
-Python wraps native results as `Localizations`. Both stack APIs use
+Python wraps native results as `Localizations`. Stack APIs use
 `rust/spotsolve-core/src/frames.rs` for independent, ordered frame processing
 with reusable worker storage. There is no nested thread pool.
 
 | Component | Python | Rust core |
 |---|---|---|
-| Multi-emitter detection | `src/spotsolve/native.py` | `detect.rs`, `model.rs` |
-| Aguet baseline | `src/spotsolve/aguet.py` | `aguet.rs` |
-| Shared filters/algebra | Native bindings | `filters.rs`, `linalg.rs` |
+| Detection | `src/spotsolve/native.py` | `detect.rs` (seeds, windows, decisions), `prefilter.rs` (screen, threshold), `fit.rs` (window fit) |
+| Shared PSF, filters, algebra | Native bindings | `psf.rs`, `filters.rs`, `linalg.rs`, `statistics.rs` |
 | Tables and results | `src/spotsolve/loctable.py`, `results.py` | — |
 | Tracking | `src/spotsolve/tracking.py` | `track.rs`, `lap.rs` |
 
 Core files live under `rust/spotsolve-core/src`; bindings are in
-`rust/spotsolve-py/src`. Frame scheduling is shared; sparse and joint
-fitting remain separate because their models differ.
+`rust/spotsolve-py/src`.
 
 ## Verification
 
@@ -38,27 +35,18 @@ python -m pytest -q
 cargo test --release --workspace --manifest-path rust/Cargo.toml
 ```
 
-Tests cover each frame's assignment against enumeration,
-peak output, fit flags, Fisher diagnostics and invalidation of stale
-uncertainties. `layer7_localize.rs` holds the detector to recall, precision
-and position error on simulated fields and to its false-positive rate on
-pure noise.
-
-Fixtures under `tests/fixtures` are frozen. Most came from the retired Python
-reference. `09_aguet.json` pins the
-original `spotfitlm` revision and source hashes. Its generator,
-`scripts/make_aguet_fixture.py`, remains available for audit, not routine
-regeneration to accommodate a failing test. Aguet checks cover candidate
-selection, 18 reference fits and full covariance, numerical derivatives,
-mask context, thread determinism, output conversion and failures.
+`layer3_fit.rs` holds the window fit to finite differences and its errors to
+the reported covariance; `layer7_localize.rs` holds the detector to recall,
+precision and error calibration on simulated fields and to its
+false-positive rate on noise. Tracking tests check each frame's assignment
+against enumeration. Fixtures under `tests/fixtures` are frozen.
 
 Benchmark runners:
 
-- `scripts/benchmark_detector_speed.py`: real-stack timing and output fingerprints.
-- `scripts/benchmark_aguet.py`: original `spotfitlm` comparison; requires its
-  sibling checkout and a C compiler, neither needed at runtime.
+- `scripts/benchmark_detection.py`: recall, precision, pairs and noise on
+  seeded scenarios; reports from different versions compare directly.
+- `scripts/benchmark_detector_speed.py`: real-stack timing and output
+  fingerprints.
 
-`scripts/localize_movie.py` exports multi-emitter results and accepts
-`--fp-per-mpx` and `--threads`. Aguet is currently exposed
-through its Python API, not that script.
-
+`scripts/localize_movie.py` exports results and accepts `--fp-per-mpx`,
+`--mixtures` and `--threads`.

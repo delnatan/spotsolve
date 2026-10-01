@@ -7,7 +7,11 @@ Detector-agnostic, so reports from different releases compare directly:
 - fields: random fields by density; recall, precision, rms error;
 - noise: false detections per 10^6 pixels of Poisson and gain-scaled noise.
 
-    python scripts/benchmark_detection.py joint --out report.json
+    python scripts/benchmark_detection.py mixtures --out report.json
+
+`single` and `mixtures` run `localize` without and with `fit_mixtures`.
+`joint` and `aguet` run the 0.3.0 API (its joint model and its spotfitlm
+port): install a 0.3.0 wheel to reproduce those reports.
 """
 
 import argparse

@@ -21,18 +21,27 @@ import tifffile
 from spotsolve import FP_PER_MPX, localize_stack
 
 
+def _update(digest, value):
+    """Hash arrays by dtype, shape and bytes, dicts by sorted key, and
+    anything else by its JSON form."""
+    if isinstance(value, np.ndarray):
+        digest.update(repr((value.dtype.descr, value.shape)).encode())
+        digest.update(value.tobytes())
+    elif isinstance(value, dict):
+        for key in sorted(value):
+            digest.update(str(key).encode())
+            _update(digest, value[key])
+    else:
+        digest.update(json.dumps(value, sort_keys=True).encode())
+
+
 def fingerprint(results):
     hashes = []
     for result in results:
         digest = hashlib.sha256()
         for field in fields(result):
-            value = getattr(result, field.name)
             digest.update(field.name.encode())
-            if isinstance(value, np.ndarray):
-                digest.update(repr((value.dtype.descr, value.shape)).encode())
-                digest.update(value.tobytes())
-            else:
-                digest.update(json.dumps(value, sort_keys=True).encode())
+            _update(digest, getattr(result, field.name))
         hashes.append(digest.hexdigest())
     return hashes
 
@@ -43,6 +52,7 @@ def main():
     parser.add_argument("--sigma", type=float, required=True)
     parser.add_argument("--offset", type=float, default=0.0)
     parser.add_argument("--fp-per-mpx", type=float, default=FP_PER_MPX)
+    parser.add_argument("--mixtures", action="store_true", help="fit overlapping spots jointly (u-track FitMixtures)")
     parser.add_argument("--frames", type=int, default=5)
     parser.add_argument("--threads", type=int, default=1)
     parser.add_argument("--repeats", type=int, default=5)
@@ -58,7 +68,7 @@ def main():
         parser.error("expected a grayscale stack with at least --frames frames")
     stack = np.ascontiguousarray(stack[:args.frames])
     settings = dict(sigma=args.sigma, offset=args.offset,
-                    fp_per_mpx=args.fp_per_mpx,
+                    fp_per_mpx=args.fp_per_mpx, fit_mixtures=args.mixtures,
                     images=True)
     localize_stack(stack[:1], n_threads=args.threads, **settings)
     elapsed = []

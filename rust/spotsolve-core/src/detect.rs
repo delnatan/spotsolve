@@ -27,11 +27,14 @@
 //!    (u-track merges copies within a fixed radius instead), and only those
 //!    are tested for removal. A component held at a position bound is not
 //!    reported.
-//! 5. Every component has its own width in `width * sigma` (by default from
-//!    `sigma` to [`widest`]), so a wider emitter is one component rather
-//!    than two; the tests search width as well as position, and `u` is set
-//!    for that search ([`prefilter::false_rate`]). Equal bounds fix the
-//!    width, as u-track does.
+//! 5. Every component has its own width, so a wider emitter is one
+//!    component rather than two. Emitters are reported in `width * sigma`
+//!    (by default `sigma` to [`widest`]); the tests search width as well as
+//!    position, and `u` is set for that search ([`prefilter::false_rate`]).
+//!    A component may widen past the band to the window's half-side as
+//!    out-of-focus light (defocused emitters, haze), which narrower
+//!    components would otherwise split up; it is counted, not reported.
+//!    Equal bounds fix the width, as u-track does.
 //! 6. With mixtures, a second pass after DAOPHOT's subtract-and-re-find
 //!    (Stetson 1987): the residual of the emitters found is screened again,
 //!    for dim emitters a bright neighbour hid from the first screen's
@@ -62,14 +65,17 @@ pub const CONFINE: f64 = 2.0;
 /// resolved, so about `(8 sigma)^2 / (pi sigma^2) = 20` can be told apart
 /// in one.
 pub const MAX_MIXTURES: usize = 20;
-/// Nats: a fit stops once no parameter can gain more by moving one
-/// standard error, far below the `u^2 / 2` the decisions turn on.
-pub const FIT_TOL: f64 = 1e-6;
+/// Nats: a fit stops once no parameter can lower the objective by more
+/// alone. That leaves each within `sqrt(2 FIT_TOL) = 0.045` of its standard
+/// error of the optimum, and each likelihood ratio far closer than the
+/// `u^2 / 2` the decisions turn on.
+pub const FIT_TOL: f64 = 1e-3;
 pub const FIT_MAX_ITER: usize = 100;
-/// px: the widest a component may be, half the window's half-side `R`. A
-/// component centred in its window then keeps at least `erf(sqrt 2)^2 =
-/// 91%` of its light inside; wider, the window cannot tell it from the
-/// level.
+/// px: the widest an emitter is reported, half the window's half-side `R`.
+/// One centred in its window then keeps at least `erf(sqrt 2)^2 = 91%` of
+/// its light inside. A component may widen to `R` itself: wider than this
+/// it is out-of-focus light, fitted so that narrower components need not
+/// explain it, and returned as background.
 pub fn widest(sigma: f64) -> f64 {
     0.5 * (WINDOW * sigma).ceil()
 }
@@ -158,6 +164,9 @@ pub struct Output {
     pub seed: Vec<f64>,
     /// `2S`: every seed, global `(y, x)`.
     pub seeds: Vec<f64>,
+    /// Components wider than the reported widths, fitted as out-of-focus
+    /// light and returned as background.
+    pub out_of_focus: usize,
     /// With mixtures: seeds of the second, residual pass, and the emitters
     /// it added.
     pub residual_seeds: usize,
@@ -226,9 +235,11 @@ struct Fate {
     removed: usize,
     /// Components left to the fits of the seeds nearest them.
     others: usize,
+    /// Owned components wider than the reported widths: background.
+    out_of_focus: usize,
 }
 
-/// `I(d, c)` of the used pixels for the level alone, at its maximum
+/// `I(d, c)` of the used pixels for a constant level alone, at its maximum
 /// likelihood `c = mean(d)`.
 fn level_divergence(win: &Window) -> f64 {
     let (n, sum) = win.d.iter().zip(&win.used).filter(|p| *p.1).fold((0.0, 0.0), |(n, s), (d, _)| (n + 1.0, s + d));
@@ -370,6 +381,10 @@ fn fit_seed(d: &[f64], h: usize, w: usize, sc: &Screen, seed: usize, at: &[bool]
     // mixture every source of light in the window takes a component, the
     // seed's neighbours as nuisance parameters, so the box is the window.
     let reach = CONFINE * s.sigma;
+    // Reported widths are `[w_lo, w_hi]`; a component may widen to the
+    // window's half-side, and is out-of-focus light beyond `w_hi`.
+    let (w_lo, w_hi) = s.widths();
+    let w_fit = if w_lo >= w_hi { (w_lo, w_lo) } else { (w_lo, r as f64) };
     let b = Bounds {
         level: (prefilter::LEVEL_FLOOR, 2.0 * dmax),
         flux: (0.0, 10.0 * dmax / psf::peak_factor(s.sigma)),
@@ -378,12 +393,11 @@ fn fit_seed(d: &[f64], h: usize, w: usize, sc: &Screen, seed: usize, at: &[bool]
         } else {
             (cy - reach, cy + reach, cx - reach, cx + reach)
         },
-        width: s.widths(),
+        width: (w_fit.0, w_fit.1),
     };
     let tol = FIT_TOL * phi;
     let bar = u * u * phi / 2.0;
     let max_k = if s.fit_mixtures { s.max_mixtures.max(1) } else { 1 };
-    let (w_lo, w_hi) = s.widths();
     let lay = Layout { k: 0, sigma: (w_lo >= w_hi).then_some(w_lo) };
     let held = |theta: &[f64], at: &[bool]| {
         let lay = lay.with((theta.len() - 1) / lay.stride());
@@ -392,6 +406,8 @@ fn fit_seed(d: &[f64], h: usize, w: usize, sc: &Screen, seed: usize, at: &[bool]
 
     // The known emitters in the window, fitted with the level first.
     let mut theta = vec![sc.background[seed].clamp(b.level.0, b.level.1)];
+    // The level alone: the null every first component is tested against.
+    let null = level_divergence(&win);
     for p in known.iter().filter(|p| p.y >= y0 as f64 - 0.5 && p.y < y1 as f64 - 0.5 && p.x >= x0 as f64 - 0.5 && p.x < x1 as f64 - 0.5) {
         theta.extend([p.a, p.y - y0 as f64, p.x - x0 as f64]);
         if lay.sigma.is_none() {
@@ -399,7 +415,7 @@ fn fit_seed(d: &[f64], h: usize, w: usize, sc: &Screen, seed: usize, at: &[bool]
         }
     }
     let n_known = (theta.len() - 1) / lay.stride();
-    let mut div = level_divergence(&win);
+    let mut div = null;
     if n_known > 0 {
         let (lo, hi) = b.of(lay.with(n_known));
         let f = fitter.fit(&win, &theta, lay.with(n_known), &lo, &hi, FIT_MAX_ITER, tol);
@@ -464,7 +480,7 @@ fn fit_seed(d: &[f64], h: usize, w: usize, sc: &Screen, seed: usize, at: &[bool]
     let removal = |fitter: &mut Fitter, theta: &[f64], j: usize, div: f64| {
         let k = k_of(theta);
         if k == 1 {
-            return (level_divergence(&win) - div, None);
+            return (null - div, None);
         }
         let (lo, hi) = b.of(lay.with(k - 1));
         let mut start = theta.to_vec();
@@ -522,6 +538,10 @@ fn fit_seed(d: &[f64], h: usize, w: usize, sc: &Screen, seed: usize, at: &[bool]
         }
         if !mine(&theta, j) {
             fate.others += (j >= n_known) as usize;
+            continue;
+        }
+        if lay.sigma(&theta, j) > w_hi {
+            fate.out_of_focus += 1;
             continue;
         }
         let mut flags = common;
@@ -586,6 +606,7 @@ impl Output {
         self.added += fate.added;
         self.removed += fate.removed;
         self.duplicates += fate.others;
+        self.out_of_focus += fate.out_of_focus;
     }
 }
 

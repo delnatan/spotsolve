@@ -43,7 +43,8 @@ def main(args):
 
     t = time.time()
     res = spotsolve.localize(img, sigma=args.sigma, offset=CAMERA_OFFSET,
-                             fp_per_mpx=args.fp_per_mpx)
+                             fp_per_mpx=args.fp_per_mpx,
+                             fit_mixtures=args.mixtures)
     dt = time.time() - t
 
     # The audit in the likelihood's own terms: dividing ADU by the measured
@@ -107,5 +108,6 @@ if __name__ == "__main__":
                     help="which frame, if the file is a stack")
     ap.add_argument("--sigma", type=float, default=1.2)
     ap.add_argument("--fp-per-mpx", type=float, default=spotsolve.FP_PER_MPX)
+    ap.add_argument("--mixtures", action="store_true", help="fit overlapping spots jointly (u-track FitMixtures)")
     ap.add_argument("--out", default="result.png")
     main(ap.parse_args())

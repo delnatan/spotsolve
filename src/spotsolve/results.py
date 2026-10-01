@@ -24,7 +24,6 @@ class FitFlag(IntFlag):
     STALLED = 4
     COVARIANCE_UNAVAILABLE = 8
     AT_BOUND = 16
-    CONTEXT_UNSETTLED = 32
 
 
 @dataclass(frozen=True)
@@ -41,36 +40,37 @@ class Localizations:
     positions: np.ndarray
     """(N, 2) float `(y, x)`."""
     amplitudes: np.ndarray
-    """(N,) total flux, ADU above the offset. Aguet converts sampled-Gaussian
-    peak amplitude to continuous flux, 2*pi*peak*fit_sigma**2.
+    """(N,) total flux of the pixel-integrated Gaussian, ADU above the
+    offset and the fitted local level.
     """
     se: np.ndarray
-    """(N, 3) standard errors of `(flux, y, x)`. Multi-emitter fits use Fisher
-    information scaled by local dispersion; Aguet uses the observed Hessian
-    and includes amplitude-width covariance in flux uncertainty.
+    """(N, 3) standard errors of `(flux, y, x)`, from the expected Fisher
+    information of the emitter's final window fit (every component and the
+    level free), scaled by the frame's dispersion. NaN without a covariance.
     """
     fit_sigma: np.ndarray
-    """(N,) each emitter's own fitted width, px."""
+    """(N,) each emitter's own fitted width, px; `sigma` when widths are
+    fixed."""
     sigma_se: np.ndarray
-    """(N,) standard error of `fit_sigma`, px."""
+    """(N,) standard error of `fit_sigma`, px; NaN when widths are fixed."""
     flags: np.ndarray
     """(N,) uint8 bitmask of `FitFlag` diagnostics; all rows are retained."""
     background: np.ndarray
-    """(H, W) background, ADU per pixel above the offset. Aguet returns the
-    diagnostic screening estimate, with NaNs outside the processed crop.
+    """(H, W) screening level, ADU per pixel above the offset: the constant of
+    the window regression at each pixel, NaN outside the processed crop. Each
+    emitter's own fitted level is `info["fitted_background"]`.
     """
     sigma: float
     """Reference width used for candidate searching and fit initialization, px."""
     dispersion: float
     """The frame's measured pixel variance per unit of signal, ADU: about the
-    camera gain plus `gain^2 * read_noise^2 / background`. Unavailable (NaN)
-    for the Aguet baseline.
+    camera gain plus `gain^2 * read_noise^2 / background`.
     """
     info: dict = field(default_factory=dict)
     """Method-specific work counts, settings and fit diagnostics."""
     model_image: np.ndarray = None
-    """(H, W) diagnostic model when requested. Multi-emitter rendering includes
-    all selected fits; Aguet renders accepted fits on its screening background.
+    """(H, W) diagnostic model when requested: the reported emitters on the
+    screening level.
     """
     residual: np.ndarray = None
     """(H, W) data minus offset minus `model_image`, ADU, when requested."""
@@ -84,17 +84,14 @@ class Localizations:
     def peak(self):
         """(N,) model peak signal above background, in ADU per pixel.
 
-        Uses `flux * peak_factor(fit_sigma)` for the integrated PSF and
-        `flux / (2*pi*fit_sigma**2)` for Aguet's sampled Gaussian. The integrated
-        value assumes an emitter centered on a pixel; subpixel placement lowers
+        `flux * peak_factor(fit_sigma)` for the integrated PSF. It assumes an
+        emitter centered on a pixel; subpixel placement lowers
         the brightest observed pixel. Peak depends on fitted width as well as
         flux, so it is useful for image inspection but not a substitute for flux
         or its uncertainty.
         """
         amp = np.asarray(self.amplitudes, float)
         sig = np.asarray(self.fit_sigma, float)
-        if self.info.get("method") == "aguet":
-            return amp / (2.0 * np.pi * sig ** 2)
         return amp * psf.peak_factor(sig)
 
     def __len__(self):

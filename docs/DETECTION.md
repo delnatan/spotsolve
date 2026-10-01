@@ -1,200 +1,180 @@
-# Multi-emitter detection
+# Detection
 
-`localize` and `localize_stack` describe each frame as one Poisson model and
-decide every emitter by a likelihood ratio. The separate
-[Aguet baseline](AGUET_BASELINE.md) fits candidates independently.
+`localize` and `localize_stack` follow u-track's `pointSourceDetection`
+(Aguet et al. 2013, *Dev. Cell* 26:279): screen the frame for significant
+signal, seed at local maxima, fit each seed on its own window, and with
+`fit_mixtures` fit several emitters per window. The structure is u-track's;
+the statistics and several mechanics are not. Each departure below was made
+for a measured failure, and the measurements are in the
+[validation](#validation) section.
 
 ## Model
 
-Work in camera units: `d = frame - offset`. Each component has flux `A`,
-position `(y, x)` and width `s`; its Gaussian is integrated over each pixel.
-The background `B` is bilinear on a lattice of nodes `ceil(8 * slack[1] *
-sigma)` px apart:
+Work in camera units: `d = frame - offset`. A window around a seed holds a
+constant level `c` and components of flux `A`, centre `(y, x)` and width `s`,
+each a Gaussian integrated over every pixel:
 
 ```text
-m[i,j] = B[i,j] + sum_k A_k * E(i; y_k, s_k) * E(j; x_k, s_k)
-E(i; c, s) = 0.5 * [erf((i-c+0.5)/(s*sqrt(2))) - erf((i-c-0.5)/(s*sqrt(2)))]
+m[i,j] = c + sum_k A_k * E(i; y_k, s_k) * E(j; x_k, s_k)
+E(i; y, s) = 0.5 * [erf((i-y+0.5)/(s*sqrt(2))) - erf((i-y-0.5)/(s*sqrt(2)))]
 I(d,m) = sum_pixels [d*log(d/m) - (d-m)]
 ```
 
 Camera pixels are not Poisson in ADU. One scalar dispersion `phi` (variance
 per unit mean, from the median squared fourth difference of the frame)
 converts: `I/phi` is the log-likelihood in nats. No gain or read-noise
-calibration is needed; fluxes scale with gain, geometry does not.
-
-Components come in two kinds, told apart by width alone:
-
-- **Emitters**, `slack[0] * sigma` to `slack[1] * sigma` (default 1.0-2.25):
-  in focus, reported.
-- **Out-of-focus light**, from `slack[1] * sigma` to half the node spacing:
-  fitted and tested like emitters but returned as background. Half the
-  spacing is where the nodes carry most of a blob wherever it sits (at
-  least 85% of its light for the default spacing); beyond it the nodes
-  suffice. Without this band, defocused emitters and haze a few pixels
-  across fit neither the nodes nor the emitters' widths, and the model
-  covers them with emitters at the width bound.
+calibration is needed; fluxes scale with gain, positions and decisions do not.
 
 ## Algorithm
 
-1. **Seeds.** Compute the score `z` for one component at every pixel: the
-   signed root of its likelihood ratio with the nodes profiled out,
-   `<g - P g, d> / sqrt(var |g - P g|^2)` with `P` the projection on the
-   nodes' tents. No background estimate enters its mean; its variance takes
-   the level of the nodes fitted to a 25-px median. The bank of widths runs
-   from `slack[0] * sigma` to half the node spacing, adjacent widths at
-   most 1.5x apart. Local maxima over
-   position and width become emitters at their template's width when `z`
-   exceeds `u` times what the grid can lose of a maximum: half a pixel off
-   in y and x costs `1 / (8 s^2)` of it, and midway between two widths 2%.
-   No emitter a test at `u` would keep goes unproposed. `u` is solved from
-   `fp_per_mpx` (below).
-2. **Fit.** Emitters and background are fitted together by block coordinate
-   descent. Emitters are fitted in groups by bounded Levenberg-Marquardt,
-   with every other emitter and the background held fixed; groups join the
-   most strongly coupled pairs (the canonical correlation of their
-   parameters under the Fisher information), at most 12 emitters each. The
-   background nodes are fitted by Poisson IRLS with emitters held fixed.
-3. **Count.** Once the model has converged, each group is tested:
-   - an emitter is removed if removing it costs less than `u^2/2` nats;
-   - every local maximum of the residual score over the in-focus seed
-     widths, within `4 sigma` of a member, that exceeds `u * kappa` (less
-     the grid's loss, as for seeds) becomes a candidate at once, and one
-     refit takes them all in. A candidate stays only if dropping it, the
-     rest refitted, costs `(u * kappa)^2 / 2` nats, and the candidates
-     together gain that much apiece; one the refit carries more than
-     `4 sigma` from where it was placed has become another source and is
-     dropped.
+1. **Screen.** At every pixel, regress the `ceil(4 sigma)` window on one
+   pixel-integrated PSF and a constant. The window stops at the frame's
+   edge (u-track mirror-pads). The mask holds pixels whose Poisson score
+   test of the flux, `z = A |g - gbar| / sqrt(phi * c0)`, reaches a bar.
+   u-track instead tests `A > k * sigma_res` with the window's residual as
+   noise; a neighbour inflates that residual and hides spots in crowded
+   areas, which its RefineMaskLoG step then patches. Neither is needed here.
+2. **Seeds.** Local maxima of the negative Laplacian of Gaussian inside the
+   mask. The score is computed at a small bank of widths spanning the
+   reported width range, neighbours at most 1.5x apart, each with the bar
+   `u` less what the pixel grid and the gap to the next width can lose of a
+   maximum. Seeds are then the sampled maxima of the field the test searches.
+3. **Window fits.** Pixels of other mask components are left out of a
+   window, as u-track does. Components are fitted by bounded
+   Levenberg-Marquardt (Coleman-Li scaling, Marquardt damping), each with its
+   own width. A component is kept only if adding it gains `u^2/2` nats:
+   `2 (I_k - I_k+1) / phi >= u^2`.
+   - **Single fits** (default): one component starting at the seed, its
+     centre held within `2 sigma` of it (u-track's confinement).
+   - **Mixtures** (`fit_mixtures=True`): components are added one at a time
+     where the efficient score of a new flux peaks (Neyman's C(alpha): the
+     score with the components already fitted projected out), each refit
+     from the joint Newton step, while each gains `u^2/2`. Then the weakest
+     is removed while removing it, the rest refitted, costs less. The seed
+     only centres the window: every source of light in it takes a
+     component, so a neighbour is a nuisance parameter rather than a bias.
+     u-track confines components to `2 sigma`, and a neighbour 2-4 sigma
+     away then drags the fit.
+4. **Ownership.** Each component is reported by the fit of the seed
+   nearest to it, so neighbouring windows report no emitter twice (u-track
+   merges copies within 0.25 px), and only those components are tested for
+   removal. A component held on a position bound is not reported.
+5. **Widths.** Emitters are reported within `width * sigma` (by default
+   `sigma` to half the window's half-side, about `2 sigma`, where a
+   centred emitter keeps 91% of its light in the window). A component may
+   widen past that, to the window's half-side, as out-of-focus light:
+   defocused emitters and haze that narrower components would otherwise
+   split up. It is counted in `info["out_of_focus"]`, not reported.
+   `width=(1, 1)` fixes every width at `sigma`, as u-track does.
+6. **Residual pass** (mixtures only), after DAOPHOT's subtract-and-re-find
+   (Stetson 1987, *PASP* 99:191): the residual of the emitters found is
+   screened again, for dim emitters a bright neighbour hid from the first
+   screen's level. Each new seed's window starts with the emitters found in
+   it as components, refitted but neither tested nor reported there. A new
+   component within `sigma` of a known emitter reshapes it rather than
+   finding a hidden one, and is not reported.
+7. **Uncertainties.** Standard errors from the inverse expected Fisher
+   information `J^T diag(1/m) J` of each emitter's final window fit, every
+   component and the level free, scaled by `phi`.
 
-   Penalising each emitter by the bar, every change a test keeps raises the
-   objective, so adds and removals cannot cycle. That holds only while the
-   decisions' likelihood ratios are accurate, which is what the exact node
-   profile below is for. A group is refitted to convergence after a
-   removal, before its candidates are scored, so an addition is never
-   credited with the rest of the group converging.
-
-   Out-of-focus components are tested like emitters, at the same `u^2/2`,
-   so light goes to whichever explains it; they are proposed by the seeds,
-   whose frame-wide score holds at every width.
-
-   The score is efficient (Neyman's C(alpha)): the score of the new flux
-   less its projection on the group's and the nodes' scores through their
-   joint Newton step, over its information less its projection on theirs.
-   With free widths a fitted emitter absorbs an unfound neighbour by
-   widening, which leaves little of the neighbour in the residual; the
-   projection is what finds it there. The Newton step makes the score exact
-   for a fit that has not fully converged, and the nodes' information is
-   moved to the group's current model on its patch: a template mostly
-   inside the nodes' span keeps a small efficient information that either
-   shortcut would misstate.
-
-   Every likelihood ratio, and the Wald screen that spares clear emitters a
-   removal trial, profiles out the background nodes. A node's tent and a
-   wide emitter trade light: with the nodes held at a fit that includes the
-   emitter, the test would credit it with the evidence the nodes gave up.
-   A decision changes the model on one group's patch only. Outside it the
-   model moves only with the nodes, and that part of the objective is taken
-   to second order at the round's model, the nodes that never touch the
-   patch eliminated through the frame-wide inverse information. On the
-   patch the Poisson objective is kept exact and the nodes under it are
-   solved by Newton's method. A second-order profile on the patch as well
-   is not enough: removing a wide component changes the model there by
-   thousands of counts, and it overstated what the nodes recover by tens of
-   nats, several times the bar, which let adds and removals cycle.
-
-   `kappa >= 1` is the spread of the residual score far from every emitter,
-   an empirical null. It is 1 where the model describes the data, and grows
-   where it does not (PSF wings, haze), raising the bar for additions there.
-   The model is re-converged and tested again until nothing changes.
-
-`sigma` is the in-focus width, the narrowest a spot can be; `slack[1]`
-marks the edge of the depth of focus. Components fitted wider are returned
-as background (`info["out_of_focus"]` counts them); a fit at the lower
-bound is flagged.
+`info["z"]` is each emitter's signed root `sqrt(2 * cost / phi)`, the cost
+being what removing it (the rest refitted) loses: at least `u`.
+`info["mixture"]` numbers the windows that held several components;
+`info["seed"]` is the seed each emitter was reported from.
 
 ## The threshold
 
-An emitter survives on pure noise when its likelihood ratio, maximized over
-position and width with the nodes profiled out, reaches `u^2/2`: a local
-maximum above `u` of that ratio's signed root, a Gaussian field over
-position and `tau = log s`. The field is `<h, r> / |h|`, with `h = g - P g`
-the pixel-integrated profile less its projection on the nodes' tents. Its
-metric, the covariance of the unit field's derivatives, comes from 1-D sums
-because `g` and the tents separate; averaged over a node cell it is
-`f(tau)^2 (dy^2 + dx^2) + L_tt(tau) dtau^2`. The Gaussian kinematic formula
-for that slab gives the expected Euler characteristic per pixel
-(`statistics::lkc`, `statistics::expected_ec`):
+`u` is set so that pure noise yields `fp_per_mpx` false emitters per 10^6
+pixels. A false emitter is a local maximum above `u` of the signed root of
+the likelihood ratio, maximized over position and width: a smooth unit
+Gaussian field over `(y, x, tau = log s)`. Scores of two profiles correlate
+as the profiles do, `exp(-r^2 / (4 v))` at offset `r` with `v = s^2 + 1/12`
+(pixel integration adds the `1/12`) and `2 sqrt(v1 v2) / (v1 + v2)` across
+widths, so the field's metric is
+
+```text
+ds^2 = (dy^2 + dx^2) / (2 v) + dtau^2
+```
+
+a slab of hyperbolic space (Siegmund & Worsley 1995, *Ann. Stat.* 23:608).
+With `a = 1/v(lo)`, `b = 1/v(hi)` over the reported widths, the expected
+number of maxima above `u` per pixel is the Euler-characteristic density
+(Adler & Taylor 2007):
 
 ```text
 EC(u) = L3 rho3(u) + L2 rho2(u) + L1 rho1(u)
-L3 = int sqrt(det Lambda) dtau
-L2 = (f(tau1)^2 + f(tau2)^2) / 2
-L1 = 1/(2 pi) int (df/dtau)^2 / sqrt(L_tt) dtau
+L3 = (a - b) / 4,   L2 = (a + b) / 4,   L1 = (a - b) / (8 pi)
 ```
 
-with `rho_j` the Gaussian EC densities. `u` solves `10^6 EC(u) =
-fp_per_mpx`. With a known background, `f^2 = 1/(2 s^2)` and `L_tt = 1`:
-the slab of hyperbolic space of the continuous Gaussian scale space. The
-narrowest widths dominate the count, which is why the search starts at the
-in-focus width.
+and `u` solves `10^6 EC(u) = fp_per_mpx`. With fixed widths it reduces to the
+2-D density `u exp(-u^2/2) / (2 pi)^(3/2) / (2 v)`. Counting false maxima per
+area rather than false pixels is the peak-based view of Cheng & Schwartzman
+(2017, *Ann. Stat.* 45:529).
 
-A node's tent resembles a wide emitter, so the node spacing sets how much
-of an emitter's flux information the background leaves it. At `8 * slack[1]
-* sigma` the widest emitter keeps at least two thirds of it wherever it sits
-(0.82 averaged over a node cell); narrower emitters keep more.
+Every decision (the first component, each addition, each removal) uses the
+same `u^2/2`, so each false component costs the same budget. A per-test
+`alpha` is not the knob: at u-track's 0.05, noise gives about 7000 seeds per
+10^6 pixels. (u-track's own test is an amplitude-over-noise criterion, about
+`z = 5` for an isolated spot, not a false-positive rate.) The seed bar is not
+lowered further: below the sampled field's maxima, the refitted likelihood
+ratio admits more false emitters than the field has, and gains no power that
+a higher `fp_per_mpx` does not.
 
-This counts the maxima of a continuous Gaussian field, so `fp_per_mpx` is a
-bound for Gaussian noise: the detector finds fewer maxima than the field
-has, while Poisson skew at low counts adds some.
+## ROI
 
-## Uncertainties
-
-Standard errors come from the undamped expected Fisher information
-`F = J.T @ diag(1/m) @ J` of each final group, with the background nodes
-profiled out, scaled by `phi`. If `F` cannot be factored, the errors are NaN.
-
-`result.info['fisher_fraction']` has shape `(N, 4)` in `(flux, y, x, sigma)`
-order:
-
-```text
-fraction[q] = 1 / (F[q,q] * inverse(F)[q,q]) = conditional / marginal variance
-```
-
-1 means no coupling to other fitted parameters; values near zero mean strong
-confounding. It is invariant to parameter units and order. Neighbours
-outside the group are treated as known, so this is not a full uncertainty
-budget.
-
-## ROI and reference width
-
-A boolean ROI limits where emitters are seeded and added; fitted positions
-may lie outside it. The frame is cropped to the ROI's bounding box plus the
-context the filters and fits need. Use one mask for the requested area, not
+A boolean ROI limits where seeds are placed; fitted positions may lie
+outside it. The frame is cropped to the ROI's bounding box plus the context
+the screens and windows need. Use one mask for the requested area, not
 separate tile calls, which would duplicate sources at seams.
-
-Choose `sigma` from a histogram of fitted widths in a few representative
-frames; see the [width inspection example](../README.md#choose-a-detection-width).
 
 ## Validation
 
-`rust/spotsolve-core/tests/layer7_localize.rs` holds the detector to recall,
-precision and position error on simulated fields (flux 150-3000 ADU on a
-background of 20, width `sigma` +-20%), and its false-positive rate on pure
-Poisson noise to within a factor of 2 of `fp_per_mpx`. Position error is
-held in units of each detection's reported SE (median about `sqrt(ln 2)`),
-so recovering a hard emitter does not count against the detector.
+`rust/spotsolve-core/tests/layer3_fit.rs` holds the window fit's
+derivatives to finite differences and its errors to the reported covariance
+(z-variance 0.98-1.05 per parameter over 2000 Poisson windows).
+`layer7_localize.rs` holds the detector to recall, precision and error
+calibration on isolated and crowded fields and to its false-positive rate on
+noise. `scripts/benchmark_detection.py` scores any version on seeded
+scenarios (sigma 1.45, background 20, 128x128).
 
-`rust/spotsolve-core/examples/characterize.rs` measures the detector against
-what the data allow: recall by oracle SNR and width, position error over the
-Cramer-Rao bound, close pairs, recall by neighbour distance, and false
-emitters on Poisson and Gaussian noise:
+On 6.5 Mpx of Poisson noise per condition, at the default `fp_per_mpx = 16`:
 
-```sh
-cargo run --release --manifest-path rust/Cargo.toml -p spotsolve-core --example characterize
-```
+| Photons/px | Gain | Single fits | Mixtures |
+|---:|---:|---:|---:|
+| 2 | 1 | 13.3 | 13.4 |
+| 6.7 | 3 | 15.0 | 14.8 |
+| 20 | 1 | 16.5 | 16.2 |
+| 200 | 1 | 16.2 | 15.9 |
+
+Against the 0.3.0 joint frame model (`benchmark_detection.py`; times are
+serial, Apple M5):
+
+| Scenario | Single fits | Mixtures | 0.3.0 joint |
+|---|---|---|---|
+| Isolated, flux 100: recall | 0.36 | 0.36 | 0.41 |
+| Isolated, flux 800: rms error, ms/frame | 0.125 px, 2.6 | 0.125 px, 8.0 | 0.125 px, 139 |
+| Equal pairs at 1.5 / 2 / 3 sigma: both found | 0 / 0 / 0 | 0.92 / 1.00 / 1.00 | 0.90 / 1.00 / 1.00 |
+| Fields 0.005 / px^2: recall, precision | 0.71, 0.93 | 0.97, 0.99 | 0.97, 1.00 |
+| Fields 0.02 / px^2 | 0.33, 0.82 | 0.85, 0.98 | 0.87, 0.99 |
+| Fields 0.04 / px^2 | 0.16, 0.76 | 0.68, 0.94 | 0.72, 0.97 |
+| Fields 0.02 / 0.04: ms/frame | 7 / 10 | 187 / 744 | 568 / 1673 |
+
+The field scenarios have exact widths, where searching widths costs a few
+points of recall; `width=(1, 1)` recovers them. With widths spread +-20%,
+fixed-width mixtures split wider emitters (precision 0.88), free widths do
+not (0.97-1.00). On 256x256 fields at 0.03 / px^2 with widths spread +-20%
+(sigma 1.2), mixtures find 0.84 of emitters at precision 0.97 in 1.3 s; the
+joint model found 0.83 at 0.985 in 5.2 s. Adding defocused blobs 3-6 sigma
+wide raises mixtures' false emitters from 3.0 to 7.1 per 128x128 frame (the
+joint model: 1.8 to 3.0).
 
 ## Limits
 
-The PSF model is a Gaussian. Real PSFs have wings and defocused structure the
-model cannot absorb; the residual then carries structure, `kappa` rises, and
-dim sources near bright ones are harder to add. Sources closer than about one
-`sigma` can be reported as one brighter source.
+The PSF model is a Gaussian, and each window's level is a constant. Real PSF
+wings, haze and defocused light wider than the window are misfit, and the
+tests read misfit as signal: mixtures find more emitters than the joint
+model did on hazy frames, some of them false. Single fits are biased by any
+neighbour within a window and lose emitters closer than about `4 sigma`; use
+mixtures wherever spots crowd. Emitters closer than about `sigma` are
+reported as one. Mixtures cost one window per seed, each refitting its
+neighbours: on dense frames that is most of the time.

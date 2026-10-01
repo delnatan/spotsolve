@@ -10,7 +10,6 @@
 
 use pyo3::prelude::*;
 
-mod aguet;
 mod detect;
 mod track;
 
@@ -21,7 +20,6 @@ fn version() -> &'static str {
 
 #[pymodule]
 fn spotsolve_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
-    aguet::register(m)?;
     detect::register(m)?;
     track::register(m)?;
     m.add_function(wrap_pyfunction!(version, m)?)?;

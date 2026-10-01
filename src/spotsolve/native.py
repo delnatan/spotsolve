@@ -89,9 +89,12 @@ def localize(frame, sigma, *, offset=0.0, roi=None, fp_per_mpx=FP_PER_MPX,
     enough become seeds. Each seed is fitted alone on a window of
     `ceil(4 sigma)` px around it: a constant level plus one emitter, held
     within `2 sigma` of the seed, with the pixels of other significant spots
-    left out. Each emitter's width is fitted within `width` (multiples of
-    `sigma`; the upper bound is capped at half the window's half-side, about
-    `2 sigma`). Equal bounds fix the width. An emitter is kept if its
+    left out. Each emitter's width is fitted; emitters are reported within
+    `width` (multiples of `sigma`; the upper bound is capped at half the
+    window's half-side, about `2 sigma`). A component may widen beyond that
+    to the window's half-side: out-of-focus light, fitted so narrower
+    components need not split it, counted in `info["out_of_focus"]` and not
+    reported. Equal bounds fix the width. An emitter is kept if its
     likelihood ratio against the level alone, in nats scaled by the frame's
     measured dispersion, reaches `u^2 / 2`. `fp_per_mpx` sets `u`: the
     expected number of false emitters per 10^6 pixels of noise, for a search

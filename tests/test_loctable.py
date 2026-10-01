@@ -35,18 +35,6 @@ def test_peak_is_the_models_own_centre_pixel():
         assert abs(m[20, 20] - _result([flux], [sigma]).peak[0]) < 1e-9
 
 
-def test_aguet_peak_is_its_own_fitted_amplitude():
-    """Aguet's sampled Gaussian reads the continuous peak, so `peak` inverts
-    its own `2*pi*sigma**2` conversion exactly and recovers the fit parameter."""
-    fitted_peak, sigma = 91.0, 1.45
-    flux = fitted_peak * 2 * np.pi * sigma ** 2
-    got = _result([flux], [sigma], info={"method": "aguet"}).peak[0]
-    assert abs(got - fitted_peak) < 1e-9
-    # The two conventions must NOT silently agree -- 4% apart at sigma 1.45.
-    integrated = _result([flux], [sigma]).peak[0]
-    assert 1.035 < got / integrated < 1.045
-
-
 def test_peak_carries_width_where_flux_does_not():
     """Equal flux at different widths is equal flux and unequal peak: the
     reason `peak` is a reading aid and `flux` stays the quantity to cut on."""

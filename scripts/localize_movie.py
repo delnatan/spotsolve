@@ -49,6 +49,7 @@ def main(args):
     results = spotsolve.localize_stack(stack, sigma=args.sigma,
                                        offset=CAMERA_OFFSET,
                                        fp_per_mpx=args.fp_per_mpx,
+                                       fit_mixtures=args.mixtures,
                                        n_threads=args.threads)
     dt = (time.time() - t0) / len(stack)
     print(f"  {len(stack)} frames in {dt * len(stack):.2f} s "
@@ -95,6 +96,7 @@ def main(args):
         "camera_offset_adu": CAMERA_OFFSET,
         "pixel_size_um": args.pixel_size, "frame_interval_s": args.interval,
         "fp_per_mpx": args.fp_per_mpx,
+        "fit_mixtures": args.mixtures,
         "threads": args.threads,
         "fit_flags": {flag.name: int(flag) for flag in spotsolve.FitFlag},
         "flux_units": "ADU above offset", "position_units": "px (y, x)",
@@ -118,6 +120,8 @@ if __name__ == "__main__":
                     help="seconds per frame")
     ap.add_argument("--fp-per-mpx", type=float, default=spotsolve.FP_PER_MPX,
                     help="expected false emitters per 10^6 noise pixels")
+    ap.add_argument("--mixtures", action="store_true",
+                    help="fit overlapping spots jointly (u-track FitMixtures)")
     ap.add_argument("--threads", type=int, default=None,
                     help="parallel frame workers (default: machine's cores)")
     ap.add_argument("--out",
