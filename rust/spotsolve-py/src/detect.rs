@@ -17,17 +17,14 @@ type Arr2 = Py<PyArray2<f64>>;
 /// `(positions, amplitudes, sigmas, se, sigma_se, flags, background, info)`.
 type Frame<'py> = (Arr2, Arr1, Arr1, Arr2, Arr1, Py<PyArray1<u8>>, Arr2, Bound<'py, PyDict>);
 
-fn settings(sigma: f64, fp_per_mpx: f64, slack: (f64, f64)) -> PyResult<detect::Settings> {
+fn settings(sigma: f64, fp_per_mpx: f64, free_sigma: bool) -> PyResult<detect::Settings> {
     if !(sigma.is_finite() && sigma > 0.0) {
         return Err(PyValueError::new_err("`sigma` must be positive"));
-    }
-    if !(slack.0 > 0.0 && slack.0 < slack.1 && slack.1.is_finite()) {
-        return Err(PyValueError::new_err("`slack` must be 0 < lo < hi"));
     }
     if !(fp_per_mpx.is_finite() && fp_per_mpx > 0.0) {
         return Err(PyValueError::new_err("`fp_per_mpx` must be positive and finite"));
     }
-    Ok(detect::Settings { sigma, fp_per_mpx, slack })
+    Ok(detect::Settings { sigma, fp_per_mpx, free_sigma })
 }
 
 fn check_offset(offset: f64) -> PyResult<()> {
@@ -59,17 +56,13 @@ fn give<'py>(py: Python<'py>, o: detect::Output, h: usize, w: usize) -> PyResult
     let n = o.amp.len();
     let info = PyDict::new(py);
     info.set_item("fitted_background", o.fitted_background.into_pyarray(py))?;
+    info.set_item("z", o.z.into_pyarray(py))?;
     info.set_item("dispersion", o.dispersion)?;
     info.set_item("u", o.u)?;
     info.set_item("seeds", o.n_seeds)?;
-    info.set_item("fits", o.fits)?;
-    info.set_item("lr_fail", o.lr_fail)?;
-    info.set_item("adds", o.adds)?;
-    info.set_item("removed", o.removed)?;
-    info.set_item("outer", o.outer)?;
-    info.set_item("kappa", o.kappa)?;
-    info.set_item("out_of_focus", o.out_of_focus)?;
-    info.set_item("fisher_fraction", o.fisher_fraction.into_pyarray(py).reshape([n, 4])?)?;
+    info.set_item("weak", o.weak)?;
+    info.set_item("unconfined", o.unconfined)?;
+    info.set_item("duplicates", o.duplicates)?;
     Ok((
         o.pos.into_pyarray(py).reshape([n, 2])?.unbind(),
         o.amp.into_pyarray(py).unbind(),
@@ -85,7 +78,7 @@ fn give<'py>(py: Python<'py>, o: detect::Output, h: usize, w: usize) -> PyResult
 /// Localize one raw frame. Everything is in ADU above `offset`; the
 /// background and dispersion are measured from the frame.
 #[pyfunction]
-#[pyo3(signature = (raw, sigma, offset=0.0, *, roi=None, fp_per_mpx=detect::FP_PER_MPX, slack=detect::SLACK))]
+#[pyo3(signature = (raw, sigma, offset=0.0, *, roi=None, fp_per_mpx=detect::FP_PER_MPX, free_sigma=false))]
 #[allow(clippy::too_many_arguments)]
 fn detect_localize<'py>(
     py: Python<'py>,
@@ -94,7 +87,7 @@ fn detect_localize<'py>(
     offset: f64,
     roi: Option<PyReadonlyArray2<'_, bool>>,
     fp_per_mpx: f64,
-    slack: (f64, f64),
+    free_sigma: bool,
 ) -> PyResult<Frame<'py>> {
     let (h, w) = (raw.shape()[0], raw.shape()[1]);
     let r = raw
@@ -106,7 +99,7 @@ fn detect_localize<'py>(
     }
     check_offset(offset)?;
     let roi = roi_slice(&roi, h, w)?.map(|m| m.to_vec());
-    let s = settings(sigma, fp_per_mpx, slack)?;
+    let s = settings(sigma, fp_per_mpx, free_sigma)?;
     let o = py.detach(|| detect::localize_raw(&r, h, w, offset, roi.as_deref(), &s));
     give(py, o, h, w)
 }
@@ -115,7 +108,7 @@ fn detect_localize<'py>(
 /// each frame exactly as `detect_localize` would. Returns one tuple per frame,
 /// in frame order.
 #[pyfunction]
-#[pyo3(signature = (raw, sigma, offset=0.0, *, roi=None, fp_per_mpx=detect::FP_PER_MPX, slack=detect::SLACK, n_threads=1))]
+#[pyo3(signature = (raw, sigma, offset=0.0, *, roi=None, fp_per_mpx=detect::FP_PER_MPX, free_sigma=false, n_threads=1))]
 #[allow(clippy::too_many_arguments)]
 fn detect_localize_stack<'py>(
     py: Python<'py>,
@@ -124,7 +117,7 @@ fn detect_localize_stack<'py>(
     offset: f64,
     roi: Option<PyReadonlyArray2<'_, bool>>,
     fp_per_mpx: f64,
-    slack: (f64, f64),
+    free_sigma: bool,
     n_threads: usize,
 ) -> PyResult<Vec<Frame<'py>>> {
     let sh = raw.shape();
@@ -137,7 +130,7 @@ fn detect_localize_stack<'py>(
     }
     check_offset(offset)?;
     let roi = roi_slice(&roi, h, w)?.map(|m| m.to_vec());
-    let s = settings(sigma, fp_per_mpx, slack)?;
+    let s = settings(sigma, fp_per_mpx, free_sigma)?;
     let r = r.to_vec();
     let outs = py.detach(|| {
         detect::localize_stack(&r, n, h, w, offset, roi.as_deref(), &s, n_threads.max(1))
@@ -173,13 +166,12 @@ fn detect_render(
 }
 
 pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
-    m.add("DETECT_OUTPUT_VERSION", 5)?;
+    m.add("DETECT_OUTPUT_VERSION", 6)?;
     m.add_function(wrap_pyfunction!(detect_localize, m)?)?;
     m.add_function(wrap_pyfunction!(detect_localize_stack, m)?)?;
     m.add_function(wrap_pyfunction!(detect_render, m)?)?;
     // The detector's defaults, read by `spotsolve.native` so Python states
     // no second copy of them.
-    m.add("DETECT_SLACK", detect::SLACK)?;
     m.add("DETECT_FP_PER_MPX", detect::FP_PER_MPX)?;
     Ok(())
 }

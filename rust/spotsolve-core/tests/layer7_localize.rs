@@ -31,19 +31,26 @@ impl Rng {
     }
 }
 
-/// A Poisson frame on a flat background of 20 with `n` emitters at least
-/// 4 px from the edge, amplitude 150-3000 ADU, width `sigma` +- 20%.
-fn field(rng: &mut Rng, h: usize, w: usize, n: usize, sigma: f64) -> (Vec<f64>, Vec<[f64; 2]>) {
+/// A Poisson frame on a flat background of 20 with emitters on a 16 px
+/// grid (jittered by up to half a pixel), flux 300-3000 ADU, width `sigma`
+/// times `1 +- spread`.
+fn grid(rng: &mut Rng, side: usize, sigma: f64, spread: f64) -> (Vec<f64>, Vec<[f64; 2]>) {
     let mut theta = vec![20.0];
-    let mut truth = Vec::with_capacity(n);
-    for _ in 0..n {
-        let y = 4.0 + rng.uni() * (h as f64 - 9.0);
-        let x = 4.0 + rng.uni() * (w as f64 - 9.0);
-        theta.extend_from_slice(&[150.0 + 2850.0 * rng.uni(), y, x, sigma * (0.8 + 0.4 * rng.uni())]);
-        truth.push([y, x]);
+    let mut truth = Vec::new();
+    let mut y = 8.0;
+    while y < side as f64 - 4.0 {
+        let mut x = 8.0;
+        while x < side as f64 - 4.0 {
+            let (yy, xx) = (y + rng.uni() - 0.5, x + rng.uni() - 0.5);
+            theta.extend_from_slice(&[300.0 + 2700.0 * rng.uni(), yy, xx, sigma * (1.0 + spread * (2.0 * rng.uni() - 1.0))]);
+            truth.push([yy, xx]);
+            x += 16.0;
+        }
+        y += 16.0;
     }
-    let mut m = vec![0.0; h * w];
-    psf::model_var_sigma_ax(&theta, &psf::local_axis(h), &psf::local_axis(w), None, &mut psf::Factors::new(h, w, n), &mut m);
+    let mut m = vec![0.0; side * side];
+    let ax = psf::local_axis(side);
+    psf::model_var_sigma_ax(&theta, &ax, &ax, None, &mut psf::Factors::new(side, side, truth.len()), &mut m);
     (m.iter().map(|&v| rng.poisson(v)).collect(), truth)
 }
 
@@ -81,28 +88,36 @@ fn score(o: &bs::Output, truth: &[[f64; 2]]) -> (f64, f64, f64, f64) {
 }
 
 #[test]
-fn simulated_fields_are_recovered() {
-    let (h, w, sigma) = (128, 128, 1.2);
-    let s = Settings { sigma, fp_per_mpx: bs::FP_PER_MPX, slack: bs::SLACK };
+fn isolated_emitters_are_recovered_with_calibrated_errors() {
+    let (side, sigma) = (128, 1.2);
     let mut rng = Rng(2026);
-    // (emitters per px, recall, precision) floors. Position error is held
-    // in units of each detection's reported SE, so recovering a hard
-    // emitter (dim, beside a bright one) does not count against it; its
-    // median is sqrt(ln 2) = 0.83 when the SEs are right.
-    for (density, rec_min, prec_min) in [(0.005, 0.97, 0.98), (0.015, 0.86, 0.97), (0.03, 0.84, 0.97)] {
-        let n = (density * (h * w) as f64).round() as usize;
-        let (d, truth) = field(&mut rng, h, w, n, sigma);
-        let o = bs::localize(&d, h, w, None, &s);
-        let (rec, prec, rmse, medz) = score(&o, &truth);
-        println!("density {density}: N {} of {n}, recall {rec:.3} precision {prec:.3} rmse {rmse:.3} px, median {medz:.2} SE", o.amp.len());
-        assert!(rec >= rec_min && prec >= prec_min && medz <= 1.0, "density {density}: {rec} {prec} {rmse} {medz}");
+    // Fixed width at the true width, and free width over a +-20% spread.
+    // The median position error is sqrt(ln 2) = 0.83 SE when the SEs are
+    // right.
+    for (free_sigma, spread) in [(false, 0.0), (true, 0.2)] {
+        let s = Settings { free_sigma, ..Settings::new(sigma) };
+        let (mut found, mut kept, mut total, mut zs) = (0.0, 0.0, 0.0, Vec::new());
+        for _ in 0..6 {
+            let (d, truth) = grid(&mut rng, side, sigma, spread);
+            let o = bs::localize(&d, side, side, None, &s);
+            let (rec, _, _, medz) = score(&o, &truth);
+            found += rec * truth.len() as f64;
+            kept += o.amp.len() as f64;
+            total += truth.len() as f64;
+            zs.push(medz);
+        }
+        let (rec, prec) = (found / total, found / kept);
+        zs.sort_by(f64::total_cmp);
+        let medz = zs[zs.len() / 2];
+        println!("free_sigma {free_sigma}: recall {rec:.4} precision {prec:.4}, median {medz:.2} SE");
+        assert!(rec >= 0.995 && prec >= 0.995 && (0.73..0.93).contains(&medz), "free_sigma {free_sigma}: {rec} {prec} {medz}");
     }
 }
 
 #[test]
 fn pure_noise_meets_the_false_positive_target() {
     let (h, w, sigma, frames) = (256, 256, 1.2, 16);
-    let s = Settings { sigma, fp_per_mpx: bs::FP_PER_MPX, slack: bs::SLACK };
+    let s = Settings::new(sigma);
     let mut rng = Rng(7);
     let mut n = 0;
     for _ in 0..frames {

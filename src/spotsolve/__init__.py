@@ -1,8 +1,9 @@
 """Emitter localization and Brownian-motion LAP tracking for microscopy.
 
-`localize` / `localize_stack` fit each frame as one Poisson model whose
-one knob, `fp_per_mpx`, is the expected false positives per 10^6 noise
-pixels. `localize_aguet` /
+`localize` / `localize_stack` follow u-track's pointSourceDetection: a
+Poisson significance screen, one window fit per seed, and a likelihood-ratio
+decision whose one knob, `fp_per_mpx`, is the expected false positives per
+10^6 noise pixels. `localize_aguet` /
 `localize_aguet_stack` provide the independent-fit spotfitlm sparse baseline.
 Both return `Localizations`; stack functions process frames in native workers.
 
@@ -20,7 +21,6 @@ frame to frame, by least squared displacement within a search radius.
 
 from .native import (  # noqa: F401
     FP_PER_MPX,
-    SLACK,
     localize,
     localize_stack,
 )
@@ -38,7 +38,6 @@ __all__ = [
     "Localizations",
     "FitFlag",
     "link",
-    "SLACK",
     "FP_PER_MPX",
     "__version__",
 ]

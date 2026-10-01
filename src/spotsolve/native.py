@@ -1,9 +1,8 @@
-"""Multi-emitter localization with the native joint-model detector.
+"""Localization with the native detector, after u-track's pointSourceDetection.
 
-Frames are independent. An ROI restricts seeds, placements and
-preprocessing; fitted centers may move outside it. Background and
-dispersion use the available ROI context, so masked results can differ
-from full-frame results.
+Frames are independent. An ROI restricts seeds; fitted centers may move
+outside it. The dispersion uses the available ROI context, so masked
+results can differ from full-frame results.
 """
 
 import os
@@ -15,17 +14,15 @@ from .results import Localizations
 
 try:
     import spotsolve_rs as _rs
-    if getattr(_rs, "DETECT_OUTPUT_VERSION", 0) != 5:
+    if getattr(_rs, "DETECT_OUTPUT_VERSION", 0) != 6:
         raise ImportError("incompatible localization output; rebuild spotsolve_rs")
 except ImportError as error:          # pragma: no cover - build problem
     raise ImportError(
         "spotsolve needs its bundled Rust extension; reinstall a compatible wheel "
         "or run `maturin develop --release` from the repository root") from error
 
-__all__ = ["localize", "localize_stack", "SLACK", "FP_PER_MPX"]
+__all__ = ["localize", "localize_stack", "FP_PER_MPX"]
 
-SLACK = tuple(_rs.DETECT_SLACK)
-"""Widths a fit may take, as multiples of `sigma`: the model space."""
 FP_PER_MPX = float(_rs.DETECT_FP_PER_MPX)
 """Default expected false emitters per 10^6 pixels of pure noise."""
 
@@ -51,19 +48,19 @@ def _roi(roi, shape):
     return roi
 
 
-def _kw(sigma, offset, roi, shape, fp_per_mpx, slack):
+def _kw(sigma, offset, roi, shape, fp_per_mpx, free_sigma):
     sigma = float(sigma)
     if not np.isfinite(sigma) or not 0 < sigma <= max(shape):
         raise ValueError("sigma must be positive, finite and no larger than the frame")
     return dict(sigma=sigma, offset=float(offset), roi=_roi(roi, shape),
-                fp_per_mpx=float(fp_per_mpx), slack=tuple(map(float, slack)))
+                fp_per_mpx=float(fp_per_mpx), free_sigma=bool(free_sigma))
 
 
 def _result(out, raw, kw, images):
     pos, amp, sig, se, sig_se, flags, bmap, info = out
     dispersion = info.pop("dispersion")
     sigma = kw["sigma"]
-    info.update(fp_per_mpx=kw["fp_per_mpx"])
+    info.update(method="detect", fp_per_mpx=kw["fp_per_mpx"], free_sigma=kw["free_sigma"])
     model = residual = None
     if images:
         model = _rs.detect_render(pos, amp, sig, bmap)
@@ -76,51 +73,37 @@ def _result(out, raw, kw, images):
 
 
 def localize(frame, sigma, *, offset=0.0, roi=None, fp_per_mpx=FP_PER_MPX,
-             slack=SLACK, images=True):
+             free_sigma=False, images=True):
     """Localize one frame. Returns `Localizations`.
 
     `frame`, `offset`, flux and background use camera units (ADU). `sigma`
-    is the in-focus PSF width in pixels; `slack` bounds reported widths as
-    multiples of `sigma`. Components fitted wider than `slack[1] * sigma`
-    are out-of-focus light: returned in `background`, counted in
-    `info["out_of_focus"]`. Lower-bound solutions are flagged.
+    is the in-focus PSF width in pixels.
 
-    One statistic proposes every emitter: the efficient score z for one more
-    emitter, at any searched width, given everything already fitted nearby.
-    Seeds are local maxima of z over position and width near a threshold u;
-    each starts as one emitter of one joint model of the frame: every
-    emitter plus a bilinear background on nodes `ceil(8 * slack[1] *
-    sigma)` px apart (the returned background map), fitted to convergence
-    in small coupled groups. Then counts change: an emitter is removed if
-    dropping it costs less than u^2 / 2 dispersion-scaled nats, and one is
-    added where the residual's z exceeds u * kappa and the refit gains
-    (u * kappa)^2 / 2, until nothing changes; every such likelihood ratio
-    refits the background. `info["kappa"]` >= 1 is the residual score's
-    spread far from any emitter (an empirical null that absorbs PSF and
-    background misfit; 1 in the first add round). `fp_per_mpx` sets u: an
-    upper bound on the expected number of false emitters per 10^6 pixels of
-    pure Gaussian noise. Lower it for fewer false positives, raise it for
-    dim data. `info` reports `u`, `adds`,
-    `removed` and `outer` (rounds).
+    The frame is screened by the Poisson score of one emitter at each pixel;
+    local maxima of the Laplacian of Gaussian where that score is high
+    enough become seeds. Each seed is fitted alone on a window of
+    `ceil(4 sigma)` px around it: a constant level plus one emitter of width
+    `sigma`, held within `2 sigma` of the seed, with the pixels of other
+    significant spots left out. An emitter is kept if its likelihood ratio
+    against the level alone, in nats scaled by the frame's measured
+    dispersion, reaches `u^2 / 2`. `fp_per_mpx` sets `u`: the expected
+    number of false emitters per 10^6 pixels of noise. With `free_sigma`,
+    kept emitters are refitted with their width free and that fit is
+    reported; the decision is still made at `sigma`.
 
-    Every emitter is returned with `FitFlag` diagnostics; there are no
-    brightness cuts after fitting. `images=False` skips `model_image` and
-    `residual`.
-
-    `info['fisher_fraction']` is an (N, 4) array for `(flux, y, x, sigma)`:
-    conditional/marginal Fisher variance. Small values mean strong coupling
-    to other fitted parameters, not necessarily poor absolute precision.
-    NaN means covariance unavailable. These are diagnostics only.
+    `info["z"]` is each emitter's `sqrt(2 * likelihood ratio)`, at least
+    `info["u"]`. Every emitter is returned with `FitFlag` diagnostics.
+    `images=False` skips `model_image` and `residual`.
     """
     raw = np.ascontiguousarray(frame, dtype=float)
     if raw.ndim != 2:
         raise ValueError(f"expected a 2-D frame, got shape {raw.shape}")
-    kw = _kw(sigma, offset, roi, raw.shape, fp_per_mpx, slack)
+    kw = _kw(sigma, offset, roi, raw.shape, fp_per_mpx, free_sigma)
     return _result(_rs.detect_localize(raw, **kw), raw, kw, images)
 
 
 def localize_stack(stack, sigma, *, offset=0.0, roi=None, fp_per_mpx=FP_PER_MPX,
-                   slack=SLACK, n_threads=None, images=False):
+                   free_sigma=False, n_threads=None, images=False):
     """Localize every frame of a `(T, H, W)` stack, in parallel.
 
     Returns one `Localizations` per frame, in frame order, each what
@@ -132,7 +115,7 @@ def localize_stack(stack, sigma, *, offset=0.0, roi=None, fp_per_mpx=FP_PER_MPX,
     raw = np.ascontiguousarray(stack, dtype=float)
     if raw.ndim != 3:
         raise ValueError(f"expected a (T, H, W) stack, got shape {raw.shape}")
-    kw = _kw(sigma, offset, roi, raw.shape[1:], fp_per_mpx, slack)
+    kw = _kw(sigma, offset, roi, raw.shape[1:], fp_per_mpx, free_sigma)
     outs = _rs.detect_localize_stack(
         raw, **kw, n_threads=_positive_int((os.cpu_count() or 1) if n_threads is None else n_threads,
                                 "n_threads"))

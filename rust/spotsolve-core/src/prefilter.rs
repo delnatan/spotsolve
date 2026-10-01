@@ -48,7 +48,7 @@ pub struct Screen {
 }
 
 /// Lowest mean a score's variance is taken at, in ADU.
-const LEVEL_FLOOR: f64 = 1e-3;
+pub const LEVEL_FLOOR: f64 = 1e-3;
 
 /// The centred pixel-integrated unit-flux PSF along one axis, radius
 /// `ceil(4 sigma)`; the 2-D kernel is its outer product.
@@ -312,6 +312,17 @@ mod tests {
         }
         let per_mpx = seeds as f64 * 1e6 / (frames * side * side) as f64;
         assert!(per_mpx > fp / 1.5 && per_mpx < fp * 1.5, "{per_mpx} per Mpx at u = {u}");
+    }
+
+    #[test]
+    fn the_dispersion_reads_white_noise_and_scales_with_the_image() {
+        let (h, w) = (200, 180);
+        // Mean 50, sd 3: phi = 9 / 50.
+        let d: Vec<f64> = crate::detect::tests::normals(h * w, 7).iter().map(|v| 50.0 + 3.0 * v).collect();
+        let phi = dispersion(&d, h, w);
+        assert!((phi - 0.18).abs() < 0.01, "phi {phi}");
+        let d7: Vec<f64> = d.iter().map(|v| 7.0 * v).collect();
+        assert!((dispersion(&d7, h, w) - 7.0 * phi).abs() < 1e-9 * phi);
     }
 
     #[test]

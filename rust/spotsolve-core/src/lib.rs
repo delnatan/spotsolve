@@ -1,18 +1,19 @@
 //! `spotsolve` core: emitter detection and localization.
 //!
-//! The detector is [`detect`]: seeds are local maxima over position and
-//! width of the score for one more emitter, near a threshold set by an
-//! expected false-positive rate; each starts as an emitter of one Poisson
-//! model of the frame, [`model`], which fits, removes and adds by likelihood
-//! ratios. `tests/layer7_localize.rs` holds it to recall, precision and
+//! The detector is [`detect`], after u-track's `pointSourceDetection`:
+//! [`prefilter`] screens the frame by a Poisson score test and proposes
+//! LoG seeds; each is fitted on its own window by [`fit`] and kept if its
+//! likelihood ratio reaches a threshold set by an expected false-positive
+//! rate. `tests/layer7_localize.rs` holds it to recall, precision and
 //! position error on simulated fields and to its false-positive rate on
 //! pure noise.
 //!
 //! The rest are the layers it is built from: [`psf`] (the
-//! pixel-integrated Gaussian and its derivatives), [`linalg`] (Cholesky,
-//! banded solves), [`filters`] (`scipy.ndimage`'s filters, matched exactly),
-//! [`render`] (model images) and [`statistics`]. The linker is [`track`], on
-//! the exact assignment in [`lap`].
+//! pixel-integrated Gaussian and its derivatives), [`linalg`] (Cholesky),
+//! [`filters`] (`scipy.ndimage`'s filters, matched exactly), [`render`]
+//! (model images) and [`statistics`]. [`aguet`] is the spotfitlm baseline,
+//! to be folded into [`detect`]. The linker is [`track`], on the exact
+//! assignment in [`lap`].
 //!
 //! # Portability
 //!
@@ -29,7 +30,6 @@ pub mod filters;
 pub mod fit;
 pub mod lap;
 pub mod linalg;
-pub mod model;
 pub mod prefilter;
 pub mod psf;
 pub mod render;

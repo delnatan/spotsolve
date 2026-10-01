@@ -33,10 +33,7 @@ LOCALIZATION_SCHEMA = {
     "sigma_se": pl.Float64,
     "sigma_ratio": pl.Float64,  # fit_sigma / sigma
     "flags": pl.UInt8,
-    "fisher_flux": pl.Float64,
-    "fisher_y": pl.Float64,
-    "fisher_x": pl.Float64,
-    "fisher_sigma": pl.Float64,
+    "z": pl.Float64,          # sqrt(2 * likelihood ratio); at least the frame's u
 }
 
 FRAME_SCHEMA = {
@@ -79,7 +76,7 @@ def frame_tables(result, frame, t=0.0, pixel_size=1.0,
     amp = np.asarray(result.amplitudes, float).ravel()
     se = np.asarray(result.se, float).reshape(-1, 3)
     n = len(amp)
-    fraction = np.asarray(result.info.get("fisher_fraction", np.full((n, 4), np.nan)))
+    z = np.asarray(result.info.get("z", np.full(n, np.nan)), float)
     background = result.info.get("fitted_background")
     if background is None:
         background = _sample_background(result.background, pos)
@@ -107,8 +104,7 @@ def frame_tables(result, frame, t=0.0, pixel_size=1.0,
             "sigma_ratio": np.asarray(result.sigma_ratio, float),
             "sigma_se": np.asarray(result.sigma_se, float),
             "flags": np.asarray(result.flags, np.uint8),
-            **{f"fisher_{name}": fraction[:, j]
-               for j, name in enumerate(("flux", "y", "x", "sigma"))},
+            "z": z,
         },
         schema=LOCALIZATION_SCHEMA,
     )
