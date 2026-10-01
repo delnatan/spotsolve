@@ -16,7 +16,7 @@ measurements.
   position and width. Measured false emitters on noise: 13-17 per 10^6
   pixels at the default 16.
 - `slack` is replaced by `width=(lo, hi)`, the reported widths as multiples
-  of `sigma` (default `sigma` to about `2 sigma`); equal bounds fix the
+  of `sigma` (default `(1, 1.5)`); equal bounds fix the
   width. Wider light is fitted as out-of-focus background and counted in
   `info["out_of_focus"]`.
 - Removed: the joint frame model, `localize_aguet` /
@@ -24,7 +24,7 @@ measurements.
   `info["fisher_fraction"]` and the `fisher_*` table columns, and
   `FitFlag.CONTEXT_UNSETTLED`. Added: `info["z"]` and the `z` table column
   (each emitter's `sqrt(2 * likelihood ratio)`), `info["seed"]`,
-  `info["seed_positions"]`, `info["mixture"]`, `MAX_MIXTURES`.
+  `info["seed_positions"]`, `info["mixture"]`, `MAX_MIXTURES`, `WIDTH`.
 - `result.background` is the screening level, NaN outside the processed
   crop; each emitter's own fitted level is `info["fitted_background"]`.
 - Results are invariant to the camera gain, and identical across worker

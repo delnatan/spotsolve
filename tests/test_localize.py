@@ -19,8 +19,9 @@ def _sim(seed, density=0.034, spread=0.2, **kw):
                     sigma_spread=spread, seed=seed, **kw)
 
 
-# Floors five points under what mixtures achieve; widths spread +-20-40%,
-# so the default free widths. The old joint model held 0.723/0.919,
+# Floors five points under what mixtures achieve. Widths are lognormal with
+# sd 0.2-0.4, many wider than the default band, so the band is opened to its
+# cap. The old joint model held 0.723/0.919,
 # 0.785/0.913 and 0.512/0.759 on these cells.
 @pytest.mark.parametrize("seed,density,spread,recall,precision",
                          [(17, 0.015, 0.4, 0.894, 0.977),
@@ -29,7 +30,8 @@ def _sim(seed, density=0.034, spread=0.2, **kw):
 def test_referee_cells_hold_their_recall_and_precision(seed, density, spread,
                                                        recall, precision):
     sim = _sim(seed, density, spread)
-    res = L.localize(sim.image, sigma=SIGMA, fit_mixtures=True)
+    res = L.localize(sim.image, sigma=SIGMA, fit_mixtures=True,
+                     width=(1.0, float("inf")))
     m = match(sim.positions, res.positions, radius=1.0)
     assert m.recall >= recall - 0.05
     assert m.precision >= precision - 0.05

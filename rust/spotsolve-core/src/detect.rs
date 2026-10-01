@@ -29,7 +29,7 @@
 //!    reported.
 //! 5. Every component has its own width, so a wider emitter is one
 //!    component rather than two. Emitters are reported in `width * sigma`
-//!    (by default `sigma` to [`widest`]); the tests search width as well as
+//!    (by default [`WIDTH`]); the tests search width as well as
 //!    position, and `u` is set for that search ([`prefilter::false_rate`]).
 //!    A component may widen past the band to the window's half-side as
 //!    out-of-focus light (defocused emitters, haze), which narrower
@@ -47,6 +47,13 @@ use crate::psf;
 pub const BANK_STEP: f64 = 1.5;
 /// Default expected false emitters per 10^6 noise pixels.
 pub const FP_PER_MPX: f64 = 16.0;
+/// Default reported widths, multiples of `sigma`. An in-focus emitter fits
+/// near `sigma`; defocus widens it, and by `sqrt(2) sigma` its peak has
+/// halved, the edge of the PSF's axial FWHM. The bound sits a little above
+/// that so a `sigma` set slightly narrow keeps in-focus emitters. A window
+/// that sees only part of wider light (haze, a defocused blob) fits it with
+/// components of `1.5-2 sigma`; above the bound they are out-of-focus light.
+pub const WIDTH: (f64, f64) = (1.0, 1.5);
 /// Widths: the fit window's half-side, `ceil(WINDOW * sigma)` px.
 pub const WINDOW: f64 = 4.0;
 /// Widths: how far an emitter's centre may move from its seed. Farther, the
@@ -101,7 +108,7 @@ pub struct Settings {
 
 impl Settings {
     pub fn new(sigma: f64) -> Self {
-        Self { sigma, fp_per_mpx: FP_PER_MPX, width: (1.0, f64::INFINITY), fit_mixtures: false, max_mixtures: MAX_MIXTURES }
+        Self { sigma, fp_per_mpx: FP_PER_MPX, width: WIDTH, fit_mixtures: false, max_mixtures: MAX_MIXTURES }
     }
 
     fn radius(&self) -> usize {

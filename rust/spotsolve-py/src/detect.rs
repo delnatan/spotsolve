@@ -91,7 +91,7 @@ fn give<'py>(py: Python<'py>, o: detect::Output, h: usize, w: usize) -> PyResult
 /// Localize one raw frame. Everything is in ADU above `offset`; the
 /// background and dispersion are measured from the frame.
 #[pyfunction]
-#[pyo3(signature = (raw, sigma, offset=0.0, *, roi=None, fp_per_mpx=detect::FP_PER_MPX, width=(1.0, f64::INFINITY), fit_mixtures=false, max_mixtures=detect::MAX_MIXTURES))]
+#[pyo3(signature = (raw, sigma, offset=0.0, *, roi=None, fp_per_mpx=detect::FP_PER_MPX, width=detect::WIDTH, fit_mixtures=false, max_mixtures=detect::MAX_MIXTURES))]
 #[allow(clippy::too_many_arguments)]
 fn detect_localize<'py>(
     py: Python<'py>,
@@ -123,7 +123,7 @@ fn detect_localize<'py>(
 /// each frame exactly as `detect_localize` would. Returns one tuple per frame,
 /// in frame order.
 #[pyfunction]
-#[pyo3(signature = (raw, sigma, offset=0.0, *, roi=None, fp_per_mpx=detect::FP_PER_MPX, width=(1.0, f64::INFINITY), fit_mixtures=false, max_mixtures=detect::MAX_MIXTURES, n_threads=1))]
+#[pyo3(signature = (raw, sigma, offset=0.0, *, roi=None, fp_per_mpx=detect::FP_PER_MPX, width=detect::WIDTH, fit_mixtures=false, max_mixtures=detect::MAX_MIXTURES, n_threads=1))]
 #[allow(clippy::too_many_arguments)]
 fn detect_localize_stack<'py>(
     py: Python<'py>,
@@ -191,5 +191,6 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // no second copy of them.
     m.add("DETECT_FP_PER_MPX", detect::FP_PER_MPX)?;
     m.add("DETECT_MAX_MIXTURES", detect::MAX_MIXTURES)?;
+    m.add("DETECT_WIDTH", detect::WIDTH)?;
     Ok(())
 }

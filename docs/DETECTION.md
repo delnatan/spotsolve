@@ -59,12 +59,15 @@ calibration is needed; fluxes scale with gain, positions and decisions do not.
    nearest to it, so neighbouring windows report no emitter twice (u-track
    merges copies within 0.25 px), and only those components are tested for
    removal. A component held on a position bound is not reported.
-5. **Widths.** Emitters are reported within `width * sigma` (by default
-   `sigma` to half the window's half-side, about `2 sigma`, where a
-   centred emitter keeps 91% of its light in the window). A component may
-   widen past that, to the window's half-side, as out-of-focus light:
-   defocused emitters and haze that narrower components would otherwise
-   split up. It is counted in `info["out_of_focus"]`, not reported.
+5. **Widths.** Emitters are reported within `width * sigma`, by default
+   `sigma` to `1.5 sigma`: just above `sqrt(2) sigma`, where a defocused
+   emitter's peak has halved (the edge of the PSF's axial FWHM), with room
+   for a `sigma` set slightly narrow. The bound is capped at half the
+   window's half-side, about `2 sigma`, where a centred emitter keeps 91%
+   of its light in the window. A component may widen past the bound, to the
+   window's half-side, as out-of-focus light: defocused emitters and haze
+   that narrower components would otherwise split up. It is counted in
+   `info["out_of_focus"]`, not reported.
    `width=(1, 1)` fixes every width at `sigma`, as u-track does.
 6. **Uncertainties.** Standard errors from the inverse expected Fisher
    information `J^T diag(1/m) J` of each emitter's final window fit, every
@@ -158,9 +161,16 @@ fixed-width mixtures split wider emitters (precision 0.88), free widths do
 not (0.97-1.00). On 256x256 fields at 0.03 / px^2 with widths spread +-20%
 (sigma 1.2), mixtures find 0.825 of emitters at precision 0.979 in 1.0 s;
 the joint model found 0.829 at 0.985 in 5.2 s. Adding defocused blobs 3-6
-sigma wide raises mixtures' false emitters from 2.5 to 5.5 per 128x128 frame
-(the joint model: 1.8 to 3.0). On a real 39x39 bead image mixtures and the
-joint model report the same 70 beads.
+sigma wide raises mixtures' false emitters from 2.1 to 3.9 per 128x128 frame
+(the joint model: 1.8 to 3.0); 0.75 per frame are pieces of blobs, the rest
+close pairs reported as one emitter between them. A window sees only part
+of such a blob, which fits as a `1.5-2 sigma` component on a raised level:
+under the true blobs these components have no evidence. The default width
+bound is what keeps them out: at `2 sigma` 1.6 per frame were reported, at
+equal recall. On a real 39x39 bead image mixtures and the joint model
+report the same 70 beads. On real GEM and glycerol frames 10-12% of
+emitters fit wider than `1.5 sigma`, three quarters of them faint (`z <=
+8`) and on diffuse light; the default leaves them out.
 
 Measured and not kept: a second, DAOPHOT-style pass on the residual (+2
 points of recall in dense fields, but it fitted PSF misfit beside bright
@@ -169,15 +179,20 @@ beads as emitters and cost 37% of the time); a window dispersion
 bar beside bright beads until 18 of 70 real beads were lost; fitting each
 mask cluster jointly (DAOPHOT's NSTAR groups), whose large clusters misfit a
 single level and ran 30x slower; plane and quadratic window levels (no gain
-at an equal false rate); and 3-sigma windows (2x faster, 2 points less
-recall, 4 of 70 beads lost).
+at an equal false rate); 3-sigma windows (2x faster, 2 points less
+recall, 4 of 70 beads lost); out-of-focus components wider than the window
+or centred outside it (blob pieces halved, but 4-6 points of recall lost in
+dense fields); and the joint model's empirical-null scale, the spread of
+the residual's score far from emitters. That spread was 1.0 on blob frames
+for the joint model, so it was not what kept blobs out, and from window
+fits it reads crowding as misfit (2.1 on a dense exact field).
 
 ## Limits
 
 The PSF model is a Gaussian, and each window's level is a constant. Real PSF
 wings, haze and defocused light wider than the window are misfit, and the
-tests read misfit as signal: mixtures find more emitters than the joint
-model did on hazy frames, some of them false. Single fits are biased by any
+tests read misfit as signal: within the width bound, some haze is reported
+as emitters. Single fits are biased by any
 neighbour within a window and lose emitters closer than about `4 sigma`; use
 mixtures wherever spots crowd. Emitters closer than about `sigma` are
 reported as one. Mixtures cost one window per seed, each refitting its

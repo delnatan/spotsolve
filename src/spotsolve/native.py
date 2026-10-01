@@ -21,10 +21,11 @@ except ImportError as error:          # pragma: no cover - build problem
         "spotsolve needs its bundled Rust extension; reinstall a compatible wheel "
         "or run `maturin develop --release` from the repository root") from error
 
-__all__ = ["localize", "localize_stack", "FP_PER_MPX", "MAX_MIXTURES"]
+__all__ = ["localize", "localize_stack", "FP_PER_MPX", "MAX_MIXTURES", "WIDTH"]
 
 FP_PER_MPX = float(_rs.DETECT_FP_PER_MPX)
 MAX_MIXTURES = int(_rs.DETECT_MAX_MIXTURES)
+WIDTH = tuple(float(v) for v in _rs.DETECT_WIDTH)
 """Default expected false emitters per 10^6 pixels of pure noise."""
 
 
@@ -77,7 +78,7 @@ def _result(out, raw, kw, images):
 
 
 def localize(frame, sigma, *, offset=0.0, roi=None, fp_per_mpx=FP_PER_MPX,
-             width=(1.0, float("inf")), fit_mixtures=False, max_mixtures=MAX_MIXTURES,
+             width=WIDTH, fit_mixtures=False, max_mixtures=MAX_MIXTURES,
              images=True):
     """Localize one frame. Returns `Localizations`.
 
@@ -90,11 +91,11 @@ def localize(frame, sigma, *, offset=0.0, roi=None, fp_per_mpx=FP_PER_MPX,
     `ceil(4 sigma)` px around it: a constant level plus one emitter, held
     within `2 sigma` of the seed, with the pixels of other significant spots
     left out. Each emitter's width is fitted; emitters are reported within
-    `width` (multiples of `sigma`; the upper bound is capped at half the
-    window's half-side, about `2 sigma`). A component may widen beyond that
-    to the window's half-side: out-of-focus light, fitted so narrower
-    components need not split it, counted in `info["out_of_focus"]` and not
-    reported. Equal bounds fix the width. An emitter is kept if its
+    `width` (multiples of `sigma`, by default `sigma` to `1.5 sigma`; the
+    upper bound is capped at half the window's half-side, about `2 sigma`).
+    A component may widen beyond that to the window's half-side:
+    out-of-focus light, fitted so narrower components need not split it,
+    counted in `info["out_of_focus"]` and not reported. Equal bounds fix the width. An emitter is kept if its
     likelihood ratio against the level alone, in nats scaled by the frame's
     measured dispersion, reaches `u^2 / 2`. `fp_per_mpx` sets `u`: the
     expected number of false emitters per 10^6 pixels of noise, for a search
@@ -122,7 +123,7 @@ def localize(frame, sigma, *, offset=0.0, roi=None, fp_per_mpx=FP_PER_MPX,
 
 
 def localize_stack(stack, sigma, *, offset=0.0, roi=None, fp_per_mpx=FP_PER_MPX,
-                   width=(1.0, float("inf")), fit_mixtures=False, max_mixtures=MAX_MIXTURES,
+                   width=WIDTH, fit_mixtures=False, max_mixtures=MAX_MIXTURES,
                    n_threads=None, images=False):
     """Localize every frame of a `(T, H, W)` stack, in parallel.
 

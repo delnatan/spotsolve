@@ -74,7 +74,7 @@ pixels.
 | `offset` | 0 | Camera offset, ADU |
 | `roi` | None | `(H, W)` bool mask of where seeds may be placed |
 | `fp_per_mpx` | 16 | Expected false emitters per 10^6 pixels of noise; lower is stricter |
-| `width` | `(1.0, inf)` | Reported widths, as multiples of `sigma`; the upper bound is capped near `2 sigma`. Equal bounds fix the width |
+| `width` | `(1.0, 1.5)` | Reported widths, as multiples of `sigma`; wider light is fitted as out-of-focus background. The upper bound is capped near `2 sigma`. Equal bounds fix the width |
 | `fit_mixtures` | False | Fit several emitters per window (u-track's FitMixtures) |
 | `max_mixtures` | 20 | Components per window at most |
 
@@ -126,7 +126,9 @@ counts, bin_edges = np.histogram(widths, bins="auto")
 
 Many fits at the lower bound mean `sigma` is set too wide; to admit
 narrower fits, lower `width[0]`, at the cost of a slightly stricter
-threshold. `width=(1, 1)` fixes every width at `sigma`, as u-track does: a
+threshold. Many at the upper bound mean it is set too narrow. To report
+defocused emitters too, raise `width[1]` (up to about 2); more haze is
+then reported as emitters. `width=(1, 1)` fixes every width at `sigma`, as u-track does: a
 little more recall when spots really are all in focus, but wider spots are
 split in two by mixtures.
 

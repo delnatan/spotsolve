@@ -20,6 +20,7 @@ frame to frame, by least squared displacement within a search radius.
 from .native import (  # noqa: F401
     FP_PER_MPX,
     MAX_MIXTURES,
+    WIDTH,
     localize,
     localize_stack,
 )
@@ -36,5 +37,6 @@ __all__ = [
     "link",
     "FP_PER_MPX",
     "MAX_MIXTURES",
+    "WIDTH",
     "__version__",
 ]
