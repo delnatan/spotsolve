@@ -19,16 +19,14 @@ def _sim(seed, density=0.034, spread=0.2, **kw):
                     sigma_spread=spread, seed=seed, **kw)
 
 
-# Floors five points under what mixtures achieve. Widths are lognormal with
-# sd 0.2-0.4, many wider than the default band, so the band is opened to its
-# cap. The old joint model held 0.723/0.919,
-# 0.785/0.913 and 0.512/0.759 on these cells.
+# Widths are lognormal with sd 0.2-0.4, many wider than the default band,
+# so the band is opened to its cap. Floors five points under what is achieved.
 @pytest.mark.parametrize("seed,density,spread,recall,precision",
                          [(17, 0.015, 0.4, 0.894, 0.977),
                           (18, 0.034, 0.2, 0.785, 0.966),
                           (19, 0.055, 0.4, 0.558, 0.950)])
-def test_referee_cells_hold_their_recall_and_precision(seed, density, spread,
-                                                       recall, precision):
+def test_crowded_fields_hold_their_recall_and_precision(seed, density, spread,
+                                                        recall, precision):
     sim = _sim(seed, density, spread)
     res = L.localize(sim.image, sigma=SIGMA, fit_mixtures=True,
                      width=(1.0, float("inf")))
@@ -81,9 +79,8 @@ def test_read_noise_needs_no_model():
 
 
 def test_the_answer_does_not_depend_on_the_camera_gain():
-    # The same photons at several gains (true 1 here): the dispersion scales
-    # with the gain exactly, and the detections are the same ones, to within
-    # the fit's tolerance (the optimizer's path is not scale-invariant).
+    # The same photons at several gains: the dispersion scales with the gain
+    # and the detections agree to within the fit's tolerance.
     sim = _sim(17, 0.015, 0.4, background=20.0)
     ref = L.localize(sim.image + 100.0, sigma=SIGMA, offset=100.0)
     for g in (0.5, 4.0, 32.0):
@@ -138,13 +135,8 @@ def test_stack_is_frame_by_frame_and_thread_count_free():
 
 
 def test_the_roi_crop_is_invisible_to_the_roi():
-    """`localize` runs on the ROI's bounding box plus a margin, not on the
-    frame. The margin's promise is that the answer inside the ROI does not
-    depend on how much frame surrounds it.
-
-    Checked by handing the same ROI more context than the crop needs: the
-    whole 192^2 frame against a sub-array that still contains the crop.
-    """
+    """An ROI is processed on its bounding box plus a margin, so more
+    surrounding frame does not change the answer."""
     sim = simulate(shape=(192, 192), density=0.01,
                    amplitude_range=(900.0, 1900.0), sigma=SIGMA,
                    sigma_spread=0.2, seed=23)

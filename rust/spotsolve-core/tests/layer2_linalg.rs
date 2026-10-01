@@ -1,15 +1,11 @@
-//! LAYER 2: the dense SPD kernels.
-//!
-//! Randomized property tests against naive references: a failure here names
-//! the kernel, where an end-to-end test would only say something changed.
+//! LAYER 2: the Cholesky factorization, by randomized property tests.
 
 mod common;
 
 use common::*;
 use spotsolve_core::linalg::Chol;
 
-/// A tiny deterministic PRNG, so the property tests do not need a dependency
-/// and do not flap between runs. xorshift64*.
+/// xorshift64*: deterministic, no dependency.
 struct Rng(u64);
 impl Rng {
     fn new(seed: u64) -> Self {
@@ -61,17 +57,15 @@ fn solve_recovers_the_right_hand_side() {
         let x_true: Vec<f64> = (0..n).map(|_| rng.unif() * 100.0).collect();
         let b = matvec(&a, &x_true, n);
         assert!(chol.factor(&a, n), "n={n}: SPD matrix rejected");
-        let mut x = vec![0.0; n];
-        chol.solve(&b, &mut x);
+        let mut x = b.clone();
+        chol.solve_in_place(&mut x);
         for i in 0..n {
             assert_rel(x[i], x_true[i], 1e-10, &format!("n={n} solve x[{i}]"));
         }
     }
 }
 
-/// `log|A|` against a naive LU determinant. Independent route, same answer.
-/// `diag(A^-1)` against `n` explicit solves against unit vectors, so one
-/// factorization serves every consumer.
+/// `diag(A^-1)` against solves for the unit vectors.
 #[test]
 fn inv_diag_matches_column_solves() {
     let mut rng = Rng::new(13);
@@ -83,25 +77,21 @@ fn inv_diag_matches_column_solves() {
         let mut got = vec![0.0; n];
         chol.inv_diag(&mut got, &mut scratch);
         for i in 0..n {
-            let mut e = vec![0.0; n];
-            e[i] = 1.0;
             let mut col = vec![0.0; n];
-            chol.solve(&e, &mut col);
+            col[i] = 1.0;
+            chol.solve_in_place(&mut col);
             assert_rel(got[i], col[i], 1e-10, &format!("n={n} inv_diag[{i}]"));
         }
     }
 }
 
-/// `F_ij` and `F_ji` differ by an ulp in practice, so which triangle is read
-/// changes the answer unless the factorization symmetrizes first. It does,
-/// so feeding it a matrix or its transpose must give bit-identical results.
+/// A matrix and its transpose, symmetric only to rounding, factor to
+/// bit-identical results.
 #[test]
 fn factorization_is_transpose_invariant() {
     let mut rng = Rng::new(17);
     let n = 21;
     let mut a = spd(&mut rng, n);
-    // Perturb one off-diagonal pair so the matrix is symmetric only to within
-    // rounding, exactly as `J^T W J` is.
     a[3 * n + 8] += 1e-15 * a[3 * n + 8].abs();
     let at: Vec<f64> = (0..n * n).map(|i| a[(i % n) * n + i / n]).collect();
 
@@ -109,9 +99,9 @@ fn factorization_is_transpose_invariant() {
     assert!(c1.factor(&a, n) && c2.factor(&at, n));
 
     let b: Vec<f64> = (0..n).map(|_| rng.unif()).collect();
-    let (mut x1, mut x2) = (vec![0.0; n], vec![0.0; n]);
-    c1.solve(&b, &mut x1);
-    c2.solve(&b, &mut x2);
+    let (mut x1, mut x2) = (b.clone(), b);
+    c1.solve_in_place(&mut x1);
+    c2.solve_in_place(&mut x2);
     assert_eq!(x1, x2, "solve depends on the triangle read");
 }
 

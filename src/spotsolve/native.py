@@ -110,7 +110,7 @@ def localize(frame, sigma, *, offset=0.0, roi=None, fp_per_mpx=FP_PER_MPX,
     of one emitter from two windows are merged.
     `info["mixture"]` numbers the windows that held several components (0:
     fitted alone). Use mixtures wherever spots come closer than about
-    `4 sigma`; alone, a fit is biased by a neighbour's light.
+    `6 sigma`; alone, a fit is biased by a neighbour's light.
 
     `info["z"]` is each emitter's `sqrt(2 * likelihood ratio)`, at least
     `info["u"]`. Every emitter is returned with `FitFlag` diagnostics.

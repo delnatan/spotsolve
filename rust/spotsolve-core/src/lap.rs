@@ -12,9 +12,8 @@
 //!     N   [  diag(birth) |      0       ]
 //! ```
 //!
-//! With the bottom-right block ZERO (not u-track's transpose of the link
-//! block, which counts every link twice -- tracksolve's `assign` docstring
-//! has the 2x2 counterexample), the objective of any assignment is exactly
+//! With the bottom-right block zero (u-track's transpose of the link block
+//! counts every link twice), the objective of any assignment is exactly
 //! `sum(term) + sum(birth) + sum over links of g[t, d]`, where
 //!
 //! ```text
@@ -47,10 +46,7 @@
 //! infeasible and no sentinel "forbidden" cost exists anywhere: a pair the
 //! gate rejected is simply not an edge.
 //!
-//! Exactness is the point -- greedy matching over the same scores can swap
-//! identities wherever candidates compete -- so the tests below check it
-//! against brute-force enumeration of every partial matching, not against
-//! another solver.
+//! The tests check exactness against enumeration of every partial matching.
 
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;

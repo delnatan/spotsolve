@@ -1,17 +1,10 @@
-//! Layer 0: the separable filters and order statistics, against
-//! `tests/fixtures/07_filters.json`.
-//!
-//! Below every other layer. These are pure arithmetic on identical inputs, so
-//! the tolerance is 1e-12 absolute -- a port that only matches to 1e-6 has a
-//! convention wrong, not a rounding difference. The convention most likely to
-//! be wrong is the order-2 kernel's normalization; see the `kernels1d` case.
+//! LAYER 0: the filters against `scipy.ndimage`
+//! (`tests/fixtures/07_filters.json`), to 1e-12 absolute: they are pure
+//! arithmetic on identical inputs, so a larger difference is a convention.
 
 mod common;
 
-use spotsolve_core::filters::{
-    gaussian_filter, gaussian_kernel1d, gaussian_laplace, kernel_radius, maximum_filter,
-    uniform_filter, Mode,
-};
+use spotsolve_core::filters::{gaussian_kernel1d, gaussian_laplace, kernel_radius, maximum_filter};
 
 const TOL: f64 = 1e-12;
 
@@ -64,10 +57,8 @@ fn gaussian_kernels_match_scipy_including_the_derivative_normalization() {
     }
 }
 
-/// The trap this layer exists to catch: a truncated order-2 kernel does NOT
-/// sum to zero, because scipy normalizes the order-0 kernel and only then
-/// differentiates. "Fixing" that rescales the whole LoG response against a
-/// fixed detection threshold.
+/// scipy normalizes the order-0 kernel and then differentiates, so the
+/// truncated order-2 kernel does not sum to zero.
 #[test]
 fn truncated_second_derivative_kernel_does_not_sum_to_zero() {
     let k = gaussian_kernel1d(0.6, 2, kernel_radius(0.6));
@@ -79,52 +70,35 @@ fn truncated_second_derivative_kernel_does_not_sum_to_zero() {
     );
 }
 
+/// The detector's filters, on the fixture's reflect-boundary cases.
 #[test]
 fn two_d_filters_match_the_fixture() {
     let fx = common::load("07_filters");
     let img = f64s(&fx.root["image"]["data"]);
     let h = fx.root["image"]["h"].as_u64().unwrap() as usize;
     let w = fx.root["image"]["w"].as_u64().unwrap() as usize;
-
+    let mut checked = 0;
     for case in fx.root["filters2d"].as_array().unwrap() {
+        if case["mode"].as_str() != Some("reflect") {
+            continue;
+        }
         let op = case["op"].as_str().unwrap();
-        let mode = match case["mode"].as_str().unwrap() {
-            "reflect" => Mode::Reflect,
-            "nearest" => Mode::Nearest,
-            m => panic!("unknown mode {m}"),
-        };
-        let want = f64s(&case["result"]);
         let got = match op {
-            "gaussian_laplace" => {
-                gaussian_laplace(&img, h, w, case["sigma"].as_f64().unwrap(), mode)
-            }
-            "gaussian_filter" => {
-                gaussian_filter(&img, h, w, case["sigma"].as_f64().unwrap(), mode)
-            }
-            "uniform_filter" => {
-                uniform_filter(&img, h, w, case["size"].as_u64().unwrap() as usize, mode)
-            }
-            "maximum_filter" => {
-                maximum_filter(&img, h, w, case["size"].as_u64().unwrap() as usize, mode)
-            }
-            o => panic!("unknown op {o}"),
+            "gaussian_laplace" => gaussian_laplace(&img, h, w, case["sigma"].as_f64().unwrap()),
+            "maximum_filter" => maximum_filter(&img, h, w, case["size"].as_u64().unwrap() as usize),
+            _ => continue,
         };
-        assert_close(&got, &want, &format!("{op} mode={:?}", mode));
+        assert_close(&got, &f64s(&case["result"]), op);
+        checked += 1;
     }
+    assert!(checked > 0);
 }
 
-/// A filter wider than the array. `background_map` reaches this on a small
-/// frame, and it is where a naive index reflection goes wrong.
+/// A window wider than the array reflects more than once.
 #[test]
 fn filters_wider_than_the_array_still_match() {
-    let fx = common::load("07_filters");
-    let o = &fx.root["oversize"];
+    let o = &common::load("07_filters").root["oversize"];
     let img = f64s(&o["data"]);
     let (h, w) = (o["h"].as_u64().unwrap() as usize, o["w"].as_u64().unwrap() as usize);
-    assert_close(&uniform_filter(&img, h, w, 9, Mode::Nearest),
-                 &f64s(&o["uniform_9_nearest"]), "uniform_9_nearest");
-    assert_close(&maximum_filter(&img, h, w, 9, Mode::Reflect),
-                 &f64s(&o["maximum_9_reflect"]), "maximum_9_reflect");
-    assert_close(&gaussian_filter(&img, h, w, 3.0, Mode::Nearest),
-                 &f64s(&o["gaussian_3_nearest"]), "gaussian_3_nearest");
+    assert_close(&maximum_filter(&img, h, w, 9), &f64s(&o["maximum_9_reflect"]), "maximum_9_reflect");
 }

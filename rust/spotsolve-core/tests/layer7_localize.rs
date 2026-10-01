@@ -5,31 +5,12 @@
 //! `fp_per_mpx` promises on noise. Floors sit a few points under what the
 //! detector achieves.
 
+mod common;
+
+use common::Rng;
 use spotsolve_core::detect::{self as bs, Settings};
 use spotsolve_core::psf;
 
-/// Uniform draws from an LCG (deterministic across platforms).
-struct Rng(u64);
-
-impl Rng {
-    fn uni(&mut self) -> f64 {
-        self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-        ((self.0 >> 11) as f64 + 0.5) / (1u64 << 53) as f64
-    }
-
-    /// Knuth's product method; fine for the means here (< 700).
-    fn poisson(&mut self, lam: f64) -> f64 {
-        let l = (-lam).exp();
-        let (mut k, mut p) = (0.0, 1.0);
-        loop {
-            p *= self.uni();
-            if p <= l {
-                return k;
-            }
-            k += 1.0;
-        }
-    }
-}
 
 /// A Poisson frame on a flat background of 20 with emitters on a 16 px
 /// grid (jittered by up to half a pixel), flux 300-3000 ADU, width `sigma`
@@ -48,9 +29,7 @@ fn grid(rng: &mut Rng, side: usize, sigma: f64, spread: f64) -> (Vec<f64>, Vec<[
         }
         y += 16.0;
     }
-    let mut m = vec![0.0; side * side];
-    let ax = psf::local_axis(side);
-    psf::model_var_sigma_ax(&theta, &ax, &ax, None, &mut psf::Factors::new(side, side, truth.len()), &mut m);
+    let m = psf::model(&theta, side, side);
     (m.iter().map(|&v| rng.poisson(v)).collect(), truth)
 }
 
@@ -65,8 +44,7 @@ fn field(rng: &mut Rng, h: usize, w: usize, n: usize, sigma: f64) -> (Vec<f64>, 
         theta.extend_from_slice(&[150.0 + 2850.0 * rng.uni(), y, x, sigma * (0.8 + 0.4 * rng.uni())]);
         truth.push([y, x]);
     }
-    let mut m = vec![0.0; h * w];
-    psf::model_var_sigma_ax(&theta, &psf::local_axis(h), &psf::local_axis(w), None, &mut psf::Factors::new(h, w, n), &mut m);
+    let m = psf::model(&theta, h, w);
     (m.iter().map(|&v| rng.poisson(v)).collect(), truth)
 }
 
@@ -135,10 +113,7 @@ fn isolated_emitters_are_recovered_with_calibrated_errors() {
 fn crowded_fields_are_recovered_with_mixtures() {
     let (h, w, sigma) = (128, 128, 1.2);
     let mut rng = Rng(2026);
-    // Widths spread +-20%, so free widths admitting the narrowest; with one
-    // fixed width, mixtures split the wider emitters. Floors a few points
-    // under what is achieved; the old joint model held (0.97, 0.98), (0.86,
-    // 0.97) and (0.84, 0.97) here.
+    // Widths spread +-20%, so free widths admitting the narrowest.
     {
         let s = Settings { fit_mixtures: true, width: (0.75, f64::INFINITY), ..Settings::new(sigma) };
         for (density, rec_min, prec_min) in [(0.005, 0.95, 0.96), (0.015, 0.85, 0.96), (0.03, 0.82, 0.94)] {
@@ -164,10 +139,8 @@ fn pure_noise_meets_the_false_positive_target() {
     }
     let expected = bs::FP_PER_MPX * (frames * h * w) as f64 / 1e6;
     println!("noise: {n} false emitters, {expected:.1} expected");
-    // `fp_per_mpx` bounds the peaks of a continuous Gaussian field. Lattice
-    // sampling lowers the count for narrow PSFs; Poisson skew at low counts
-    // and frame edges raise it. Hold it within a factor of 2, with 3 sd of
-    // Poisson slack.
+    // The rate is for a continuous field: lattice sampling, Poisson skew
+    // and frame edges move it. Within a factor of 2, with 3 sd of slack.
     let (lo, hi) = (expected / 2.0, 2.0 * expected);
     assert!(n as f64 >= lo - 3.0 * lo.sqrt() && n as f64 <= hi + 3.0 * hi.sqrt(), "{n} vs {expected}");
 }

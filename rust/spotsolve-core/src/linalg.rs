@@ -1,8 +1,6 @@
-//! Small dense symmetric-positive-definite linear algebra, f64.
-//!
-//! [`Chol`] reuses storage for LM steps and inverse-diagonal estimates.
-//! Inputs are symmetrized as `(A + A^T)/2` before lower-triangle factorization
-//! so rounding differences between triangles do not affect the choice.
+//! Cholesky factorization of small dense symmetric positive-definite
+//! matrices, with reusable storage. Inputs are symmetrized as `(A + A^T) / 2`
+//! first, so rounding differences between the triangles do not matter.
 
 /// A Cholesky factorization `A = L L^T`, with reusable storage.
 ///
@@ -66,17 +64,6 @@ impl Chol {
         true
     }
 
-    #[inline]
-    pub fn n(&self) -> usize {
-        self.n
-    }
-
-    /// Largest `n*n` this instance can factorize without reallocating.
-    #[inline]
-    pub fn capacity(&self) -> usize {
-        self.l.len()
-    }
-
     /// Grow so that an `n x n` factorization fits. A no-op when it already does.
     ///
     /// Call before [`Chol::factor`], which asserts capacity instead of growing.
@@ -88,37 +75,11 @@ impl Chol {
         }
     }
 
-    /// Solve `A x = b` by forward then back substitution.
-    pub fn solve(&self, b: &[f64], x: &mut [f64]) {
-        debug_assert!(self.ok);
-        let n = self.n;
-        debug_assert_eq!(b.len(), n);
-        debug_assert_eq!(x.len(), n);
-        // L y = b
-        for i in 0..n {
-            let mut sum = b[i];
-            for k in 0..i {
-                sum -= self.l[i * n + k] * x[k];
-            }
-            x[i] = sum / self.l[i * n + i];
-        }
-        // L^T x = y
-        for i in (0..n).rev() {
-            let mut sum = x[i];
-            for k in (i + 1)..n {
-                sum -= self.l[k * n + i] * x[k];
-            }
-            x[i] = sum / self.l[i * n + i];
-        }
-    }
-
     /// `diag(A^-1)` into `out`.
     ///
     /// `A^-1 = L^-T L^-1`, so `(A^-1)_ii = sum_k (L^-1)_ki^2` -- the inverse of
     /// the triangular factor is enough and the full inverse is never formed.
     /// `scratch` is resized to `n*n` and used for `L^-1`.
-    ///
-    /// Used for final uncertainties, outside the LM inner loop.
     pub fn inv_diag(&self, out: &mut [f64], scratch: &mut Vec<f64>) {
         debug_assert!(self.ok);
         let n = self.n;
@@ -147,9 +108,7 @@ impl Chol {
         }
     }
 
-    /// Solve `A x = b` with `b` overwritten in place.
-    ///
-    /// Reuses the LM step buffer without allocating a second right-hand side.
+    /// Solve `A x = v`, `v` overwritten by `x`.
     pub fn solve_in_place(&self, v: &mut [f64]) {
         self.forward_in_place(v);
         self.back_in_place(v);

@@ -4,32 +4,14 @@
 //! position and flux errors against the reported variances; bounds, masked
 //! pixels and two-component recovery, at one width and at each its own.
 
+mod common;
+
+use common::Rng;
 use spotsolve_core::fit::{Fitter, Layout, Window};
 
-/// Deterministic LCG; Knuth's Poisson method is fine for the means here.
-struct Rng(u64);
-
-impl Rng {
-    fn uni(&mut self) -> f64 {
-        self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-        ((self.0 >> 11) as f64 + 0.5) / (1u64 << 53) as f64
-    }
-
-    fn poisson(&mut self, lam: f64) -> f64 {
-        let l = (-lam).exp();
-        let (mut k, mut p) = (0.0, 1.0);
-        loop {
-            p *= self.uni();
-            if p <= l {
-                return k;
-            }
-            k += 1.0;
-        }
-    }
-}
 
 const SIGMA: f64 = 1.45;
-/// `ceil(4 sigma)`: u-track's window half-width.
+/// `ceil(4 sigma)`: the window's half-side.
 const HALF: usize = 6;
 const SIDE: usize = 2 * HALF + 1;
 

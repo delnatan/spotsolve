@@ -6,7 +6,7 @@ linking.
 | Guide | Contents |
 |---|---|
 | [Building and distribution](BUILDING.md) | Platform wheels, CI checks, source builds and releases |
-| [Detection](DETECTION.md) | The model, the algorithm and its departures from u-track, the threshold, validation and limits |
+| [Detection](DETECTION.md) | The model, the algorithm, the threshold, performance and limits |
 | [Localization quality](LOCALIZATION_QUALITY.md) | Flags, uncertainties, `z`, and how to choose cuts |
 | [Tracking](TRACKING.md) | Motion model, assignment, parameters, benchmarks and limits |
 
@@ -19,7 +19,7 @@ with reusable worker storage. There is no nested thread pool.
 | Component | Python | Rust core |
 |---|---|---|
 | Detection | `src/spotsolve/native.py` | `detect.rs` (seeds, windows, decisions), `prefilter.rs` (screen, threshold), `fit.rs` (window fit) |
-| Shared PSF, filters, algebra | Native bindings | `psf.rs`, `filters.rs`, `linalg.rs`, `statistics.rs` |
+| Shared PSF, filters, algebra | Native bindings | `psf.rs`, `filters.rs`, `linalg.rs`, `render.rs` |
 | Tables and results | `src/spotsolve/loctable.py`, `results.py` | — |
 | Tracking | `src/spotsolve/tracking.py` | `track.rs`, `lap.rs` |
 
@@ -44,7 +44,7 @@ against enumeration. Fixtures under `tests/fixtures` are frozen.
 Benchmark runners:
 
 - `scripts/benchmark_detection.py`: recall, precision, pairs and noise on
-  seeded scenarios; reports from different versions compare directly.
+  seeded scenarios.
 - `scripts/benchmark_detector_speed.py`: real-stack timing and output
   fingerprints.
 

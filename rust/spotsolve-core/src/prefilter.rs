@@ -1,4 +1,5 @@
-//! Where to fit: u-track's significance mask, LoG seeds and mask labels.
+//! Where to fit: a significance mask, LoG seeds and mask labels, after
+//! u-track.
 //!
 //! 1. **Score.** At every pixel, regress the window `[-R, R]^2`, `R =
 //!    ceil(4 sigma)`, on one pixel-integrated PSF `g` and a constant:
@@ -11,25 +12,20 @@
 //!    z = A |g - gbar| / sqrt(phi c0),    c0 = mean of d over the window
 //!    ```
 //!
-//!    u-track instead takes the noise from the window's residual and tests
-//!    `A > k sigma_res` with a Welch t. A neighbour inside the window
-//!    inflates that residual and hides the spot in crowded areas; here the
-//!    noise comes from the Poisson model and the frame's measured `phi`.
-//! 2. **Mask.** Pixels with `z >= z_min`.
+//!    The noise comes from the Poisson model, not the window's residual,
+//!    so a neighbour in the window does not hide a spot.
+//! 2. **Mask.** Pixels whose score at some width of a bank reaches that
+//!    width's bar.
 //! 3. **Seeds.** Local maxima of the negative Laplacian of Gaussian over a
-//!    `2 ceil(sigma) + 1` square, inside the mask. u-track's RefineMaskLoG
-//!    is left out: it admitted maxima the residual-based test had hidden,
-//!    which the score above does not hide, and on noise it multiplies the
-//!    seeds.
+//!    `2 ceil(sigma) + 1` square, inside the mask.
 //! 4. **Labels.** 8-connected components of the mask. A seed's fit leaves
 //!    out the pixels of other components.
 //!
-//! [`threshold`] sets the score a false emitter must reach from the expected
-//! false emitters per 10^6 pixels of noise.
+//! [`threshold`] sets the bar from the expected false emitters per 10^6
+//! pixels of noise.
 
-use crate::filters::{self, Mode};
+use crate::filters;
 use crate::psf;
-use crate::statistics;
 use std::f64::consts::PI;
 
 /// The result of screening a frame, all row-major `h x w`.
@@ -47,6 +43,9 @@ pub struct Screen {
     pub seeds: Vec<usize>,
 }
 
+/// The median of chi-squared with one degree of freedom, `Phi^-1(0.75)^2`.
+pub const CHI2_1_MEDIAN: f64 = 0.454_936_423_119_572_8;
+
 /// Lowest mean a score's variance is taken at, in ADU.
 pub const LEVEL_FLOOR: f64 = 1e-3;
 
@@ -56,7 +55,7 @@ pub fn psf_kernel1d(sigma: f64) -> Vec<f64> {
     let r = (4.0 * sigma).ceil() as isize;
     let t: Vec<f64> = (-r..=r).map(|v| v as f64).collect();
     let mut k = vec![0.0; t.len()];
-    psf::shape_axis(&t, &[0.0], sigma, &mut k);
+    psf::shape_axis(&t, 0.0, sigma, &mut k);
     k
 }
 
@@ -177,9 +176,9 @@ pub fn screen(d: &[f64], h: usize, w: usize, sigma: f64, phi: f64, bank: &[(f64,
             *m |= v >= bar;
         }
     }
-    let neg_log: Vec<f64> = filters::gaussian_laplace(d, h, w, sigma, Mode::Reflect).into_iter().map(|v| -v).collect();
+    let neg_log: Vec<f64> = filters::gaussian_laplace(d, h, w, sigma).into_iter().map(|v| -v).collect();
     let size = 2 * sigma.ceil() as usize + 1;
-    let local_max = filters::maximum_filter(&neg_log, h, w, size, Mode::Reflect);
+    let local_max = filters::maximum_filter(&neg_log, h, w, size);
     let seeds = maxima(&neg_log, &local_max, &mask, roi);
     let labels = label(&mask, h, w);
     Screen { z, amplitude, background, mask, labels, seeds }
@@ -251,13 +250,8 @@ pub fn threshold(fp_per_mpx: f64, lo: f64, hi: f64) -> f64 {
 ///
 /// Variance and mean come from the same pixels with the same weights, so a
 /// background that varies across the frame, or an emitter's light, raises
-/// both alike; an emitter's curvature adds to `b` alone, and can only raise
-/// `phi`. A mean over a wider square would spread an emitter's light past
-/// the pixels its variance reaches and lower `phi`, by 16% in a field of
-/// 0.02 emitters per px^2. Noise in `mbar` raises `phi` by about `0.07 phi /
-/// m` (4% at 2 photons per pixel). A median of the frame as the mean would
-/// be shifted by skewed or integer counts, and taken from other pixels than
-/// the variance.
+/// both alike; an emitter's curvature adds to `b` alone and can only raise
+/// `phi`. Noise in `mbar` raises `phi` by about `0.07 phi / m`.
 ///
 /// Frames too small to filter are taken as Poisson.
 pub fn dispersion(d: &[f64], h: usize, w: usize) -> f64 {
@@ -266,21 +260,15 @@ pub fn dispersion(d: &[f64], h: usize, w: usize) -> f64 {
     }
     const K: [f64; 5] = [1.0, -4.0, 6.0, -4.0, 1.0];
     const K2: [f64; 5] = [1.0 / 70.0, 16.0 / 70.0, 36.0 / 70.0, 16.0 / 70.0, 1.0 / 70.0];
-    let sep = |k: &[f64]| {
-        let (mut a, mut b) = (vec![0.0; h * w], vec![0.0; h * w]);
-        filters::convolve1d(d, &mut a, h, w, k, 0, Mode::Reflect);
-        filters::convolve1d(&a, &mut b, h, w, k, 1, Mode::Reflect);
-        b
-    };
-    let (b, m) = (sep(&K), sep(&K2));
+    let (b, m) = (filters::separable(d, h, w, &K, &K), filters::separable(d, h, w, &K2, &K2));
     let ratio: Vec<f64> = (2..h - 2)
         .flat_map(|r| (2..w - 2).map(move |c| r * w + c))
         .map(|i| b[i] * b[i] / m[i].max(LEVEL_FLOOR))
         .collect();
-    median(&ratio) / (statistics::CHI2_1_MEDIAN * 70.0 * 70.0)
+    median(&ratio) / (CHI2_1_MEDIAN * 70.0 * 70.0)
 }
 
-pub(crate) fn median(v: &[f64]) -> f64 {
+fn median(v: &[f64]) -> f64 {
     let mut s = v.to_vec();
     s.sort_by(f64::total_cmp);
     let n = s.len();
@@ -388,6 +376,12 @@ mod tests {
             .collect();
         let phi = dispersion(&d, h, w);
         assert!((phi - 1.0).abs() < 0.04, "phi {phi}");
+    }
+
+    #[test]
+    fn half_the_chi2_1_mass_lies_below_its_median() {
+        // P(chi2_1 <= m) = erf(sqrt(m / 2)).
+        assert!((libm::erf((CHI2_1_MEDIAN / 2.0).sqrt()) - 0.5).abs() < 1e-15);
     }
 
     #[test]

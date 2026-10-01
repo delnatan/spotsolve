@@ -10,7 +10,7 @@
 //! `used` are left out of the likelihood, as u-track sets them to NaN.
 //! `theta = [c0, A_1, y_1, x_1, (s_1), ..., A_k, y_k, x_k, (s_k)]`: each
 //! component's width is its own parameter, or one fixed width for all
-//! ([`Layout`]). With free widths this is [`psf::pack_var`]'s layout.
+//! ([`Layout`]).
 //!
 //! [`Fitter::fit`] minimizes `I` by bounded Levenberg-Marquardt (Fisher
 //! scoring) with Coleman-Li affine scaling: parameters stay strictly inside
@@ -188,8 +188,8 @@ impl Fitter {
         for i in 0..k {
             let (q, s) = (lay.at(i), lay.sigma(theta, i));
             let (ry, rx) = (i * rows..(i + 1) * rows, i * cols..(i + 1) * cols);
-            psf::factors_axis_sigma(&self.ay, &theta[q + 1..q + 2], s, &mut self.ey[ry.clone()], &mut self.dey[ry.clone()], &mut self.sey[ry]);
-            psf::factors_axis_sigma(&self.ax, &theta[q + 2..q + 3], s, &mut self.ex[rx.clone()], &mut self.dex[rx.clone()], &mut self.sex[rx]);
+            psf::factors_axis_sigma(&self.ay, theta[q + 1], s, &mut self.ey[ry.clone()], &mut self.dey[ry.clone()], &mut self.sey[ry]);
+            psf::factors_axis_sigma(&self.ax, theta[q + 2], s, &mut self.ex[rx.clone()], &mut self.dex[rx.clone()], &mut self.sex[rx]);
         }
         self.m.clear();
         self.m.resize(rows * cols, theta[0]);

@@ -158,7 +158,7 @@ fn detect_localize_stack<'py>(
 /// `background` plus every emitter at its own width, truncated at
 /// `truncate` of its sigma.
 #[pyfunction]
-#[pyo3(signature = (positions, amplitudes, sigmas, background, truncate=4.0))]
+#[pyo3(signature = (positions, amplitudes, sigmas, background, truncate=spotsolve_core::render::RENDER_TRUNCATE))]
 fn detect_render(
     py: Python<'_>,
     positions: PyReadonlyArray2<'_, f64>,

@@ -38,11 +38,8 @@ error and motion blur are measurements to make on the tracks afterwards.
 
 `max_step` trades broken tracks against identity switches. About three times
 the rms step of the fastest particles of interest is a good start. For a
-2-D Brownian step, that rms step is `sqrt(4 D dt + 4 se^2)`. On simulated
-movies the switch rate and track continuity are flat between 2.5 and 3
-times the rms step. At 2 times, true links are lost (recovery 0.955 → 0.938
-in the GEM-like regime). At 4 times, dense fields gain switches (15 → 18 per
-100 links).
+2-D Brownian step, that rms step is `sqrt(4 D dt + 4 se^2)`. Much smaller
+loses true links; much larger adds switches where particles are dense.
 
 `max_step` is required and is not estimated from the movie. An estimate from
 the linked steps is circular: a wider radius admits wrong links, and those

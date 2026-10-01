@@ -82,12 +82,11 @@ The frame is screened by a Poisson score test, seeds are placed at local
 maxima, and each seed's window is fitted with a constant level and
 pixel-integrated Gaussians. A spot is kept only if it gains `u^2/2` nats of
 likelihood, `u` solved so that pure noise gives `fp_per_mpx` false spots per
-10^6 pixels; measured rates are 13-17 at the default. Light wider than the
+10^6 pixels. Light wider than the
 reported widths is fitted as out-of-focus background and counted in
 `info["out_of_focus"]`. Use `fit_mixtures=True` wherever spots come closer
-than about `4 sigma`: single fits are biased by a neighbour's light and
-cannot separate pairs. See [detection](docs/DETECTION.md) for the method,
-its departures from u-track and their measurements.
+than about `6 sigma`: single fits are biased by a neighbour's light and
+cannot separate pairs. See [detection](docs/DETECTION.md) for the method.
 
 The ROI restricts seeding and crops work to its bounding box plus context;
 fitted positions can lie outside it. Use one mask covering the desired area,
@@ -103,11 +102,11 @@ the default except for single-frame `localize`.
 On a 10-core Apple M5, real 256x256 GEM frames (about 205 spots per frame
 single, 550 with mixtures; best of three runs):
 
-| Workload | Single fits | Mixtures | 0.3.0 joint model |
-|---|---:|---:|---:|
-| First five frames, serial | 0.09 s | 1.19 s | 8.26 s |
-| First five frames, five workers | 0.02 s | 0.30 s | 2.15 s |
-| All 49 frames, ten workers | 0.16 s | 1.90 s | 13.3 s |
+| Workload | Single fits | Mixtures |
+|---|---:|---:|
+| First five frames, serial | 0.09 s | 1.19 s |
+| First five frames, five workers | 0.02 s | 0.30 s |
+| All 49 frames, ten workers | 0.16 s | 1.90 s |
 
 ## Choose a detection width
 
@@ -128,13 +127,13 @@ Many fits at the lower bound mean `sigma` is set too wide; to admit
 narrower fits, lower `width[0]`, at the cost of a slightly stricter
 threshold. Many at the upper bound mean it is set too narrow. To report
 defocused emitters too, raise `width[1]` (up to about 2); more haze is
-then reported as emitters. `width=(1, 1)` fixes every width at `sigma`, as u-track does: a
-little more recall when spots really are all in focus, but wider spots are
-split in two by mixtures.
+then reported as emitters. `width=(1, 1)` fixes every width at `sigma`: a
+little more recall when spots really are all in focus, but mixtures split
+wider spots in two.
 
 ## Link detections
 
-For a compact filtering workflow for either detector, see the
+For filtering, see the
 [localization-quality guide](docs/LOCALIZATION_QUALITY.md).
 
 ```python

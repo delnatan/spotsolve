@@ -44,16 +44,10 @@ Flags can coexist. Test individual bits with `result.flags & int(spotsolve.FitFl
 | `AT_BOUND` | 16 | A fitted level, flux or position is within numerical tolerance of an optimization bound |
 
 The edge flag uses pixel boundaries at -0.5 and size-0.5, independently of
-reference width or ROI boundaries. A Gaussian has infinite tails; three
-sigmas is the stated finite-support convention, not a proof of failure.
-Bound tolerance is `1e-6 * (1 + abs(bound))` plus twice the optimizer's
-strict-interiority margin (`1e-10` of the parameter range). A bound-limited fit is constrained
-by the allowed model; it is not evidence that an object is biologically too
-wide or bright. A width at its lower bound, `width[0] * sigma`, is not
-flagged: that is the in-focus width, where an in-focus emitter belongs,
-and about half of them fit there (an in-focus spot narrower than `sigma`
-by noise). Flagging it marked 40% of isolated emitters and 57-77% in
-fields.
+the ROI. Bound tolerance is `1e-6 * (1 + abs(bound))` plus twice the
+optimizer's interior margin (`1e-10` of the parameter range). A width at its
+lower bound, `width[0] * sigma`, is not flagged: that is the in-focus width,
+where in-focus emitters belong.
 
 Each emitter carries the convergence flags of its window's final fit, which
 apply to every component of that window. Non-convergence and missing
@@ -63,10 +57,8 @@ covariance are separate: finite SEs do not imply convergence.
 
 SEs use the expected Fisher information of the emitter's final window fit,
 every component, width and the window's level free, scaled by the frame's
-dispersion. They are local model approximations; bounds, low counts, overlap
-with light outside the window and PSF mismatch can invalidate coverage. On
-simulated isolated and crowded fields, position errors are within about 10%
-of the reported SEs.
+dispersion. They are local approximations; bounds, low counts, light from
+outside the window and PSF mismatch can invalidate coverage.
 
 `z` (table column; `result.info["z"]`) is each emitter's
 `sqrt(2 * likelihood ratio)`: what removing it, the rest of its window

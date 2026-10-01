@@ -10,9 +10,8 @@
 //!
 //! The rest are the layers it is built from: [`psf`] (the
 //! pixel-integrated Gaussian and its derivatives), [`linalg`] (Cholesky),
-//! [`filters`] (`scipy.ndimage`'s filters, matched exactly), [`render`]
-//! (model images) and [`statistics`]. The linker is [`track`], on the exact
-//! assignment in [`lap`].
+//! [`filters`] (`scipy.ndimage`'s filters) and [`render`] (model images).
+//! The linker is [`track`], on the exact assignment in [`lap`].
 //!
 //! # Portability
 //!
@@ -31,5 +30,4 @@ pub mod linalg;
 pub mod prefilter;
 pub mod psf;
 pub mod render;
-pub mod statistics;
 pub mod track;

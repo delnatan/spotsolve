@@ -1,10 +1,6 @@
-//! Loader for the golden fixtures in `tests/fixtures/*.json`. They are
-//! frozen: their generator no longer exists. Every float there is emitted at
-//! 17 significant digits, so it round-trips f64 exactly and the early layers
-//! can be compared bit for bit.
-//!
-//! Each fixture's own `compare` field states how exactly that layer can be
-//! reproduced.
+//! Shared by the layer tests: the golden fixtures in `tests/fixtures/*.json`
+//! (frozen; floats at 17 significant digits, so they round-trip f64), and a
+//! deterministic random source.
 
 #![allow(dead_code)]
 
@@ -37,11 +33,6 @@ impl Fixture {
             .as_array()
             .expect("fixture has no `cases` array")
     }
-    /// The fixture's own statement of how exactly this layer reproduces.
-    /// Printed on failure so the tolerance and its reasoning stay together.
-    pub fn compare(&self) -> &str {
-        self.root["compare"].as_str().unwrap_or("")
-    }
 }
 
 pub fn f64_at(v: &Value, key: &str) -> f64 {
@@ -52,12 +43,6 @@ pub fn usize_at(v: &Value, key: &str) -> usize {
     v[key]
         .as_u64()
         .unwrap_or_else(|| panic!("`{key}` is not an integer")) as usize
-}
-
-pub fn bool_at(v: &Value, key: &str) -> bool {
-    v[key]
-        .as_bool()
-        .unwrap_or_else(|| panic!("`{key}` is not a bool"))
 }
 
 pub fn vec_at(v: &Value, key: &str) -> Vec<f64> {
@@ -89,8 +74,7 @@ pub fn mat_at(v: &Value, key: &str) -> (usize, usize, Vec<f64>) {
     (nr, nc, data)
 }
 
-/// JSON has no NaN or Infinity, so the fixture encoder wrote them as the bare
-/// strings Python's `json` produces. Accept both.
+/// A number, or NaN / Infinity written as strings (JSON has neither).
 fn num(v: &Value) -> f64 {
     if let Some(x) = v.as_f64() {
         return x;
@@ -103,8 +87,6 @@ fn num(v: &Value) -> f64 {
     }
 }
 
-// ----------------------------------------------------------------- asserts
-
 #[track_caller]
 pub fn assert_rel(got: f64, want: f64, tol: f64, what: &str) {
     let scale = want.abs().max(1.0);
@@ -115,17 +97,7 @@ pub fn assert_rel(got: f64, want: f64, tol: f64, what: &str) {
     );
 }
 
-#[track_caller]
-pub fn assert_abs(got: f64, want: f64, tol: f64, what: &str) {
-    let err = (got - want).abs();
-    assert!(
-        err <= tol,
-        "{what}: got {got:.17e}, want {want:.17e}, abs err {err:.3e} > {tol:.3e}"
-    );
-}
-
-/// Elementwise relative comparison, reporting the worst entry rather than the
-/// first -- when a whole Jacobian is wrong, the worst one localizes the bug.
+/// Elementwise relative comparison, reporting the worst entry.
 #[track_caller]
 pub fn assert_all_rel(got: &[f64], want: &[f64], tol: f64, what: &str) {
     assert_eq!(
@@ -151,4 +123,28 @@ pub fn assert_all_rel(got: &[f64], want: &[f64], tol: f64, what: &str) {
         worst.1,
         tol
     );
+}
+
+/// An LCG: deterministic across platforms.
+pub struct Rng(pub u64);
+
+impl Rng {
+    /// Uniform on (0, 1).
+    pub fn uni(&mut self) -> f64 {
+        self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        ((self.0 >> 11) as f64 + 0.5) / (1u64 << 53) as f64
+    }
+
+    /// Knuth's product method, for means up to a few hundred.
+    pub fn poisson(&mut self, lam: f64) -> f64 {
+        let l = (-lam).exp();
+        let (mut k, mut p) = (0.0, 1.0);
+        loop {
+            p *= self.uni();
+            if p <= l {
+                return k;
+            }
+            k += 1.0;
+        }
+    }
 }

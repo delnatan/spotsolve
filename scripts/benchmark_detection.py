@@ -1,6 +1,4 @@
-"""Score a detector on seeded simulated scenarios and write a JSON report.
-
-Detector-agnostic, so reports from different releases compare directly:
+"""Score the detector on seeded simulated scenarios and write a JSON report.
 
 - iso: isolated emitters by flux; recall, precision, rms error, error/SE;
 - pairs: equal pairs by separation in sigma; both resolved, detections per pair;
@@ -10,8 +8,6 @@ Detector-agnostic, so reports from different releases compare directly:
     python scripts/benchmark_detection.py mixtures --out report.json
 
 `single` and `mixtures` run `localize` without and with `fit_mixtures`.
-`joint` and `aguet` run the 0.3.0 API (its joint model and its spotfitlm
-port): install a 0.3.0 wheel to reproduce those reports.
 """
 
 import argparse
@@ -31,15 +27,8 @@ SHAPE = (128, 128)
 
 
 def detector(name, **kw):
-    if name == "joint":
-        return lambda f: spotsolve.localize(f, SIGMA, images=False, **kw)
-    if name == "aguet":
-        return lambda f: spotsolve.localize_aguet(f, SIGMA, **kw)
-    if name == "single":
-        return lambda f: spotsolve.localize(f, SIGMA, images=False, **kw)
-    if name == "mixtures":
-        return lambda f: spotsolve.localize(f, SIGMA, images=False, fit_mixtures=True, **kw)
-    raise ValueError(name)
+    return lambda f: spotsolve.localize(f, SIGMA, images=False,
+                                        fit_mixtures=name == "mixtures", **kw)
 
 
 def render(positions, fluxes, shape=SHAPE, bg=BG):
@@ -158,7 +147,7 @@ def noise(det, rng, frames):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("detector", choices=("joint", "aguet", "single", "mixtures"))
+    ap.add_argument("detector", choices=("single", "mixtures"))
     ap.add_argument("--frames", type=int, default=8)
     ap.add_argument("--seed", type=int, default=20261001)
     ap.add_argument("--kw", default="{}", help="JSON keyword arguments for the detector")

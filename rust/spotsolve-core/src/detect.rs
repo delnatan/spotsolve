@@ -10,32 +10,24 @@
 //! 3. Each seed's window ([`crate::fit`]), `ceil(4 sigma)` px around it, holds a
 //!    constant level and pixel-integrated Gaussian components; pixels of
 //!    other mask components are left out. A component is kept if adding it
-//!    gains `u^2 / 2` nats, `2 (I_k - I_k+1) / phi >= u^2`, where `u` is
-//!    calibrated.
-//!    - Alone (u-track's default), one component starts at the seed and its
-//!      centre is held within [`CONFINE`] widths of it.
-//!    - With mixtures (u-track's `FitMixtures`), components are added where
-//!      the efficient score peaks ([`propose`]) while each refit gains as
-//!      much, then the weakest is removed while removing it, the rest
-//!      refitted, costs less. The seed only centres the window: every
-//!      source of light in it takes a component, so a neighbour is a
-//!      nuisance parameter rather than a bias. u-track instead confines
-//!      components to 2 sigma, and the light of a neighbour farther off
-//!      then drags the fit.
+//!    gains `u^2 / 2` nats, `2 (I_k - I_k+1) / phi >= u^2`.
+//!    - Alone, one component starts at the seed and its centre is held
+//!      within [`CONFINE`] widths of it.
+//!    - With mixtures, components are added where the efficient score
+//!      peaks ([`propose`]) while each refit gains as much, then the
+//!      weakest is removed while removing it, the rest refitted, costs
+//!      less. Every source of light in the window takes a component, so a
+//!      neighbour is a nuisance parameter rather than a bias.
 //! 4. Each component is reported by the fit of the seed nearest to it
-//!    ([`owned`]), so fits from neighbouring seeds seldom report an emitter
-//!    twice (u-track merges copies within a fixed radius instead), and only those
-//!    are tested for removal. A component held at a position bound is not
-//!    reported. Two fits can still each place one emitter on their own
-//!    seed's side; such copies are merged ([`merge`]).
-//! 5. Every component has its own width, so a wider emitter is one
-//!    component rather than two. Emitters are reported in `width * sigma`
-//!    (by default [`WIDTH`]); the tests search width as well as
-//!    position, and `u` is set for that search ([`prefilter::false_rate`]).
-//!    A component may widen past the band to the window's half-side as
-//!    out-of-focus light (defocused emitters, haze), which narrower
-//!    components would otherwise split up; it is counted, not reported.
-//!    Equal bounds fix the width, as u-track does.
+//!    ([`owned`]), and only those are tested for removal; copies of one
+//!    emitter from two fits are merged ([`merge`]). A component held at a
+//!    position bound is not reported.
+//! 5. Every component has its own width. Emitters are reported in `width *
+//!    sigma` (by default [`WIDTH`]), and `u` is set for a search over
+//!    position and width ([`prefilter::false_rate`]). A component may widen
+//!    past that to the window's half-side as out-of-focus light, which
+//!    narrower components would otherwise split; it is counted, not
+//!    reported. Equal bounds fix the width.
 //! 6. Standard errors from the reported fit's Fisher information, scaled by
 //!    `phi`.
 
@@ -48,12 +40,9 @@ use crate::psf;
 pub const BANK_STEP: f64 = 1.5;
 /// Default expected false emitters per 10^6 noise pixels.
 pub const FP_PER_MPX: f64 = 16.0;
-/// Default reported widths, multiples of `sigma`. An in-focus emitter fits
-/// near `sigma`; defocus widens it, and by `sqrt(2) sigma` its peak has
-/// halved, the edge of the PSF's axial FWHM. The bound sits a little above
-/// that so a `sigma` set slightly narrow keeps in-focus emitters. A window
-/// that sees only part of wider light (haze, a defocused blob) fits it with
-/// components of `1.5-2 sigma`; above the bound they are out-of-focus light.
+/// Default reported widths, multiples of `sigma`: from the in-focus width
+/// to a little past `sqrt(2) sigma`, where defocus has halved the peak (the
+/// edge of the PSF's axial FWHM).
 pub const WIDTH: (f64, f64) = (1.0, 1.5);
 /// Widths: the fit window's half-side, `ceil(WINDOW * sigma)` px.
 pub const WINDOW: f64 = 4.0;
@@ -250,11 +239,8 @@ struct Fate {
 }
 
 /// `I(d, c)` of the used pixels for a constant level alone, at its minimum
-/// `c = mean(max(d, 0))`: `I` reads a pixel below the offset as 0 counts
-/// ([`crate::fit`]), so the fitted models do too. `mean(d)` there would
-/// leave the null above its minimum and add the difference to every first
-/// component's gain, as much as the bar itself at 1 photon of background
-/// and read noise 1.5.
+/// `c = mean(max(d, 0))`: `I` reads a pixel below the offset as 0 counts,
+/// as in the fitted models.
 fn level_divergence(win: &Window) -> f64 {
     let (n, sum) = win.d.iter().zip(&win.used).filter(|p| *p.1).fold((0.0, 0.0), |(n, s), (d, _)| (n + 1.0, s + d.max(0.0)));
     let c = (sum / n).max(prefilter::LEVEL_FLOOR);
@@ -303,12 +289,10 @@ impl Bounds {
 ///
 /// `U`, `I` the new flux's score and information at the template `k1`, `b`
 /// its cross-information with `theta`, `F` and `g` theta's information and
-/// objective gradient. A component that widened over an unfound neighbour
-/// leaves little of it in the residual (`U` small), but the projection
-/// leaves as little of the neighbour's information (`I_eff`), and `z` finds
-/// it. The joint Newton step from there gives the new flux and moves the
-/// rest. Returns that start, `theta` extended; `None` if no score is
-/// positive.
+/// objective gradient. The projection finds a neighbour that a fitted
+/// component has partly absorbed. The joint Newton step from there gives
+/// the new flux and moves the rest. Returns that start, `theta` extended;
+/// `None` if no score is positive.
 fn propose(win: &Window, fitter: &mut Fitter, theta: &[f64], lay: Layout, k1: &[f64], (y0, y1, x0, x1): (f64, f64, f64, f64)) -> Option<Vec<f64>> {
     let (rows, cols, n) = (win.rows, win.cols, lay.n());
     let p = rows * cols;
@@ -393,9 +377,8 @@ fn fit_seed(d: &[f64], h: usize, w: usize, sc: &Screen, seed: usize, at: &[bool]
     let win = Window::new(rows, cols, wd, used);
     let dmax = win.d.iter().zip(&win.used).filter(|p| *p.1).fold(1.0f64, |m, (&v, _)| m.max(v));
     let (cy, cx) = ((sy - y0) as f64, (sx - x0) as f64);
-    // Alone, a component is held near its seed, as u-track holds it. In a
-    // mixture every source of light in the window takes a component, the
-    // seed's neighbours as nuisance parameters, so the box is the window.
+    // Alone, a component is held near its seed; in a mixture anywhere in
+    // the window.
     let reach = CONFINE * s.sigma;
     // Reported widths are `[w_lo, w_hi]`; a component may widen to the
     // window's half-side, and is out-of-focus light beyond `w_hi`.
@@ -426,10 +409,9 @@ fn fit_seed(d: &[f64], h: usize, w: usize, sc: &Screen, seed: usize, at: &[bool]
     let mut div = null;
 
     // Forward: each new component where the efficient score peaks.
-    let mut gains: Vec<f64> = Vec::new();
     let mut fit = None;
-    while gains.len() < max_k {
-        let k = gains.len();
+    let mut k = 0;
+    while k < max_k {
         // Alone, the component starts at its seed. In a mixture the seed
         // only centres the window: every component, the first too, starts
         // where the efficient score peaks, and ownership decides which are
@@ -461,7 +443,7 @@ fn fit_seed(d: &[f64], h: usize, w: usize, sc: &Screen, seed: usize, at: &[bool]
             fate.unconfined = k == 0;
             break;
         }
-        gains.push(gain);
+        k += 1;
         div = f.divergence;
         theta = f.theta.clone();
         fit = Some(f);
@@ -470,7 +452,7 @@ fn fit_seed(d: &[f64], h: usize, w: usize, sc: &Screen, seed: usize, at: &[bool]
         fate.weak = !fate.unconfined;
         return fate;
     };
-    fate.added = gains.len() - 1;
+    fate.added = k - 1;
 
     // Backward: the cost of removing each component this seed reports,
     // the rest refitted. The others are its neighbours' to test.
@@ -792,10 +774,7 @@ pub(crate) mod tests {
     fn an_isolated_emitter_is_found_once_where_it_is() {
         let (h, w, sigma) = (41, 43, 1.2);
         let theta = [0.0, 1500.0, 19.3, 21.6, 1.3];
-        let (ay, ax) = (psf::local_axis(h), psf::local_axis(w));
-        let mut f = psf::Factors::new(h, w, 1);
-        let mut d = vec![0.0; h * w];
-        psf::model_var_sigma_ax(&theta, &ay, &ax, None, &mut f, &mut d);
+        let mut d = psf::model(&theta, h, w);
         // Gaussian noise at the Poisson variance on a background of 10.
         for (v, z) in d.iter_mut().zip(normals(h * w, 11)) {
             *v += 10.0;
