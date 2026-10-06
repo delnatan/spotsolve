@@ -1,9 +1,10 @@
 """Link localization tables frame to frame, preserving all input rows.
 
-Between consecutive frames, links minimize the summed squared displacement,
-with each track end costing `max_step`^2 (Crocker & Grier 1996). No step
-longer than `max_step` is linked; a missed frame ends a track. See
-docs/TRACKING.md for the model and its validation.
+Each track predicts its next step from its own diffusion coefficient,
+inferred from its steps so far, so immobile, slow and fast particles in one
+movie are linked on their own scales. No step longer than `max_step` is
+linked; a missed frame ends a track. See docs/TRACKING.md for the model and
+its validation.
 """
 
 import numpy as np
@@ -17,7 +18,7 @@ except ImportError as error:          # pragma: no cover - build problem
 
 __all__ = ["link", "LINK_COLUMNS"]
 
-LINK_COLUMNS = ("frame", "y", "x")
+LINK_COLUMNS = ("frame", "y", "x", "se_y", "se_x")
 """Columns the linker reads."""
 
 
@@ -26,9 +27,10 @@ def link(locs, max_step):
 
     `max_step` is the largest distance, in the table's position units
     (pixels for `loctable` output), a particle may move between consecutive
-    frames. About three times the rms step of the fastest particles of
-    interest is a good start: smaller breaks their tracks, larger admits
-    more identity switches where particles are dense.
+    frames: about three times the rms step of the fastest particles of
+    interest. A larger value costs slow particles little, because each
+    track is held to its own step size. `se_y` and `se_x` are each
+    detection's localization errors in the same units.
 
     The result is the input with one `UInt32` column added, in the input's
     row order; a `track_id` column already present is replaced. Every row
@@ -49,6 +51,8 @@ def link(locs, max_step):
     frame = np.ascontiguousarray(locs["frame"].to_numpy(), dtype=np.int64)
     pos = np.ascontiguousarray(
         np.stack([locs["y"].to_numpy(), locs["x"].to_numpy()], axis=1), dtype=float)
-    ids = _rs.track_link(frame, pos, max_step)
+    err = np.ascontiguousarray(
+        np.stack([locs["se_y"].to_numpy(), locs["se_x"].to_numpy()], axis=1), dtype=float)
+    ids = _rs.track_link(frame, pos, err, max_step)
     return locs.drop([c for c in ("track_id",) if c in locs.columns]).with_columns(
         pl.Series("track_id", ids, dtype=pl.UInt32))

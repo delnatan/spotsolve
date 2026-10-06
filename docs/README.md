@@ -38,8 +38,11 @@ cargo test --release --workspace --manifest-path rust/Cargo.toml
 `layer3_fit.rs` holds the window fit to finite differences and its errors to
 the reported covariance; `layer7_localize.rs` holds the detector to recall,
 precision and error calibration on simulated fields and to its
-false-positive rate on noise. Tracking tests check each frame's assignment
-against enumeration. Fixtures under `tests/fixtures` are frozen.
+false-positive rate on noise. `lap.rs` checks the assignment against
+enumeration; `track.rs` checks what the linker reads from the movie against
+truth, and `tests/test_tracking.py` holds it to Crocker & Grier's best radius
+per mobility class on simulated movies. Fixtures under `tests/fixtures` are
+frozen.
 
 Benchmark runners:
 

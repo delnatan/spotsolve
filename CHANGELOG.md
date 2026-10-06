@@ -1,5 +1,22 @@
 # Changelog
 
+## Unreleased
+
+The linker is rebuilt for movies that mix mobilities; see
+[tracking](docs/TRACKING.md). Breaking API change.
+
+- Each track predicts its next step from its own diffusion coefficient,
+  a posterior over a log grid from its linked steps, and a new track starts
+  from its spot's occupancy in the surrounding frames. A link's gain is the
+  log step density over the cost of an end, `lambda = (1 - q)^2 rho / q`.
+- The detector gap, the continuation fraction `q` and the density `rho` are
+  read from the movie without links. `max_step` is the only setting.
+- The linker runs forward and on the reversed movie and keeps the links
+  both make, so reversing a movie gives the same links.
+- `link` now also reads `se_y` and `se_x`.
+- Removed: Crocker & Grier's least squared displacement as the linker; it
+  remains the reference in the tests.
+
 ## 0.4.0 (2026-10-01)
 
 The detector is rebuilt after u-track's `pointSourceDetection`; see

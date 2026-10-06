@@ -1,8 +1,8 @@
 # spotsolve
 
 Emitter localization for fluorescence images, after u-track's
-`pointSourceDetection`, with frame-to-frame trajectory linking by least
-squared displacement. Each spot is fitted on its own window; with
+`pointSourceDetection`, with frame-to-frame trajectory linking in which
+each track moves on its own diffusion scale. Each spot is fitted on its own window; with
 `fit_mixtures`, overlapping spots are fitted jointly. Every decision is a
 Poisson likelihood ratio at one threshold, set by an expected number of
 false spots. Detection and fitting run in Rust, with movie frames processed
@@ -158,12 +158,14 @@ tracks.select("track_id", "frame", "y", "x")
 long = tracks.filter(pl.len().over("track_id") >= 4)
 ```
 
-Between consecutive frames, links minimize the summed squared displacement,
-and ending a track costs `max_step`². No step longer than `max_step` is
-linked; about three times the rms step of the fastest particles of interest
-is a good start. The result is the input table plus `track_id`, in the same
-row order. A missed detection ends a track. See [tracking](docs/TRACKING.md)
-for the model, how to choose `max_step`, and validation.
+Each track predicts its next step from its own diffusion coefficient,
+inferred from its steps so far, so immobile, slow and fast particles in one
+movie are each linked on their own scale. `max_step` is the largest step
+considered: about three times the rms step of the fastest particles of
+interest. The linker also reads `se_y` and `se_x`; everything else it needs
+is measured from the movie. The result is the input table plus `track_id`,
+in the same row order. A missed detection ends a track. See
+[tracking](docs/TRACKING.md) for the model and validation.
 
 ## Development
 
