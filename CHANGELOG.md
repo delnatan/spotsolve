@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.5.0 (2026-10-06)
 
 The linker is rebuilt for movies that mix mobilities; see
 [tracking](docs/TRACKING.md). Breaking API change.

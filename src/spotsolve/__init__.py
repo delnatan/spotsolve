@@ -27,7 +27,7 @@ from .native import (  # noqa: F401
 from .results import FitFlag, Localizations  # noqa: F401
 from .tracking import link  # noqa: F401
 
-__version__ = "0.4.0"
+__version__ = "0.5.0"
 
 __all__ = [
     "localize",
