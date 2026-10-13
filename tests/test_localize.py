@@ -22,7 +22,7 @@ def _sim(seed, density=0.034, spread=0.2, **kw):
 # Widths are lognormal with sd 0.2-0.4, many wider than the default band,
 # so the band is opened to its cap. Floors five points under what is achieved.
 @pytest.mark.parametrize("seed,density,spread,recall,precision",
-                         [(17, 0.015, 0.4, 0.894, 0.977),
+                         [(17, 0.015, 0.4, 0.894, 0.913),
                           (18, 0.034, 0.2, 0.785, 0.966),
                           (19, 0.055, 0.4, 0.558, 0.950)])
 def test_crowded_fields_hold_their_recall_and_precision(seed, density, spread,
@@ -115,23 +115,23 @@ def test_roi_confines_the_search():
     assert part.info["seeds"] < 0.6 * full.info["seeds"]
 
 
-def test_stack_is_frame_by_frame_and_thread_count_free():
+def test_stack_shares_one_bar_and_is_thread_count_free():
     stack = np.stack([_sim(s).image for s in (17, 18, 19, 20, 21)])
     one = L.localize_stack(stack, sigma=SIGMA, n_threads=1)
     many = L.localize_stack(stack, sigma=SIGMA, n_threads=3)
-    for t, (a, b) in enumerate(zip(one, many)):
-        single = L.localize(stack[t], sigma=SIGMA)
-        for r in (a, b):
-            np.testing.assert_array_equal(r.positions, single.positions)
-            np.testing.assert_array_equal(r.amplitudes, single.amplitudes)
-            np.testing.assert_array_equal(r.se, single.se)
-            np.testing.assert_array_equal(r.flags, single.flags)
-            np.testing.assert_array_equal(r.info["z"], single.info["z"])
+    for a, b in zip(one, many):
+        for key in ("positions", "amplitudes", "se", "flags"):
+            np.testing.assert_array_equal(getattr(a, key), getattr(b, key))
+        np.testing.assert_array_equal(a.info["z"], b.info["z"])
+        assert a.info["u"] == one[0].info["u"]
+        assert np.all(a.info["z"] >= a.info["u"])
+        assert np.all(a.info["p_real"] >= L.P_REAL)
         assert a.model_image is None and a.residual is None
-    with_images = L.localize_stack(stack[:1], sigma=SIGMA,
-                                   images=True)[0]
-    np.testing.assert_allclose(with_images.model_image,
-                               L.localize(stack[0], sigma=SIGMA).model_image)
+    # A frame alone is a movie of one.
+    alone = L.localize(stack[0], sigma=SIGMA)
+    first = L.localize_stack(stack[:1], sigma=SIGMA, images=True)[0]
+    np.testing.assert_array_equal(first.positions, alone.positions)
+    np.testing.assert_allclose(first.model_image, alone.model_image)
 
 
 def test_the_roi_crop_is_invisible_to_the_roi():

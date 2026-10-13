@@ -1,12 +1,15 @@
 //! Spot detection in ADU above the camera offset, after u-track's
 //! `pointSourceDetection` (Aguet et al. 2013, *Dev. Cell* 26:279).
 //!
-//! 1. Dispersion `phi` from the frame ([`prefilter::dispersion`]); the
-//!    threshold `u` from `fp_per_mpx` ([`prefilter::threshold`]).
-//! 2. Seeds: LoG maxima where the Poisson score of one emitter, at some
-//!    width of a small bank, reaches the least a real emitter at `u` can
-//!    show on that grid of positions and widths ([`bank`]), with the mask's
-//!    labels ([`prefilter::screen`]).
+//! The movie sets the bar `u` on every decision ([`localize_stack`]): each
+//! frame's seeds are fitted alone at [`posterior::CANDIDATE`], and `u` is
+//! the least root likelihood ratio from which an emitter is real, not
+//! noise, with probability `p_real` ([`Posterior`]). Each frame is then:
+//!
+//! 1. Dispersion `phi` from the frame ([`prefilter::dispersion`]).
+//! 2. Seeds: LoG maxima where the Poisson score of one emitter reaches
+//!    [`posterior::CANDIDATE`], with the mask's labels
+//!    ([`prefilter::screen`]).
 //! 3. Each seed's window ([`crate::fit`]), `ceil(4 sigma)` px around it, holds a
 //!    constant level and pixel-integrated Gaussian components; pixels of
 //!    other mask components are left out. A component is kept if adding it
@@ -23,23 +26,23 @@
 //!    emitter from two fits are merged ([`merge`]). A component held at a
 //!    position bound is not reported.
 //! 5. Every component has its own width. Emitters are reported in `width *
-//!    sigma` (by default [`WIDTH`]), and `u` is set for a search over
+//!    sigma` (by default [`WIDTH`]); the null of `u` is that of a search over
 //!    position and width ([`prefilter::false_rate`]). A component may widen
 //!    past that to the window's half-side as out-of-focus light, which
 //!    narrower components would otherwise split; it is counted, not
-//!    reported. Equal bounds fix the width.
+//!    reported, once it is [`WIDER`] standard errors wider than the bound,
+//!    and is otherwise an emitter held at the bound. Equal bounds fix the
+//!    width.
 //! 6. Standard errors from the reported fit's Fisher information, scaled by
 //!    `phi`.
 
 use crate::fit::{Fitter, Layout, Window};
+use crate::posterior::{self, Posterior};
 use crate::prefilter::{self, Screen};
 use crate::psf;
 
-/// Ratio of neighbouring widths in the seed [`bank`]: a maximum midway
-/// between two keeps 98% of its score.
-pub const BANK_STEP: f64 = 1.5;
-/// Default expected false emitters per 10^6 noise pixels.
-pub const FP_PER_MPX: f64 = 16.0;
+/// Default least probability that a reported emitter is real, not noise.
+pub const P_REAL: f64 = 0.9;
 /// Default reported widths, multiples of `sigma`: from the in-focus width
 /// to a little past `sqrt(2) sigma`, where defocus has halved the peak (the
 /// edge of the PSF's axial FWHM).
@@ -63,12 +66,19 @@ pub const FIT_TOL: f64 = 1e-3;
 pub const FIT_MAX_ITER: usize = 100;
 /// px: the widest an emitter is reported, half the window's half-side `R`.
 /// One centred in its window then keeps at least `erf(sqrt 2)^2 = 91%` of
-/// its light inside. A component may widen to `R` itself: wider than this
-/// it is out-of-focus light, fitted so that narrower components need not
-/// explain it, and returned as background.
+/// its light inside. A component may widen to `R` itself: [`WIDER`] than
+/// the reported widths it is out-of-focus light, fitted so that narrower
+/// components need not explain it, and returned as background.
 pub fn widest(sigma: f64) -> f64 {
     0.5 * (WINDOW * sigma).ceil()
 }
+
+/// Standard errors by which a component's width must exceed the reported
+/// widths for it to be out-of-focus light rather than an emitter at the
+/// upper bound: a one-sided test, so an emitter on the bound is taken for
+/// out-of-focus light in `Phi(-2) = 2.3%` of frames, and one inside it
+/// fewer. A point estimate alone would drop half of those on the bound.
+pub const WIDER: f64 = 2.0;
 
 /// Widths: two reports from different windows closer than this, each the
 /// other window's nearest component, are one emitter fitted twice
@@ -92,8 +102,9 @@ pub const EDGE: f64 = 3.0;
 pub struct Settings {
     /// In-focus PSF width, px.
     pub sigma: f64,
-    /// Expected false emitters per 10^6 noise pixels; sets `u`.
-    pub fp_per_mpx: f64,
+    /// Least probability that a reported emitter is real, not noise; sets
+    /// `u`.
+    pub p_real: f64,
     /// Widths a component may take, as multiples of `sigma`. Equal bounds
     /// fix every width, as u-track does; the upper one is capped at
     /// [`widest`].
@@ -105,7 +116,7 @@ pub struct Settings {
 
 impl Settings {
     pub fn new(sigma: f64) -> Self {
-        Self { sigma, fp_per_mpx: FP_PER_MPX, width: WIDTH, fit_mixtures: false, max_mixtures: MAX_MIXTURES }
+        Self { sigma, p_real: P_REAL, width: WIDTH, fit_mixtures: false, max_mixtures: MAX_MIXTURES }
     }
 
     fn radius(&self) -> usize {
@@ -137,6 +148,9 @@ pub struct Output {
     /// removing it with the rest of its window refitted, `sqrt(2 (I_without
     /// - I) / phi)`; at least `u`.
     pub z: Vec<f64>,
+    /// `N`: the probability each emitter is real, not noise, from its `z`
+    /// ([`Posterior`]); at least `p_real`.
+    pub p_real: Vec<f64>,
     /// `N`: the fitted level of each emitter's window.
     pub fitted_background: Vec<f64>,
     /// Scalar dispersion: pixel variance per unit of signal.
@@ -144,6 +158,7 @@ pub struct Output {
     /// `H*W`: the screening level (the window regression's constant); NaN
     /// outside the processed crop.
     pub background: Vec<f64>,
+    /// The movie's bar on `z`, where `P(real | z)` reaches `p_real`.
     pub u: f64,
     pub n_seeds: usize,
     /// Seeds whose emitter fell short of `u`, or left its confinement.
@@ -163,42 +178,9 @@ pub struct Output {
     pub seed: Vec<f64>,
     /// `2S`: every seed, global `(y, x)`.
     pub seeds: Vec<f64>,
-    /// Components wider than the reported widths, fitted as out-of-focus
-    /// light and returned as background.
+    /// Components [`WIDER`] than the reported widths, fitted as
+    /// out-of-focus light and returned as background.
     pub out_of_focus: usize,
-}
-
-/// Correlation of the scores of two unit pixel-integrated profiles of
-/// widths `a` and `b` at one centre: `2 sqrt(va vb) / (va + vb)`, `v = s^2 +
-/// 1/12` their variances.
-fn width_correlation(a: f64, b: f64) -> f64 {
-    let (va, vb) = (a * a + 1.0 / 12.0, b * b + 1.0 / 12.0);
-    2.0 * (va * vb).sqrt() / (va + vb)
-}
-
-/// The least fraction of an emitter's peak score the pixel grid can lose:
-/// the score field's correlation half a pixel off in y and in x. Its
-/// covariance is the profile correlated with itself, a Gaussian of
-/// variance `2 (s^2 + 1/12)` per axis, so the correlation at offset `r` is
-/// `exp(-r^2 / (4 (s^2 + 1/12)))`.
-pub fn seed_factor(s: f64) -> f64 {
-    (-0.5 / (4.0 * (s * s + 1.0 / 12.0))).exp()
-}
-
-/// Widths `[lo, hi]` sampled geometrically, neighbours at most [`BANK_STEP`]
-/// apart, each with its bar: `u` less what the pixel grid and the gap to
-/// the next width can lose of a maximum ([`seed_factor`],
-/// [`width_correlation`] at the gap's geometric middle). The mask's seeds
-/// are then the sampled maxima above `u` of the field the test searches,
-/// the count [`prefilter::false_rate`] calibrates. A lower bar admits more
-/// maxima of the refitted likelihood ratio than the field has, and with
-/// them false emitters; it gains no power that a higher `fp_per_mpx` does
-/// not.
-pub fn bank(lo: f64, hi: f64, u: f64) -> Vec<(f64, f64)> {
-    let n = ((hi / lo).ln() / BANK_STEP.ln()).ceil().max(0.0) as i32;
-    let step = if n > 0 { (hi / lo).powf(1.0 / n as f64) } else { 1.0 };
-    let gap = width_correlation(1.0, step.sqrt()).min(width_correlation(lo, lo * step.sqrt()));
-    (0..=n).map(|i| lo * step.powi(i)).map(|s| (s, u * seed_factor(s) * gap)).collect()
 }
 
 /// One emitter as fitted, in crop coordinates.
@@ -381,7 +363,7 @@ fn fit_seed(d: &[f64], h: usize, w: usize, sc: &Screen, seed: usize, at: &[bool]
     // the window.
     let reach = CONFINE * s.sigma;
     // Reported widths are `[w_lo, w_hi]`; a component may widen to the
-    // window's half-side, and is out-of-focus light beyond `w_hi`.
+    // window's half-side, and is out-of-focus light [`WIDER`] than `w_hi`.
     let (w_lo, w_hi) = s.widths();
     let w_fit = if w_lo >= w_hi { (w_lo, w_lo) } else { (w_lo, r as f64) };
     let b = Bounds {
@@ -521,18 +503,40 @@ fn fit_seed(d: &[f64], h: usize, w: usize, sc: &Screen, seed: usize, at: &[bool]
             fate.others += 1;
             continue;
         }
-        if lay.sigma(&theta, j) > w_hi {
-            fate.out_of_focus += 1;
-            continue;
-        }
-        // A reported width on a bound is on its floor, the in-focus width,
-        // where an in-focus emitter belongs: not flagged.
+        let mut cost_j = cost[j].expect("an owned component's cost");
+        // Wider than the reported widths, a component is out-of-focus light
+        // only if it is [`WIDER`] standard errors wide of `w_hi`: holding
+        // it there, the rest refitted, costs `WIDER^2 / 2` nats. Otherwise
+        // it is an emitter at `w_hi`, if it still gains the bar.
+        let held = if lay.sigma(&theta, j) > w_hi {
+            let (lo, mut hi) = b.of(lay);
+            hi[q + 3] = w_hi;
+            let mut start = theta.clone();
+            start[q + 3] = w_hi;
+            let f = fitter.fit(&win, &start, lay, &lo, &hi, FIT_MAX_ITER, tol);
+            let excess = f.divergence - div;
+            if excess >= WIDER * WIDER * phi / 2.0 || cost_j - excess < bar || f.at_bound[q + 1] || f.at_bound[q + 2] || !mine(&f.theta, j) {
+                fate.out_of_focus += 1;
+                continue;
+            }
+            cost_j -= excess;
+            let v = fitter.variances(&win, &f.theta, lay, phi).filter(|v| v.iter().all(|&v| v > 0.0));
+            Some((f, v))
+        } else {
+            None
+        };
+        let (theta, at_bound, var) = match &held {
+            Some((f, v)) => (&f.theta, &f.at_bound, v),
+            None => (&theta, &fit.at_bound, &var),
+        };
+        // A reported width on its floor, the in-focus width, is where an
+        // in-focus emitter belongs: not flagged. One held at `w_hi` is.
         let mut flags = common;
-        if (q..q + 3).any(|p| fit.at_bound[p]) {
+        if (q..q + 3).any(|p| at_bound[p]) || held.is_some() {
             flags |= FLAG_BOUND;
         }
         let (mut se, mut se_s) = ([f64::NAN; 3], f64::NAN);
-        match &var {
+        match var {
             Some(v) => {
                 for (i, p) in (q..q + 3).enumerate() {
                     se[i] = v[p].sqrt();
@@ -547,11 +551,11 @@ fn fit_seed(d: &[f64], h: usize, w: usize, sc: &Screen, seed: usize, at: &[bool]
             y: theta[q + 1] + y0 as f64,
             x: theta[q + 2] + x0 as f64,
             a: theta[q],
-            s: lay.sigma(&theta, j),
+            s: lay.sigma(theta, j),
             se,
             se_s,
             c: theta[0],
-            z: (2.0 * cost[j].expect("an owned component's cost") / phi).sqrt(),
+            z: (2.0 * cost_j / phi).sqrt(),
             flags,
             seed,
             window: 0,
@@ -620,6 +624,20 @@ fn merge(spots: &mut Vec<Spot>, fates: &[Fate], w: usize, reach: f64) -> usize {
 }
 
 impl Output {
+    /// Keep the emitters at or above `u`; those below are weak seeds.
+    fn above(mut self, u: f64) -> Self {
+        let keep: Vec<bool> = self.z.iter().map(|&z| z >= u).collect();
+        fn take<T: Copy>(v: &[T], keep: &[bool], k: usize) -> Vec<T> {
+            v.chunks(k).zip(keep).filter(|p| *p.1).flat_map(|p| p.0.iter().copied()).collect()
+        }
+        self.weak += keep.iter().filter(|&&k| !k).count();
+        (self.pos, self.seed, self.se) = (take(&self.pos, &keep, 2), take(&self.seed, &keep, 2), take(&self.se, &keep, 3));
+        (self.amp, self.sig, self.se_sig, self.z) = (take(&self.amp, &keep, 1), take(&self.sig, &keep, 1), take(&self.se_sig, &keep, 1), take(&self.z, &keep, 1));
+        (self.flags, self.fitted_background, self.mixture) = (take(&self.flags, &keep, 1), take(&self.fitted_background, &keep, 1), take(&self.mixture, &keep, 1));
+        self.u = u;
+        self
+    }
+
     fn tally(&mut self, fate: &Fate) {
         self.weak += fate.weak as usize;
         self.unconfined += fate.unconfined as usize;
@@ -648,16 +666,16 @@ fn roi_crop(roi: &[bool], h: usize, w: usize, s: &Settings) -> Option<[usize; 4]
     Some([y0.saturating_sub(m), (y1 + m).min(h), x0.saturating_sub(m), (x1 + m).min(w)])
 }
 
-/// Localize an offset-subtracted frame in ADU. An ROI limits seeds; the
-/// work runs on its bounding box plus the context [`roi_crop`] gives.
+/// Localize an offset-subtracted frame in ADU, a movie of one frame
+/// ([`localize_stack`]). An ROI limits seeds; the work runs on its bounding
+/// box plus the context [`roi_crop`] gives.
 pub fn localize(d: &[f64], h: usize, w: usize, roi: Option<&[bool]>, s: &Settings) -> Output {
-    localize_with(d, h, w, roi, s, &mut Fitter::default())
+    localize_raw(d, h, w, 0.0, roi, s)
 }
 
-fn localize_with(d: &[f64], h: usize, w: usize, roi: Option<&[bool]>, s: &Settings, fitter: &mut Fitter) -> Output {
+/// One frame at the bar `u`.
+fn localize_with(d: &[f64], h: usize, w: usize, roi: Option<&[bool]>, s: &Settings, u: f64, fitter: &mut Fitter) -> Output {
     assert_eq!(d.len(), h * w);
-    let (w_lo, w_hi) = s.widths();
-    let u = prefilter::threshold(s.fp_per_mpx, w_lo, w_hi);
     let [r0, r1, c0, c1] = match roi {
         None => [0, h, 0, w],
         Some(m) => match roi_crop(m, h, w, s) {
@@ -670,7 +688,7 @@ fn localize_with(d: &[f64], h: usize, w: usize, roi: Option<&[bool]>, s: &Settin
     let dc = cut(d);
     let rc: Option<Vec<bool>> = roi.map(|m| (r0..r1).flat_map(|r| m[r * w + c0..r * w + c1].iter().copied()).collect());
     let phi = prefilter::dispersion(&dc, ch, cw);
-    let sc = prefilter::screen(&dc, ch, cw, s.sigma, phi, &bank(w_lo, w_hi, u), rc.as_deref());
+    let sc = prefilter::screen(&dc, ch, cw, s.sigma, phi, posterior::CANDIDATE, rc.as_deref());
     let mut out = Output { dispersion: phi, u, n_seeds: sc.seeds.len(), ..Output::default() };
     out.seeds = sc.seeds.iter().flat_map(|&i| [(i / cw + r0) as f64, (i % cw + c0) as f64]).collect();
     let k1 = prefilter::psf_kernel1d(s.sigma);
@@ -711,12 +729,14 @@ fn localize_with(d: &[f64], h: usize, w: usize, roi: Option<&[bool]>, s: &Settin
 
 /// Localize one raw frame using `d = raw - offset` in ADU.
 pub fn localize_raw(raw: &[f64], h: usize, w: usize, offset: f64, roi: Option<&[bool]>, s: &Settings) -> Output {
-    let d: Vec<f64> = raw.iter().map(|&r| r - offset).collect();
-    localize(&d, h, w, roi, s)
+    localize_stack(raw, 1, h, w, offset, roi, s, 1).pop().expect("one frame")
 }
 
-/// Localize every frame of a stack on `n_threads` workers, in frame order.
-/// `raw` is `n*H*W`; each frame goes through [`localize_raw`].
+/// Localize every frame of a stack, `d = raw - offset` in ADU, on
+/// `n_threads` workers, in frame order. `raw` is `n*H*W`. The bar `u` is
+/// the movie's: every frame's candidates, fitted alone above
+/// [`posterior::CANDIDATE`], set `P(real | z)` ([`Posterior`]), and each
+/// frame is then fitted at the `u` where it reaches `p_real`.
 #[allow(clippy::too_many_arguments)]
 pub fn localize_stack(
     raw: &[f64],
@@ -729,10 +749,27 @@ pub fn localize_stack(
     n_threads: usize,
 ) -> Vec<Output> {
     assert_eq!(raw.len(), n * h * w);
-    crate::frames::map(n, n_threads, Fitter::default, |t, fitter| {
-        let d: Vec<f64> = raw[t * h * w..(t + 1) * h * w].iter().map(|&r| r - offset).collect();
-        localize_with(&d, h, w, roi, s, fitter)
-    })
+    let frame = |t: usize| -> Vec<f64> { raw[t * h * w..(t + 1) * h * w].iter().map(|&r| r - offset).collect() };
+    let alone = Settings { fit_mixtures: false, ..*s };
+    let candidates = crate::frames::map(n, n_threads, Fitter::default, |t, fitter| {
+        localize_with(&frame(t), h, w, roi, &alone, posterior::CANDIDATE, fitter)
+    });
+    let area = n as f64 * roi.map_or((h * w) as f64, |m| m.iter().filter(|&&v| v).count() as f64);
+    let (w_lo, w_hi) = s.widths();
+    let heights: Vec<f64> = candidates.iter().flat_map(|o| o.z.iter().copied()).collect();
+    let post = Posterior::fit(&heights, area, w_lo, w_hi);
+    let u = post.cut(s.p_real);
+    // Fitted alone, the frames' emitters are their candidates above `u`;
+    // mixtures refit every frame at `u`.
+    let mut out = if s.fit_mixtures {
+        crate::frames::map(n, n_threads, Fitter::default, |t, fitter| localize_with(&frame(t), h, w, roi, s, u, fitter))
+    } else {
+        candidates.into_iter().map(|o| o.above(u)).collect()
+    };
+    for o in &mut out {
+        o.p_real = o.z.iter().map(|&z| post.p_real(z)).collect();
+    }
+    out
 }
 
 #[cfg(test)]
@@ -790,5 +827,32 @@ pub(crate) mod tests {
         assert!((o.amp[0] - 1500.0).abs() < 3.0 * o.se[0], "A {}", o.amp[0]);
         assert!((o.sig[0] - 1.3).abs() < 3.0 * o.se_sig[0], "sigma {}", o.sig[0]);
         assert!(o.z[0] >= o.u);
+    }
+
+    /// An emitter on the upper reported width is reported in all but about
+    /// `Phi(-WIDER)` of frames, however its fitted width falls; a bright
+    /// one well wider is out-of-focus light.
+    #[test]
+    fn an_emitter_on_the_width_bound_is_reported_and_wider_light_is_not() {
+        let (h, w, sigma, n) = (31, 31, 1.2, 200);
+        let s = Settings::new(sigma);
+        let movie = |flux: f64, width: f64, seed: u64| {
+            let raw: Vec<f64> = (0..n as u64)
+                .flat_map(|i| {
+                    let mut d = psf::model(&[0.0, flux, 15.2, 14.7, width], h, w);
+                    for (v, z) in d.iter_mut().zip(normals(h * w, seed + i)) {
+                        *v += 10.0;
+                        *v += v.sqrt() * z;
+                    }
+                    d
+                })
+                .collect();
+            localize_stack(&raw, n, h, w, 0.0, None, &s, 4)
+        };
+        let reported = movie(250.0, s.widths().1, 100).iter().filter(|o| o.amp.len() == 1).count();
+        assert!(reported as f64 >= 0.95 * n as f64, "reported in {reported} of {n} frames");
+        let wide = movie(3000.0, 2.0 * s.widths().1, 7);
+        assert!(wide.iter().all(|o| o.amp.is_empty()), "wide light reported");
+        assert!(wide.iter().map(|o| o.out_of_focus).sum::<usize>() >= n, "wide light not fitted");
     }
 }

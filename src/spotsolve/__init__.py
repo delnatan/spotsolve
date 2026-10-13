@@ -1,9 +1,9 @@
 """Emitter localization and Brownian-motion LAP tracking for microscopy.
 
 `localize` / `localize_stack` follow u-track's pointSourceDetection: a
-Poisson significance screen, one window fit per seed, and a likelihood-ratio
-decision whose one knob, `fp_per_mpx`, is the expected false positives per
-10^6 noise pixels. `fit_mixtures=True` fits overlapping spots jointly.
+Poisson significance screen, one window fit per seed, and a decision whose
+one knob, `p_real`, is the least probability that a reported emitter is real
+rather than noise, fitted per movie. `fit_mixtures=True` fits overlapping spots jointly.
 Each returns `Localizations`; stack functions process frames in native workers.
 
     locs = localize(frame, sigma=1.45, offset=100)
@@ -18,7 +18,7 @@ frame to frame, by least squared displacement within a search radius.
 """
 
 from .native import (  # noqa: F401
-    FP_PER_MPX,
+    P_REAL,
     MAX_MIXTURES,
     WIDTH,
     localize,
@@ -35,7 +35,7 @@ __all__ = [
     "Localizations",
     "FitFlag",
     "link",
-    "FP_PER_MPX",
+    "P_REAL",
     "MAX_MIXTURES",
     "WIDTH",
     "__version__",

@@ -51,5 +51,5 @@ Benchmark runners:
 - `scripts/benchmark_detector_speed.py`: real-stack timing and output
   fingerprints.
 
-`scripts/localize_movie.py` exports results and accepts `--fp-per-mpx`,
+`scripts/localize_movie.py` exports results and accepts `--p-real`,
 `--mixtures` and `--threads`.

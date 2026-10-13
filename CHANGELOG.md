@@ -1,5 +1,31 @@
 # Changelog
 
+## Unreleased
+
+The detection bar is now Bayesian and set per movie. Breaking API change.
+
+- `fp_per_mpx` / `FP_PER_MPX` are replaced by `p_real` / `P_REAL` (default
+  0.9): the least probability that a reported emitter is real, not noise.
+  Every frame's spots, fitted alone at a low bar, give the density of
+  likelihood-ratio heights; the noise maxima's density is known from the
+  Euler-characteristic formula, and `P(real | z)` is the part it does not
+  explain (empirical Bayes, two groups). `u` is where that reaches
+  `p_real`, so it adapts to each movie; `localize` treats one frame as a
+  movie of one. Each report carries `info["p_real"]`, also a `p_real`
+  table column.
+- Seeds are placed at one fixed low bar on the score at `sigma`, a full
+  unit under every bar the posterior sets, so a maximum above `u` is no
+  longer lost for want of a seed. The width bank of seed bars is removed.
+- With single fits a movie is fitted once; with mixtures, once alone and
+  once at `u`.
+- On pure noise `u` rises to about 5: under 1 false emitter per 10^6
+  pixels in movies (16 before).
+- A component fitted wider than the reported widths is out-of-focus light
+  only if its width is 2 standard errors beyond the upper bound (holding it
+  there costs 2 nats); otherwise it is reported at the bound, flagged
+  `AT_BOUND`. Deciding on the fitted width alone dropped half of the
+  emitters on the bound, so particles near it vanished from frame to frame.
+
 ## 0.5.0 (2026-10-06)
 
 The linker is rebuilt for movies that mix mobilities; see

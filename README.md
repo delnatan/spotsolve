@@ -4,8 +4,8 @@ Emitter localization for fluorescence images, after u-track's
 `pointSourceDetection`, with frame-to-frame trajectory linking in which
 each track moves on its own diffusion scale. Each spot is fitted on its own window; with
 `fit_mixtures`, overlapping spots are fitted jointly. Every decision is a
-Poisson likelihood ratio at one threshold, set by an expected number of
-false spots. Detection and fitting run in Rust, with movie frames processed
+Poisson likelihood ratio at one bar, set per movie so that a reported spot
+is real, not noise, with a chosen probability. Detection and fitting run in Rust, with movie frames processed
 in parallel.
 
 ## Install
@@ -38,8 +38,8 @@ movie = spotsolve.localize_stack(stack, sigma=1.45, offset=100, n_threads=5)
 # Crowded spots: fit several emitters per window.
 locs = spotsolve.localize(frame, sigma=1.45, offset=100, fit_mixtures=True)
 
-# Stricter: 4 expected false emitters per 10^6 noise pixels instead of 16.
-locs = spotsolve.localize(frame, sigma=1.45, offset=100, fp_per_mpx=4)
+# Stricter: report only spots at least 99% likely to be real, not 90%.
+movie = spotsolve.localize_stack(stack, sigma=1.45, offset=100, p_real=0.99)
 ```
 
 Both return `Localizations` (one per frame for stacks):
@@ -55,14 +55,15 @@ Both return `Localizations` (one per frame for stacks):
 | `flags` | `(N,)` bitmask of `FitFlag` diagnostics; rows are retained |
 | `background` | Screening level map, NaN outside the processed crop |
 | `dispersion` | The frame's measured variance per unit signal |
-| `info` | `u`, per-emitter `z`, `fitted_background`, `seed`, `mixture`, and work counts |
+| `info` | `u`, per-emitter `z` and `p_real`, `fitted_background`, `seed`, `mixture`, and work counts |
 | `model_image`, `residual` | Optional diagnostic images |
 
 Flux and background use ADU above `offset`; divide flux by camera gain for
 photoelectrons. Uncertainties come from the expected Fisher information of
 each emitter's final window fit, scaled by the frame's dispersion; NaN if it
 cannot be computed. `info["z"]` is each emitter's `sqrt(2 * likelihood
-ratio)`, at least the threshold `info["u"]`. `peak` varies with width and
+ratio)`, at least the movie's bar `info["u"]`, and `info["p_real"]` its
+probability of being real rather than noise. `peak` varies with width and
 can exceed the brightest observed pixel when the emitter lies between
 pixels.
 
@@ -73,16 +74,19 @@ pixels.
 | `sigma` | required | In-focus PSF width, px |
 | `offset` | 0 | Camera offset, ADU |
 | `roi` | None | `(H, W)` bool mask of where seeds may be placed |
-| `fp_per_mpx` | 16 | Expected false emitters per 10^6 pixels of noise; lower is stricter |
-| `width` | `(1.0, 1.5)` | Reported widths, as multiples of `sigma`; wider light is fitted as out-of-focus background. The upper bound is capped near `2 sigma`. Equal bounds fix the width |
+| `p_real` | 0.9 | Least probability that a reported spot is real, not noise; higher is stricter |
+| `width` | `(1.0, 1.5)` | Reported widths, as multiples of `sigma`; light 2 standard errors wider is fitted as out-of-focus background, and an emitter less wide is reported at the upper bound. The upper bound is capped near `2 sigma`. Equal bounds fix the width |
 | `fit_mixtures` | False | Fit several emitters per window (u-track's FitMixtures) |
 | `max_mixtures` | 20 | Components per window at most |
 
 The frame is screened by a Poisson score test, seeds are placed at local
 maxima, and each seed's window is fitted with a constant level and
 pixel-integrated Gaussians. A spot is kept only if it gains `u^2/2` nats of
-likelihood, `u` solved so that pure noise gives `fp_per_mpx` false spots per
-10^6 pixels. Light wider than the
+likelihood. The movie sets `u`: every frame's spots, fitted alone at a low
+bar, have a density of `z` that noise alone explains only in part, and `u`
+is where the probability of being real reaches `p_real`. The bar therefore
+adapts to each movie, and a frame's result depends on the stack it is in;
+`localize` treats a frame as a movie of one. Light 2 standard errors wider than the
 reported widths is fitted as out-of-focus background and counted in
 `info["out_of_focus"]`. Use `fit_mixtures=True` wherever spots come closer
 than about `6 sigma`: single fits are biased by a neighbour's light and
@@ -99,14 +103,14 @@ native frame workers. Results stay in frame order and are identical across
 worker counts. `images=False` avoids returning model/residual images; it is
 the default except for single-frame `localize`.
 
-On a 10-core Apple M5, real 256x256 GEM frames (about 205 spots per frame
-single, 550 with mixtures; best of three runs):
+On a 10-core Apple M5, real 256x256 GEM frames (about 240 spots per frame
+single, 555 with mixtures; best of three runs):
 
 | Workload | Single fits | Mixtures |
 |---|---:|---:|
-| First five frames, serial | 0.09 s | 1.19 s |
-| First five frames, five workers | 0.02 s | 0.30 s |
-| All 49 frames, ten workers | 0.16 s | 1.90 s |
+| First five frames, serial | 0.11 s | 1.20 s |
+| First five frames, five workers | 0.03 s | 0.30 s |
+| All 49 frames, ten workers | 0.19 s | 1.91 s |
 
 ## Choose a detection width
 

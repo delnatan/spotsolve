@@ -1,9 +1,8 @@
 //! `localize` against truth: simulated fields and pure noise.
 //!
 //! The detector's contract is statistical: recall, precision and position
-//! error on Poisson fields with known emitters, and the false-positive rate
-//! `fp_per_mpx` promises on noise. Floors sit a few points under what the
-//! detector achieves.
+//! error on Poisson fields with known emitters, and no emitters on noise.
+//! Floors sit a few points under what the detector achieves.
 
 mod common;
 
@@ -127,20 +126,15 @@ fn crowded_fields_are_recovered_with_mixtures() {
     }
 }
 
+/// On pure noise every candidate is a noise maximum: `P(real)` stays low,
+/// the bar rises to the top of the fitted range, and nothing is reported.
 #[test]
-fn pure_noise_meets_the_false_positive_target() {
+fn pure_noise_is_not_reported() {
     let (h, w, sigma, frames) = (256, 256, 1.2, 16);
-    let s = Settings::new(sigma);
     let mut rng = Rng(7);
-    let mut n = 0;
-    for _ in 0..frames {
-        let d: Vec<f64> = (0..h * w).map(|_| rng.poisson(20.0)).collect();
-        n += bs::localize(&d, h, w, None, &s).amp.len();
-    }
-    let expected = bs::FP_PER_MPX * (frames * h * w) as f64 / 1e6;
-    println!("noise: {n} false emitters, {expected:.1} expected");
-    // The rate is for a continuous field: lattice sampling, Poisson skew
-    // and frame edges move it. Within a factor of 2, with 3 sd of slack.
-    let (lo, hi) = (expected / 2.0, 2.0 * expected);
-    assert!(n as f64 >= lo - 3.0 * lo.sqrt() && n as f64 <= hi + 3.0 * hi.sqrt(), "{n} vs {expected}");
+    let raw: Vec<f64> = (0..frames * h * w).map(|_| rng.poisson(20.0)).collect();
+    let out = bs::localize_stack(&raw, frames, h, w, 0.0, None, &Settings::new(sigma), 4);
+    let n: usize = out.iter().map(|o| o.amp.len()).sum();
+    println!("noise: {n} reported, u = {:.2}", out[0].u);
+    assert!(n <= 2, "{n} reported at u = {}", out[0].u);
 }

@@ -1,7 +1,9 @@
 """Localization with the native detector, after u-track's pointSourceDetection.
 
-Frames are independent. An ROI restricts seeds; fitted centers may move
-outside it. The dispersion uses the available ROI context, so masked
+The bar on each emitter's likelihood ratio is set by the movie: the
+probability that an emitter of that ratio is real, not noise, is fitted to
+the candidates of every frame. An ROI restricts seeds; fitted centers may
+move outside it. The dispersion uses the available ROI context, so masked
 results can differ from full-frame results.
 """
 
@@ -14,19 +16,19 @@ from .results import Localizations
 
 try:
     import spotsolve_rs as _rs
-    if getattr(_rs, "DETECT_OUTPUT_VERSION", 0) != 6:
+    if getattr(_rs, "DETECT_OUTPUT_VERSION", 0) != 7:
         raise ImportError("incompatible localization output; rebuild spotsolve_rs")
 except ImportError as error:          # pragma: no cover - build problem
     raise ImportError(
         "spotsolve needs its bundled Rust extension; reinstall a compatible wheel "
         "or run `maturin develop --release` from the repository root") from error
 
-__all__ = ["localize", "localize_stack", "FP_PER_MPX", "MAX_MIXTURES", "WIDTH"]
+__all__ = ["localize", "localize_stack", "P_REAL", "MAX_MIXTURES", "WIDTH"]
 
-FP_PER_MPX = float(_rs.DETECT_FP_PER_MPX)
+P_REAL = float(_rs.DETECT_P_REAL)
+"""Default least probability that a reported emitter is real, not noise."""
 MAX_MIXTURES = int(_rs.DETECT_MAX_MIXTURES)
 WIDTH = tuple(float(v) for v in _rs.DETECT_WIDTH)
-"""Default expected false emitters per 10^6 pixels of pure noise."""
 
 
 def _positive_int(value, name):
@@ -50,12 +52,12 @@ def _roi(roi, shape):
     return roi
 
 
-def _kw(sigma, offset, roi, shape, fp_per_mpx, width, fit_mixtures, max_mixtures):
+def _kw(sigma, offset, roi, shape, p_real, width, fit_mixtures, max_mixtures):
     sigma = float(sigma)
     if not np.isfinite(sigma) or not 0 < sigma <= max(shape):
         raise ValueError("sigma must be positive, finite and no larger than the frame")
     return dict(sigma=sigma, offset=float(offset), roi=_roi(roi, shape),
-                fp_per_mpx=float(fp_per_mpx), width=tuple(map(float, width)),
+                p_real=float(p_real), width=tuple(map(float, width)),
                 fit_mixtures=bool(fit_mixtures),
                 max_mixtures=_positive_int(max_mixtures, "max_mixtures"))
 
@@ -64,7 +66,7 @@ def _result(out, raw, kw, images):
     pos, amp, sig, se, sig_se, flags, bmap, info = out
     dispersion = info.pop("dispersion")
     sigma = kw["sigma"]
-    info.update(method="detect", fp_per_mpx=kw["fp_per_mpx"], width=kw["width"],
+    info.update(method="detect", p_real_min=kw["p_real"], width=kw["width"],
                 fit_mixtures=kw["fit_mixtures"])
     model = residual = None
     if images:
@@ -77,7 +79,7 @@ def _result(out, raw, kw, images):
         model_image=model, residual=residual)
 
 
-def localize(frame, sigma, *, offset=0.0, roi=None, fp_per_mpx=FP_PER_MPX,
+def localize(frame, sigma, *, offset=0.0, roi=None, p_real=P_REAL,
              width=WIDTH, fit_mixtures=False, max_mixtures=MAX_MIXTURES,
              images=True):
     """Localize one frame. Returns `Localizations`.
@@ -95,11 +97,18 @@ def localize(frame, sigma, *, offset=0.0, roi=None, fp_per_mpx=FP_PER_MPX,
     upper bound is capped at half the window's half-side, about `2 sigma`).
     A component may widen beyond that to the window's half-side:
     out-of-focus light, fitted so narrower components need not split it,
-    counted in `info["out_of_focus"]` and not reported. Equal bounds fix the width. An emitter is kept if its
-    likelihood ratio against the level alone, in nats scaled by the frame's
-    measured dispersion, reaches `u^2 / 2`. `fp_per_mpx` sets `u`: the
-    expected number of false emitters per 10^6 pixels of noise, for a search
-    over position and width.
+    counted in `info["out_of_focus"]` and not reported, once its width is
+    2 standard errors beyond the upper bound; less wide, it is an emitter at
+    the bound, flagged `AT_BOUND`. Equal bounds fix the width.
+
+    An emitter is kept if it is real, not noise, with probability at least
+    `p_real`. The probability comes from its likelihood ratio against the
+    level alone, `z = sqrt(2 * ratio)` in nats scaled by the frame's
+    measured dispersion: candidates fitted alone above a low bar have a
+    density of `z` that noise alone, by theory, would give only in part,
+    and `P(real | z)` is the part noise does not explain. The emitter is
+    kept where `z >= u`, the bar at which that reaches `p_real`. A single
+    frame is a movie of one; `localize_stack` pools every frame.
 
     With `fit_mixtures`, after u-track's FitMixtures, a window takes more
     components: each next one where the residual's score peaks anywhere in
@@ -113,31 +122,33 @@ def localize(frame, sigma, *, offset=0.0, roi=None, fp_per_mpx=FP_PER_MPX,
     `6 sigma`; alone, a fit is biased by a neighbour's light.
 
     `info["z"]` is each emitter's `sqrt(2 * likelihood ratio)`, at least
-    `info["u"]`. Every emitter is returned with `FitFlag` diagnostics.
+    `info["u"]`; `info["p_real"]` its probability of being real, at least
+    `p_real`. Every emitter is returned with `FitFlag` diagnostics.
     `images=False` skips `model_image` and `residual`.
     """
     raw = np.ascontiguousarray(frame, dtype=float)
     if raw.ndim != 2:
         raise ValueError(f"expected a 2-D frame, got shape {raw.shape}")
-    kw = _kw(sigma, offset, roi, raw.shape, fp_per_mpx, width, fit_mixtures, max_mixtures)
+    kw = _kw(sigma, offset, roi, raw.shape, p_real, width, fit_mixtures, max_mixtures)
     return _result(_rs.detect_localize(raw, **kw), raw, kw, images)
 
 
-def localize_stack(stack, sigma, *, offset=0.0, roi=None, fp_per_mpx=FP_PER_MPX,
+def localize_stack(stack, sigma, *, offset=0.0, roi=None, p_real=P_REAL,
                    width=WIDTH, fit_mixtures=False, max_mixtures=MAX_MIXTURES,
                    n_threads=None, images=False):
     """Localize every frame of a `(T, H, W)` stack, in parallel.
 
-    Returns one `Localizations` per frame, in frame order, each what
-    `localize` returns for that frame; each frame's background and
-    dispersion are its own. `n_threads` defaults to the machine's cores.
+    Returns one `Localizations` per frame, in frame order. Each frame's
+    background and dispersion are its own; the bar `u` and `P(real | z)` are
+    the movie's, fitted to the candidates of every frame, so a frame's
+    result depends on the stack it is in. `n_threads` defaults to the machine's cores.
     `images` defaults to False here: for a long timecourse the model and
     residual are two more copies of the movie.
     """
     raw = np.ascontiguousarray(stack, dtype=float)
     if raw.ndim != 3:
         raise ValueError(f"expected a (T, H, W) stack, got shape {raw.shape}")
-    kw = _kw(sigma, offset, roi, raw.shape[1:], fp_per_mpx, width, fit_mixtures, max_mixtures)
+    kw = _kw(sigma, offset, roi, raw.shape[1:], p_real, width, fit_mixtures, max_mixtures)
     outs = _rs.detect_localize_stack(
         raw, **kw, n_threads=_positive_int((os.cpu_count() or 1) if n_threads is None else n_threads,
                                 "n_threads"))

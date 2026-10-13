@@ -63,8 +63,10 @@ outside the window and PSF mismatch can invalidate coverage.
 `z` (table column; `result.info["z"]`) is each emitter's
 `sqrt(2 * likelihood ratio)`: what removing it, the rest of its window
 refitted, costs, in standard-normal units. Every reported emitter has `z`
-at least the frame's threshold `result.info["u"]`; it ranks evidence, not
-precision.
+at least the movie's bar `result.info["u"]`; it ranks evidence, not
+precision. `p_real` (`result.info["p_real"]`) is the probability, from its
+`z` and the movie's heights, that the emitter is real rather than noise;
+`1 - p_real` summed over a table is its expected number of noise reports.
 
 ## Apply analysis-specific cuts afterwards
 

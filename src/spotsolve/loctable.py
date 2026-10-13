@@ -33,7 +33,8 @@ LOCALIZATION_SCHEMA = {
     "sigma_se": pl.Float64,
     "sigma_ratio": pl.Float64,  # fit_sigma / sigma
     "flags": pl.UInt8,
-    "z": pl.Float64,          # sqrt(2 * likelihood ratio); at least the frame's u
+    "z": pl.Float64,          # sqrt(2 * likelihood ratio); at least the movie's u
+    "p_real": pl.Float64,     # probability the emitter is real, not noise
 }
 
 FRAME_SCHEMA = {
@@ -77,6 +78,7 @@ def frame_tables(result, frame, t=0.0, pixel_size=1.0,
     se = np.asarray(result.se, float).reshape(-1, 3)
     n = len(amp)
     z = np.asarray(result.info.get("z", np.full(n, np.nan)), float)
+    p_real = np.asarray(result.info.get("p_real", np.full(n, np.nan)), float)
     background = result.info.get("fitted_background")
     if background is None:
         background = _sample_background(result.background, pos)
@@ -105,6 +107,7 @@ def frame_tables(result, frame, t=0.0, pixel_size=1.0,
             "sigma_se": np.asarray(result.sigma_se, float),
             "flags": np.asarray(result.flags, np.uint8),
             "z": z,
+            "p_real": p_real,
         },
         schema=LOCALIZATION_SCHEMA,
     )

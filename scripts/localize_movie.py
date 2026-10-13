@@ -1,7 +1,7 @@
 """Localize a movie and save all measurements and diagnostic flags.
 
     python localize_movie.py --frames 0 50 --out hyp7_all
-    python localize_movie.py --fp-per-mpx 4 --threads 5
+    python localize_movie.py --p-real 0.99 --threads 5
 """
 
 import argparse
@@ -48,7 +48,7 @@ def main(args):
     t0 = time.time()
     results = spotsolve.localize_stack(stack, sigma=args.sigma,
                                        offset=CAMERA_OFFSET,
-                                       fp_per_mpx=args.fp_per_mpx,
+                                       p_real=args.p_real,
                                        fit_mixtures=args.mixtures,
                                        n_threads=args.threads)
     dt = (time.time() - t0) / len(stack)
@@ -95,7 +95,7 @@ def main(args):
         "sigma_px": args.sigma,
         "camera_offset_adu": CAMERA_OFFSET,
         "pixel_size_um": args.pixel_size, "frame_interval_s": args.interval,
-        "fp_per_mpx": args.fp_per_mpx,
+        "p_real": args.p_real,
         "fit_mixtures": args.mixtures,
         "threads": args.threads,
         "fit_flags": {flag.name: int(flag) for flag in spotsolve.FitFlag},
@@ -118,8 +118,8 @@ if __name__ == "__main__":
                     help="um per px, for the derived physical columns")
     ap.add_argument("--interval", type=float, default=DEFAULT_INTERVAL,
                     help="seconds per frame")
-    ap.add_argument("--fp-per-mpx", type=float, default=spotsolve.FP_PER_MPX,
-                    help="expected false emitters per 10^6 noise pixels")
+    ap.add_argument("--p-real", type=float, default=spotsolve.P_REAL,
+                    help="least probability a reported emitter is real, not noise")
     ap.add_argument("--mixtures", action="store_true",
                     help="fit overlapping spots jointly (u-track FitMixtures)")
     ap.add_argument("--threads", type=int, default=None,

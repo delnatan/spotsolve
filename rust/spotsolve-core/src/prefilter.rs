@@ -14,15 +14,14 @@
 //!
 //!    The noise comes from the Poisson model, not the window's residual,
 //!    so a neighbour in the window does not hide a spot.
-//! 2. **Mask.** Pixels whose score at some width of a bank reaches that
-//!    width's bar.
+//! 2. **Mask.** Pixels whose score reaches a bar.
 //! 3. **Seeds.** Local maxima of the negative Laplacian of Gaussian over a
 //!    `2 ceil(sigma) + 1` square, inside the mask.
 //! 4. **Labels.** 8-connected components of the mask. A seed's fit leaves
 //!    out the pixels of other components.
 //!
-//! [`threshold`] sets the bar from the expected false emitters per 10^6
-//! pixels of noise.
+//! [`false_rate`] counts the maxima noise alone gives, the null of
+//! [`crate::posterior`].
 
 use crate::filters;
 use crate::psf;
@@ -163,19 +162,12 @@ pub fn label(mask: &[bool], h: usize, w: usize) -> Vec<u32> {
 }
 
 /// Screen a frame `d` (ADU above the offset) of dispersion `phi`: the mask
-/// holds every pixel whose score at some width of `bank`, `(width, bar)`
-/// pairs, reaches that width's bar. Score, flux and level are reported at
-/// `sigma`, which also sets the LoG. Seeds are confined to `roi`.
-pub fn screen(d: &[f64], h: usize, w: usize, sigma: f64, phi: f64, bank: &[(f64, f64)], roi: Option<&[bool]>) -> Screen {
+/// holds every pixel whose score at `sigma`, which also sets the LoG,
+/// reaches `bar`. Seeds are confined to `roi`.
+pub fn screen(d: &[f64], h: usize, w: usize, sigma: f64, phi: f64, bar: f64, roi: Option<&[bool]>) -> Screen {
     assert_eq!(d.len(), h * w);
     let (z, amplitude, background) = score(d, h, w, sigma, phi);
-    let mut mask = vec![false; h * w];
-    for &(width, bar) in bank {
-        let zw = if width == sigma { z.clone() } else { score(d, h, w, width, phi).0 };
-        for (m, v) in mask.iter_mut().zip(zw) {
-            *m |= v >= bar;
-        }
-    }
+    let mask: Vec<bool> = z.iter().map(|&v| v >= bar).collect();
     let neg_log: Vec<f64> = filters::gaussian_laplace(d, h, w, sigma).into_iter().map(|v| -v).collect();
     let size = 2 * sigma.ceil() as usize + 1;
     let local_max = filters::maximum_filter(&neg_log, h, w, size);
@@ -219,26 +211,6 @@ pub fn false_rate(u: f64, lo: f64, hi: f64) -> f64 {
     let rho1 = e / (2.0 * PI);
     let rho3 = (u * u - 1.0) * e / (4.0 * PI * PI);
     0.25 * (a - b) * rho3 + 0.25 * a * rho2 + (a / (2.0 * PI) - 3.0 * (a - b) / (8.0 * PI)) * rho1
-}
-
-/// The `u >= 1` at which [`false_rate`] over widths `[lo, hi]` is
-/// `fp_per_mpx` per 10^6 pixels, by bisection; the rate falls with `u`
-/// there.
-pub fn threshold(fp_per_mpx: f64, lo: f64, hi: f64) -> f64 {
-    let rate = |u: f64| 1e6 * false_rate(u, lo, hi);
-    let (mut lo, mut hi) = (1.0, 40.0);
-    if rate(lo) <= fp_per_mpx {
-        return lo;
-    }
-    for _ in 0..100 {
-        let mid = 0.5 * (lo + hi);
-        if rate(mid) > fp_per_mpx {
-            lo = mid;
-        } else {
-            hi = mid;
-        }
-    }
-    0.5 * (lo + hi)
 }
 
 /// Scalar `phi = pixel variance / mean`, the median over pixels of a local
@@ -315,15 +287,14 @@ mod tests {
         }
     }
 
-    /// Seeds above `threshold(fp_per_mpx)` on Poisson noise number about
-    /// `fp_per_mpx`: seeds are maxima of the LoG, not of the score, and the
-    /// level is fitted, so the rate is an approximation; hold it within a
-    /// factor 1.5 where the count is large enough to measure.
+    /// Seeds above `u` on Poisson noise number about [`false_rate`]: seeds
+    /// are maxima of the LoG, not of the score, and the level is fitted, so
+    /// the rate is an approximation; hold it within a factor 1.5 where the
+    /// count is large enough to measure.
     #[test]
     fn noise_seeds_meet_the_false_rate() {
-        let (side, frames, sigma, fp) = (128, 24, 1.45, 300.0);
-        let u = threshold(fp, sigma, sigma);
-        assert!((1e6 * false_rate(u, sigma, sigma) - fp).abs() < 1e-6 * fp);
+        let (side, frames, sigma, u) = (128, 24, 1.45, 3.5);
+        let fp = 1e6 * false_rate(u, sigma, sigma);
         let mut state = 99u64;
         let mut uni = || {
             state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
@@ -344,7 +315,7 @@ mod tests {
                 })
                 .collect();
             let phi = dispersion(&d, side, side);
-            seeds += screen(&d, side, side, sigma, phi, &[(sigma, u)], None).seeds.len();
+            seeds += screen(&d, side, side, sigma, phi, u, None).seeds.len();
         }
         let per_mpx = seeds as f64 * 1e6 / (frames * side * side) as f64;
         assert!(per_mpx > fp / 1.5 && per_mpx < fp * 1.5, "{per_mpx} per Mpx at u = {u}");

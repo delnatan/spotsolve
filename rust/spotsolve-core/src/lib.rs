@@ -2,11 +2,11 @@
 //!
 //! The detector is [`detect`], after u-track's `pointSourceDetection`:
 //! [`prefilter`] screens the frame by a Poisson score test and proposes
-//! LoG seeds; each is fitted on its own window by [`fit`] and kept if its
-//! likelihood ratio reaches a threshold set by an expected false-positive
-//! rate. `tests/layer7_localize.rs` holds it to recall, precision and
-//! position error on simulated fields and to its false-positive rate on
-//! pure noise.
+//! LoG seeds; each is fitted on its own window by [`fit`] and kept if it
+//! is real, not noise, with the probability [`posterior`] gives its
+//! likelihood ratio over the movie. `tests/layer7_localize.rs` holds it to
+//! recall, precision and position error on simulated fields and to its
+//! false positives on pure noise.
 //!
 //! The rest are the layers it is built from: [`psf`] (the
 //! pixel-integrated Gaussian and its derivatives), [`linalg`] (Cholesky),
@@ -27,6 +27,7 @@ pub mod filters;
 pub mod fit;
 pub mod lap;
 pub mod linalg;
+pub mod posterior;
 pub mod prefilter;
 pub mod psf;
 pub mod render;
