@@ -103,7 +103,10 @@ def test_the_answer_does_not_depend_on_the_camera_gain():
         assert np.all(np.abs(res.positions - ref.positions) < 0.01 * ref.se[:, 1:])
         assert np.all(np.abs(res.amplitudes - g * ref.amplitudes) < 0.01 * g * ref.se[:, 0])
         np.testing.assert_allclose(res.info["z"], ref.info["z"], rtol=1e-4)
-    assert 1.0 <= ref.dispersion <= 1.6
+    # Widths spread 0.4 scatter one small frame's gain (0.8-1.9 over seeds);
+    # where the PSF is the model's, it is the camera's.
+    matched = L.localize(_sim(17, 0.015, 0.0, background=20.0).image, sigma=SIGMA)
+    assert 0.9 <= matched.dispersion <= 1.2
 
 
 def test_full_roi_is_no_roi():

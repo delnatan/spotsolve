@@ -21,11 +21,24 @@ v[i,j] = read + gain * m[i,j]
 I(d,m) = sum_pixels (d - m)^2 / (2 v)
 ```
 
-`I` is the negative log-likelihood in nats. The weights follow the model:
-each pixel's variance is that of the light the current fit puts there,
-refreshed as components are added and removed, and the reported fit is
-settled once at its own weights, as iteratively reweighted least squares
-does.
+Fits minimize `I`. The weights follow the model: each pixel's variance is
+that of the light the current fit puts there, refreshed as components are
+added and removed, and the reported fit is settled once at its own
+weights, as iteratively reweighted least squares does. That is a
+quasi-likelihood fit, and every decision compares its deviance, in nats,
+
+```text
+Q(d,m) = sum_pixels integral from m to d of (d - t) / V(t) dt,    V(t) = read + gain * t
+```
+
+the Poisson deviance (halved) of `d + read/gain` at `m + read/gain`, over
+`gain`; Gaussian of the quietest background's variance where `V` would
+fall below it. Its likelihood ratios carry shot noise's skew, so noise
+alone gives them the null of the Euler-characteristic formula at every
+level of light. The Gaussian ratio at fixed weights does not: at the
+alternative's weights its noise maxima fall short of that null, the more
+so the darker the background; at the null's they overshoot it in the tail,
+with skew and with pixels noisier than the curve.
 
 ## Noise
 

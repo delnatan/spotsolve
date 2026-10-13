@@ -30,9 +30,11 @@ The noise model is the camera's, measured from the movie. Breaking change
 to `dispersion`, and the output version is 8.
 
 - Each pixel's variance is `read + gain * light`, the light the model puts
-  on it, and every fit is a Gaussian likelihood at those variances,
-  reweighted as components are added and removed and settled once at the
-  reported fit's own weights. The scalar dispersion `phi = variance / mean`
+  on it, and every fit is least squares at those variances, reweighted as
+  components are added and removed and settled once at the reported fit's
+  own weights: a quasi-likelihood fit. Every decision, and `z`, compares
+  its deviance, the Poisson deviance for a Poisson camera, so `P(real)`
+  holds its null on dark sCMOS and EMCCD frames too. The scalar dispersion `phi = variance / mean`
   is gone: with read noise it overstated the variance at spot peaks and
   understated `z` on dark backgrounds, so faint spots went unreported.
 - Both are measured without calibration: the gain from the

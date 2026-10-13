@@ -284,6 +284,33 @@ impl Curve {
     pub fn at(&self, light: f64) -> f64 {
         (self.read + self.gain * light).max(self.floor).max(f64::MIN_POSITIVE)
     }
+
+    /// The quasi-likelihood deviance of `d` at mean `mu`, in nats,
+    ///
+    /// ```text
+    /// q(d, mu) = integral from mu to d of (d - t) / V(t) dt,    V = at
+    /// ```
+    ///
+    /// the likelihood a fit reweighted to `V(mu)` maximizes. It is the
+    /// Poisson deviance (halved) of `d + read / gain` at `mu + read / gain`,
+    /// over `gain`, where `V` is linear, and Gaussian below the floor:
+    /// shot noise's skew is in it, so its ratios have the null of
+    /// [`false_rate`] at every level of light.
+    pub fn deviance(&self, d: f64, mu: f64) -> f64 {
+        // Below `kink` the variance is the floor; without shot noise it is
+        // flat throughout.
+        let (floor, kink) = if self.gain > 0.0 {
+            let floor = self.floor.max(f64::MIN_POSITIVE);
+            (floor, (floor - self.read) / self.gain)
+        } else {
+            (self.at(0.0), f64::INFINITY)
+        };
+        let flat = |t: f64| (d * t - 0.5 * t * t) / floor;
+        let (a, g) = (self.read, self.gain);
+        let linear = |t: f64| (d + a / g) / g * (a + g * t).ln() - t / g;
+        let antiderivative = |t: f64| if t < kink { flat(t) } else { flat(kink) + linear(t) - linear(kink) };
+        antiderivative(d) - antiderivative(mu)
+    }
 }
 
 /// The quietest of `points`' variances; 0 without points.
@@ -427,6 +454,24 @@ mod tests {
         let per_mpx = maxima as f64 * 1e6 / (frames * (side - 12) * (side - 12)) as f64;
         assert!((var - 1.0).abs() < 0.03, "score variance {var}");
         assert!(per_mpx > 0.7 * fp && per_mpx < 1.3 * fp, "{per_mpx} per Mpx at u = {u}, predicted {fp}");
+    }
+
+    /// The deviance is the Poisson one where the curve is Poisson, the
+    /// Gaussian one where it is flat, and continuous across the floor.
+    #[test]
+    fn the_deviance_has_its_limits() {
+        let poisson = Curve { read: 0.0, gain: 1.0, floor: 1e-12 };
+        for (d, mu) in [(7.0, 3.0), (3.0, 7.0), (20.0, 20.5)] {
+            let exact = d * (d / mu as f64).ln() - (d - mu);
+            assert!((poisson.deviance(d, mu) - exact).abs() < 1e-9, "{d} {mu}");
+        }
+        let flat = Curve { read: 9.0, gain: 0.0, floor: 4.0 };
+        assert!((flat.deviance(5.0, -1.0) - 36.0 / 18.0).abs() < 1e-12);
+        let cam = Curve { read: 7.8, gain: 2.7, floor: 10.0 };
+        let kink = (10.0 - 7.8) / 2.7;
+        let (below, above) = (cam.deviance(3.0, kink - 1e-9), cam.deviance(3.0, kink + 1e-9));
+        assert!((below - above).abs() < 1e-8 && cam.deviance(3.0, 3.0) == 0.0);
+        assert!([-4.0, 0.0, 0.5, 2.0, 9.0].iter().all(|&mu| cam.deviance(3.0, mu) > 0.0 || mu == 3.0));
     }
 
     /// On a background rising across the frame, with read noise and gain,

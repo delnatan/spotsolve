@@ -20,9 +20,11 @@
 //!    ([`prefilter::screen`]).
 //! 2. Each seed's window ([`crate::fit`]), `ceil(4 sigma)` px around it, holds a
 //!    constant level and pixel-integrated Gaussian components; pixels of
-//!    other mask components are left out. The likelihood is Gaussian at each
-//!    pixel's variance, reweighted as components are added and removed. A
-//!    component is kept if adding it gains `u^2 / 2` nats.
+//!    other mask components are left out. Fits are least squares at each
+//!    pixel's variance, reweighted as components are added and removed: a
+//!    quasi-likelihood fit, and every decision compares its deviance
+//!    ([`prefilter::Curve::deviance`]). A component is kept if adding it
+//!    gains `u^2 / 2` nats.
 //!    - Alone, one component starts at the seed and its centre is held
 //!      within [`CONFINE`] widths of it.
 //!    - With mixtures, components are added where the efficient score
@@ -183,8 +185,8 @@ pub struct Output {
     /// `N`: bitwise combination of `FLAG_*` diagnostics.
     pub flags: Vec<u8>,
     /// `N`: the root of each emitter's likelihood ratio, the cost of
-    /// removing it with the rest of its window refitted, `sqrt(2 (I_without
-    /// - I))`, `I` in nats; at least `u`.
+    /// removing it with the rest of its window refitted, `sqrt(2 (Q_without
+    /// - Q))`, `Q` the quasi-likelihood deviance in nats; at least `u`.
     pub z: Vec<f64>,
     /// `N`: the probability each emitter is real, not noise, from its `z`
     /// ([`Posterior`]); at least `p_real`.
@@ -277,13 +279,29 @@ struct Fate {
     components: Vec<(f64, f64)>,
 }
 
-/// `I(d, c)` of the used pixels for a constant level alone, at its minimum,
-/// the variance-weighted mean.
-fn level_divergence(win: &Window) -> f64 {
-    let used = || win.d.iter().zip(&win.v).zip(&win.used).filter(|p| *p.1).map(|p| p.0);
-    let (sw, swd) = used().fold((0.0, 0.0), |(a, b), (&d, &v)| (a + 1.0 / v, b + d / v));
-    let c = swd / sw;
-    used().map(|(&d, &v)| 0.5 * (d - c) * (d - c) / v).sum()
+/// The quasi-likelihood deviance of the used pixels at the light `m`
+/// ([`prefilter::Curve::deviance`]): what every decision compares.
+fn deviance(win: &Window, m: &[f64], curve: &prefilter::Curve) -> f64 {
+    (0..m.len()).filter(|&i| win.used[i]).map(|i| curve.deviance(win.d[i], m[i])).sum()
+}
+
+/// The deviance of a constant level over light `other` holds (none: a
+/// level alone), at the level's maximum quasi-likelihood: the mean, or with
+/// `other`, Fisher scoring from it.
+fn level_deviance(win: &Window, other: Option<&[f64]>, curve: &prefilter::Curve) -> f64 {
+    let o = |i: usize| other.map_or(0.0, |o| o[i]);
+    let used: Vec<usize> = (0..win.d.len()).filter(|&i| win.used[i]).collect();
+    let mut c = used.iter().map(|&i| win.d[i] - o(i)).sum::<f64>() / used.len() as f64;
+    if other.is_some() {
+        for _ in 0..3 {
+            let (sc, info) = used.iter().fold((0.0, 0.0), |(a, b), &i| {
+                let v = curve.at(o(i) + c);
+                (a + (win.d[i] - o(i) - c) / v, b + 1.0 / v)
+            });
+            c += sc / info;
+        }
+    }
+    used.iter().map(|&i| curve.deviance(win.d[i], o(i) + c)).sum()
 }
 
 /// Parameter bounds of components in one window: the level, each
@@ -446,8 +464,10 @@ fn fit_seed(d: &[f64], h: usize, w: usize, sc: &Screen, seed: usize, at: &[bool]
     };
 
     let mut theta = vec![level0.clamp(b.level.0, b.level.1)];
+    let curve = &noise.curve;
+    let dev = |fitter: &mut Fitter, win: &Window, theta: &[f64], lay: Layout| deviance(win, fitter.model(win, theta, lay), curve);
     // The level alone: the null the first component is tested against.
-    let mut div = level_divergence(&win);
+    let mut div = level_deviance(&win, None, curve);
 
     // Forward: each new component where the efficient score peaks.
     let mut fit = None;
@@ -455,7 +475,6 @@ fn fit_seed(d: &[f64], h: usize, w: usize, sc: &Screen, seed: usize, at: &[bool]
     while k < max_k {
         if k > 0 {
             reweight(&mut win, fitter, &theta, lay.with(k));
-            div = fitter.divergence(&win, &theta, lay.with(k));
         }
         // Alone, the component starts at its seed. In a mixture the seed
         // only centres the window: every component, the first too, starts
@@ -478,7 +497,8 @@ fn fit_seed(d: &[f64], h: usize, w: usize, sc: &Screen, seed: usize, at: &[bool]
         }
         let (lo, hi) = b.of(lay.with(k + 1));
         let f = fitter.fit(&win, &start, lay.with(k + 1), &lo, &hi, FIT_MAX_ITER, tol);
-        let gain = div - f.divergence;
+        let next = dev(fitter, &win, &f.theta, lay.with(k + 1));
+        let gain = div - next;
         if !(gain >= bar) {
             break;
         }
@@ -489,7 +509,7 @@ fn fit_seed(d: &[f64], h: usize, w: usize, sc: &Screen, seed: usize, at: &[bool]
             break;
         }
         k += 1;
-        div = f.divergence;
+        div = next;
         theta = f.theta.clone();
         fit = Some(f);
     }
@@ -512,7 +532,7 @@ fn fit_seed(d: &[f64], h: usize, w: usize, sc: &Screen, seed: usize, at: &[bool]
         let mut start = theta.to_vec();
         start.drain(lay.at(j)..lay.at(j) + lay.stride());
         let f = fitter.fit(win, &start, lay.with(k - 1), &lo, &hi, FIT_MAX_ITER, tol);
-        (f.divergence - div, f)
+        (dev(fitter, win, &f.theta, lay.with(k - 1)) - div, f)
     };
     // One component left costs its gain over the level alone, which every
     // forward gain reaching the bar and every removal falling short of it
@@ -521,9 +541,9 @@ fn fit_seed(d: &[f64], h: usize, w: usize, sc: &Screen, seed: usize, at: &[bool]
     loop {
         let k = k_of(&theta);
         reweight(&mut win, fitter, &theta, lay.with(k));
-        div = fitter.divergence(&win, &theta, lay.with(k));
+        div = dev(fitter, &win, &theta, lay.with(k));
         if k == 1 {
-            cost = vec![Some(level_divergence(&win) - div)];
+            cost = vec![Some(level_deviance(&win, None, curve) - div)];
             break;
         }
         cost = vec![None; k];
@@ -557,9 +577,9 @@ fn fit_seed(d: &[f64], h: usize, w: usize, sc: &Screen, seed: usize, at: &[bool]
         theta = fit.theta.clone();
         reweight(&mut win, fitter, &theta, lay);
     }
-    div = fitter.divergence(&win, &theta, lay);
+    div = dev(fitter, &win, &theta, lay);
     if lay.k == 1 {
-        cost[0] = Some(level_divergence(&win) - div);
+        cost[0] = Some(level_deviance(&win, None, curve) - div);
     }
     let mut common = 0;
     if !fit.converged {
@@ -633,7 +653,11 @@ fn fit_seed(d: &[f64], h: usize, w: usize, sc: &Screen, seed: usize, at: &[bool]
             let lo = [b.level.0, 0.0, b.centre.0, b.centre.2, wl, wl, -10.0];
             let hi = [b.level.1, 2.0 * b.flux.1, b.centre.1, b.centre.3, wr, wr, 10.0];
             let ef = crate::ellipse::fit(&win, &other, start, lo, hi, tol);
-            if ef.divergence - div >= bar {
+            let mut le = vec![0.0; other.len()];
+            crate::ellipse::light(&ef.theta, rows, cols, &mut le);
+            let me: Vec<f64> = (0..le.len()).map(|q| ef.theta[0] + other[q] + le[q]).collect();
+            let dev_e = deviance(&win, &me, curve);
+            if dev_e - div >= bar {
                 continue;
             }
             consumed[i] = true;
@@ -646,11 +670,7 @@ fn fit_seed(d: &[f64], h: usize, w: usize, sc: &Screen, seed: usize, at: &[bool]
                 continue;
             }
             // Its cost: the level alone in its place, the rest held.
-            let pts = || (0..win.d.len()).filter(|&q| win.used[q]);
-            let (sw, swd) = pts().fold((0.0, 0.0), |(s0, s1), q| (s0 + 1.0 / win.v[q], s1 + (win.d[q] - other[q]) / win.v[q]));
-            let c = swd / sw;
-            let null: f64 = pts().map(|q| 0.5 * (win.d[q] - other[q] - c).powi(2) / win.v[q]).sum();
-            let cost_e = null - ef.divergence;
+            let cost_e = level_deviance(&win, Some(&other), curve) - dev_e;
             if cost_e < bar {
                 fate.weak = true;
                 continue;
@@ -715,7 +735,7 @@ fn fit_seed(d: &[f64], h: usize, w: usize, sc: &Screen, seed: usize, at: &[bool]
             let mut start = theta.clone();
             start[q + 3] = w_hi;
             let f = fitter.fit(&win, &start, lay, &lo, &hi, FIT_MAX_ITER, tol);
-            let excess = f.divergence - div;
+            let excess = dev(fitter, &win, &f.theta, lay) - div;
             if excess >= WIDER * WIDER / 2.0 || cost_j - excess < bar || f.at_bound[q + 1] || f.at_bound[q + 2] || !mine(&f.theta, j) {
                 fate.out_of_focus += 1;
                 continue;

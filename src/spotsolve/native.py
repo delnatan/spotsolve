@@ -109,9 +109,10 @@ def localize(frame, sigma, *, offset=0.0, roi=None, p_real=P_REAL,
 
     An emitter is kept if it is real, not noise, with probability at least
     `p_real`. The probability comes from its likelihood ratio against the
-    level alone, `z = sqrt(2 * ratio)` in nats of the Gaussian likelihood at
-    each pixel's variance: candidates fitted alone above a low bar have a
-    density of `z` that noise alone, by theory, would give only in part,
+    level alone, `z = sqrt(2 * ratio)` in nats of the quasi-likelihood of
+    the noise curve (the Poisson likelihood for a Poisson camera):
+    candidates fitted alone above a low bar have a density of `z` that
+    noise alone, by theory, would give only in part,
     and `P(real | z)` is the part noise does not explain. The emitter is
     kept where `z >= u`, the bar at which that reaches `p_real`. A single
     frame is a movie of one; `localize_stack` pools every frame.
