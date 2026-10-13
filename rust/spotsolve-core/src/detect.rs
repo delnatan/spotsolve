@@ -29,9 +29,10 @@
 //!      peaks ([`propose`]) while each refit gains as much, then the
 //!      weakest is removed while removing it, the rest refitted, costs
 //!      less. Every source of light in the window takes a component, so a
-//!      neighbour is a nuisance parameter rather than a bias. A close pair
-//!      is two emitters only if it gains as much over one elongated spot
-//!      ([`crate::ellipse`]), as an emitter moving within the exposure is.
+//!      neighbour is a nuisance parameter rather than a bias. With
+//!      `motion_blur`, a close pair is two emitters only if it gains as much
+//!      over one elongated spot ([`crate::ellipse`]), as an emitter moving
+//!      within the exposure is.
 //! 3. Each component is reported by the fit of the seed nearest to it
 //!    ([`owned`]), and only those are tested for removal; copies of one
 //!    emitter from two fits are merged ([`merge`]). A component held at a
@@ -145,11 +146,14 @@ pub struct Settings {
     /// Fit several components per window, after u-track's `FitMixtures`.
     pub fit_mixtures: bool,
     pub max_mixtures: usize,
+    /// With mixtures, test each close pair against one elongated spot, as an
+    /// emitter moving within the exposure is.
+    pub motion_blur: bool,
 }
 
 impl Settings {
     pub fn new(sigma: f64) -> Self {
-        Self { sigma, p_real: P_REAL, width: WIDTH, fit_mixtures: false, max_mixtures: MAX_MIXTURES }
+        Self { sigma, p_real: P_REAL, width: WIDTH, fit_mixtures: false, max_mixtures: MAX_MIXTURES, motion_blur: false }
     }
 
     fn radius(&self) -> usize {
@@ -586,11 +590,11 @@ fn fit_seed(d: &[f64], h: usize, w: usize, sc: &Screen, seed: usize, at: &[bool]
             }
         }
     }
-    // Elongation: a close pair is two emitters only if it gains the bar over
-    // one elongated spot at the same pixel variances ([`crate::ellipse`]);
-    // otherwise it is one, at the ellipse's centre.
+    // Elongation, with motion blur: a close pair is two emitters only if it
+    // gains the bar over one elongated spot at the same pixel variances
+    // ([`crate::ellipse`]); otherwise it is one, at the ellipse's centre.
     let mut consumed = vec![false; lay.k];
-    if s.fit_mixtures && lay.k > 1 && !noise.probe {
+    if s.fit_mixtures && s.motion_blur && lay.k > 1 && !noise.probe {
         let total = fitter.model(&win, &theta, lay).to_vec();
         let comp = |fitter: &mut Fitter, j: usize| -> Vec<f64> {
             let q = lay.at(j);

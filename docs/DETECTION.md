@@ -77,13 +77,15 @@ without read noise and otherwise an upper bound.
      it, the rest refitted, costs less. Every source of light in the window
      takes a component, so a neighbour is a nuisance parameter rather than a
      bias.
-   - **Elongated spots** (mixtures): an emitter moving within the exposure
-     is one elongated spot that two round components tile. A close pair is
+   - **Elongated spots** (mixtures with `motion_blur=True`): an emitter
+     moving within the exposure is one elongated spot that two round
+     components tile. A close pair is
      two emitters only if it gains `u^2/2` nats over one rotated Gaussian at
      the same pixel variances; otherwise it is one emitter at the ellipse's
      centre, flagged `ELONGATED`, its width the geometric mean of the axes.
      Pairs closer than about `2 sigma` are not told from a streak, and are
-     reported so.
+     reported so; off by default, so that where exposures keep emitters
+     round, mixtures resolve them.
 4. **Ownership.** Each component is reported by the fit of the seed nearest
    to it, and only those are tested for removal. A component held on a
    position bound is not reported. Two windows may each place an emitter

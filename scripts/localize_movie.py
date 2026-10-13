@@ -50,6 +50,7 @@ def main(args):
                                        offset=CAMERA_OFFSET,
                                        p_real=args.p_real,
                                        fit_mixtures=args.mixtures,
+                                       motion_blur=args.motion_blur,
                                        n_threads=args.threads)
     dt = (time.time() - t0) / len(stack)
     print(f"  {len(stack)} frames in {dt * len(stack):.2f} s "
@@ -97,6 +98,7 @@ def main(args):
         "pixel_size_um": args.pixel_size, "frame_interval_s": args.interval,
         "p_real": args.p_real,
         "fit_mixtures": args.mixtures,
+        "motion_blur": args.motion_blur,
         "threads": args.threads,
         "fit_flags": {flag.name: int(flag) for flag in spotsolve.FitFlag},
         "flux_units": "ADU above offset", "position_units": "px (y, x)",
@@ -122,6 +124,8 @@ if __name__ == "__main__":
                     help="least probability a reported emitter is real, not noise")
     ap.add_argument("--mixtures", action="store_true",
                     help="fit overlapping spots jointly (u-track FitMixtures)")
+    ap.add_argument("--motion-blur", action="store_true",
+                    help="with --mixtures, report a close pair as one elongated spot unless two fit better")
     ap.add_argument("--threads", type=int, default=None,
                     help="parallel frame workers (default: machine's cores)")
     ap.add_argument("--out",

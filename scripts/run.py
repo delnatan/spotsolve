@@ -44,7 +44,8 @@ def main(args):
     t = time.time()
     res = spotsolve.localize(img, sigma=args.sigma, offset=CAMERA_OFFSET,
                              p_real=args.p_real,
-                             fit_mixtures=args.mixtures)
+                             fit_mixtures=args.mixtures,
+                             motion_blur=args.motion_blur)
     dt = time.time() - t
 
     # The audit in the likelihood's own terms: the read variance as a
@@ -111,5 +112,6 @@ if __name__ == "__main__":
     ap.add_argument("--sigma", type=float, default=1.2)
     ap.add_argument("--p-real", type=float, default=spotsolve.P_REAL)
     ap.add_argument("--mixtures", action="store_true", help="fit overlapping spots jointly (u-track FitMixtures)")
+    ap.add_argument("--motion-blur", action="store_true", help="with --mixtures, report a close pair as one elongated spot unless two fit better")
     ap.add_argument("--out", default="result.png")
     main(ap.parse_args())

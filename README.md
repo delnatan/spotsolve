@@ -80,6 +80,7 @@ pixels.
 | `width` | `(1.0, 1.5)` | Reported widths, as multiples of `sigma`; light 2 standard errors wider is fitted as out-of-focus background, and an emitter less wide is reported at the upper bound. The upper bound is capped near `2 sigma`. Equal bounds fix the width |
 | `fit_mixtures` | False | Fit several emitters per window (u-track's FitMixtures) |
 | `max_mixtures` | 20 | Components per window at most |
+| `motion_blur` | False | With mixtures, report a close pair as one elongated spot unless two fit better |
 
 The frame is screened by a score test on the camera's measured noise, seeds are placed at local
 maxima, and each seed's window is fitted with a constant level and
@@ -92,10 +93,11 @@ adapts to each movie, and a frame's result depends on the stack it is in;
 reported widths is fitted as out-of-focus background and counted in
 `info["out_of_focus"]`. Use `fit_mixtures=True` wherever spots come closer
 than about `6 sigma`: single fits are biased by a neighbour's light and
-cannot separate pairs. With mixtures, a close pair is two spots only if it
-beats one elongated spot by the same `u^2/2`, so an emitter moving within
-the exposure is one spot, flagged `ELONGATED`, and pairs closer than about
-`2 sigma` are reported as one. See [detection](docs/DETECTION.md) for the method.
+cannot separate pairs. With `motion_blur=True` as well, a close pair is two
+spots only if it beats one elongated spot by the same `u^2/2`, so an emitter
+moving within the exposure is one spot, flagged `ELONGATED`, and pairs
+closer than about `2 sigma` are reported as one; leave it off where the
+exposure is short enough that emitters stay round. See [detection](docs/DETECTION.md) for the method.
 
 The ROI restricts seeding and crops work to its bounding box plus context;
 fitted positions can lie outside it. Use one mask covering the desired area,

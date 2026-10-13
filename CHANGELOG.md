@@ -40,10 +40,12 @@ to `dispersion`, and the output version is 8.
   over the movie, and the read variance from the background's fourth
   differences. `dispersion` is now the gain; `info["read_variance"]` and a
   `read_variance` frame-table column are new.
-- With mixtures, a close pair is two emitters only if it gains `u^2 / 2`
-  nats over one elongated spot (a rotated Gaussian): an emitter moving
-  within the exposure is one spot, flagged `FitFlag.ELONGATED`, not two.
-  Pairs closer than about `2 sigma` are reported as one elongated emitter.
+- `motion_blur=True`, with mixtures, tests a close pair against one
+  elongated spot (a rotated Gaussian): it is two emitters only if it gains
+  `u^2 / 2` nats over it, so an emitter moving within the exposure is one
+  spot, flagged `FitFlag.ELONGATED`, not two. Pairs closer than about
+  `2 sigma` are then reported as one elongated emitter. Off by default:
+  where exposures keep emitters round, mixtures resolve the pair.
 
 ## 0.5.0 (2026-10-06)
 

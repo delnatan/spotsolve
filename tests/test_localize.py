@@ -22,9 +22,9 @@ def _sim(seed, density=0.034, spread=0.2, **kw):
 # Widths are lognormal with sd 0.2-0.4, many wider than the default band,
 # so the band is opened to its cap. Floors five points under what is achieved.
 @pytest.mark.parametrize("seed,density,spread,recall,precision",
-                         [(17, 0.015, 0.4, 0.872, 0.953),
-                          (18, 0.034, 0.2, 0.682, 0.961),
-                          (19, 0.055, 0.4, 0.506, 0.946)])
+                         [(17, 0.015, 0.4, 0.894, 0.955),
+                          (18, 0.034, 0.2, 0.748, 0.988),
+                          (19, 0.055, 0.4, 0.593, 0.990)])
 def test_crowded_fields_hold_their_recall_and_precision(seed, density, spread,
                                                         recall, precision):
     sim = _sim(seed, density, spread)
@@ -52,10 +52,12 @@ def test_separated_emitters_are_recovered(width):
         assert np.all(res.fit_sigma == SIGMA) and np.all(np.isnan(res.sigma_se))
 
 
-# A pair is two emitters only if it gains the bar over one elongated spot:
-# at 3 sigma it does; closer, it is one elongated emitter at its centroid.
+# Mixtures resolve a close pair. With motion blur, a pair is two emitters
+# only if it gains the bar over one elongated spot: at 3 sigma it does;
+# closer, it is one elongated emitter at its centroid.
+@pytest.mark.parametrize("motion_blur", [False, True])
 @pytest.mark.parametrize("separation", [1.5, 2.0, 3.0])
-def test_mixtures_resolve_a_pair_or_report_one_elongated_spot(separation):
+def test_mixtures_resolve_a_pair_or_report_one_elongated_spot(separation, motion_blur):
     from spotsolve import psf, FitFlag
     yy, xx = np.mgrid[:48, :48]
     d = separation * SIGMA
@@ -63,11 +65,12 @@ def test_mixtures_resolve_a_pair_or_report_one_elongated_spot(separation):
     flux = np.array([1500., 1200.])
     mean = psf.model(psf.pack(20., flux, truth[:, 0], truth[:, 1]), yy, xx, SIGMA)
     image = np.random.default_rng(9).poisson(mean).astype(float)
-    mixed = L.localize(image, SIGMA, fit_mixtures=True)
+    mixed = L.localize(image, SIGMA, fit_mixtures=True, motion_blur=motion_blur)
     assert np.all(mixed.info["mixture"] > 0)
-    if separation >= 3.0:
-        m = match(truth, mixed.positions, radius=1.0)
+    if separation >= 3.0 or not motion_blur:
+        m = match(truth, mixed.positions, radius=min(1.0, d / 2))
         assert m.recall == 1.0 and len(mixed) == 2
+        assert not np.any(mixed.flags & FitFlag.ELONGATED)
     else:
         centroid = flux @ truth / flux.sum()
         assert len(mixed) == 1 and mixed.flags[0] & FitFlag.ELONGATED

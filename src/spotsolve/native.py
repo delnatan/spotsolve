@@ -52,14 +52,15 @@ def _roi(roi, shape):
     return roi
 
 
-def _kw(sigma, offset, roi, shape, p_real, width, fit_mixtures, max_mixtures):
+def _kw(sigma, offset, roi, shape, p_real, width, fit_mixtures, max_mixtures, motion_blur):
     sigma = float(sigma)
     if not np.isfinite(sigma) or not 0 < sigma <= max(shape):
         raise ValueError("sigma must be positive, finite and no larger than the frame")
     return dict(sigma=sigma, offset=float(offset), roi=_roi(roi, shape),
                 p_real=float(p_real), width=tuple(map(float, width)),
                 fit_mixtures=bool(fit_mixtures),
-                max_mixtures=_positive_int(max_mixtures, "max_mixtures"))
+                max_mixtures=_positive_int(max_mixtures, "max_mixtures"),
+                motion_blur=bool(motion_blur))
 
 
 def _result(out, raw, kw, images):
@@ -67,7 +68,7 @@ def _result(out, raw, kw, images):
     dispersion = info.pop("dispersion")
     sigma = kw["sigma"]
     info.update(method="detect", p_real_min=kw["p_real"], width=kw["width"],
-                fit_mixtures=kw["fit_mixtures"])
+                fit_mixtures=kw["fit_mixtures"], motion_blur=kw["motion_blur"])
     model = residual = None
     if images:
         model = _rs.detect_render(pos, amp, sig, bmap)
@@ -81,7 +82,7 @@ def _result(out, raw, kw, images):
 
 def localize(frame, sigma, *, offset=0.0, roi=None, p_real=P_REAL,
              width=WIDTH, fit_mixtures=False, max_mixtures=MAX_MIXTURES,
-             images=True):
+             motion_blur=False, images=True):
     """Localize one frame. Returns `Localizations`.
 
     `frame`, `offset`, flux and background use camera units (ADU). `sigma`
@@ -121,14 +122,18 @@ def localize(frame, sigma, *, offset=0.0, roi=None, p_real=P_REAL,
     `max_mixtures`; then the weakest is removed while removing it, the rest
     refitted, costs less. Neighbours inside a window are fitted with it, and
     each component is reported by the fit of the seed nearest to it; copies
-    of one emitter from two windows are merged. A close pair is two emitters
-    only if it gains `u^2 / 2` nats over one elongated spot, as an emitter
-    moving within the exposure is; otherwise it is one emitter at the
-    ellipse's centre, flagged `ELONGATED`, its width the geometric mean of
-    the ellipse's axes. Pairs closer than about `2 sigma` are so reported.
-    `info["mixture"]` numbers the windows that held several components (0:
-    fitted alone). Use mixtures wherever spots come closer than about
-    `6 sigma`; alone, a fit is biased by a neighbour's light.
+    of one emitter from two windows are merged. `info["mixture"]` numbers
+    the windows that held several components (0: fitted alone). Use
+    mixtures wherever spots come closer than about `6 sigma`; alone, a fit
+    is biased by a neighbour's light.
+
+    With `motion_blur` as well, a close pair is two emitters only if it
+    gains `u^2 / 2` nats over one elongated spot, as an emitter moving
+    within the exposure is; otherwise it is one emitter at the ellipse's
+    centre, flagged `ELONGATED`, its width the geometric mean of the
+    ellipse's axes. Pairs closer than about `2 sigma` are so reported, so
+    leave it off where the exposure is short enough that emitters stay
+    round.
 
     `info["z"]` is each emitter's `sqrt(2 * likelihood ratio)`, at least
     `info["u"]`; `info["p_real"]` its probability of being real, at least
@@ -138,13 +143,13 @@ def localize(frame, sigma, *, offset=0.0, roi=None, p_real=P_REAL,
     raw = np.ascontiguousarray(frame, dtype=float)
     if raw.ndim != 2:
         raise ValueError(f"expected a 2-D frame, got shape {raw.shape}")
-    kw = _kw(sigma, offset, roi, raw.shape, p_real, width, fit_mixtures, max_mixtures)
+    kw = _kw(sigma, offset, roi, raw.shape, p_real, width, fit_mixtures, max_mixtures, motion_blur)
     return _result(_rs.detect_localize(raw, **kw), raw, kw, images)
 
 
 def localize_stack(stack, sigma, *, offset=0.0, roi=None, p_real=P_REAL,
                    width=WIDTH, fit_mixtures=False, max_mixtures=MAX_MIXTURES,
-                   n_threads=None, images=False):
+                   motion_blur=False, n_threads=None, images=False):
     """Localize every frame of a `(T, H, W)` stack, in parallel.
 
     Returns one `Localizations` per frame, in frame order. Each frame's
@@ -157,7 +162,7 @@ def localize_stack(stack, sigma, *, offset=0.0, roi=None, p_real=P_REAL,
     raw = np.ascontiguousarray(stack, dtype=float)
     if raw.ndim != 3:
         raise ValueError(f"expected a (T, H, W) stack, got shape {raw.shape}")
-    kw = _kw(sigma, offset, roi, raw.shape[1:], p_real, width, fit_mixtures, max_mixtures)
+    kw = _kw(sigma, offset, roi, raw.shape[1:], p_real, width, fit_mixtures, max_mixtures, motion_blur)
     outs = _rs.detect_localize_stack(
         raw, **kw, n_threads=_positive_int((os.cpu_count() or 1) if n_threads is None else n_threads,
                                 "n_threads"))
