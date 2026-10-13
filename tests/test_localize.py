@@ -33,6 +33,7 @@ def test_crowded_fields_hold_their_recall_and_precision(seed, density, spread,
     m = match(sim.positions, res.positions, radius=1.0)
     assert m.recall >= recall - 0.05
     assert m.precision >= precision - 0.05
+    assert np.all(res.info["z"] >= res.info["u"])
     assert np.all(np.isfinite(res.se)) and np.all(res.se > 0)
     assert np.all(np.isfinite(res.sigma_se)) and np.all(res.sigma_se > 0)
 

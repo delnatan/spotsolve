@@ -46,7 +46,8 @@
 //!    and is otherwise an emitter held at the bound. Equal bounds fix the
 //!    width.
 //! 5. The reported fit is settled at the weights its own light gives, and
-//!    standard errors come from its Fisher information.
+//!    standard errors come from its Fisher information. A component is
+//!    reported only if it still gains `u^2 / 2` nats there.
 
 use crate::fit::{Fitter, Layout, Window};
 use crate::posterior::{self, Posterior};
@@ -697,6 +698,13 @@ fn fit_seed(d: &[f64], h: usize, w: usize, sc: &Screen, seed: usize, at: &[bool]
             fate.others += 1;
             continue;
         };
+        // Reweighting moves the costs the decisions above were made at: a
+        // component is reported only if it gains the bar at the weights of
+        // its own fit.
+        if cost_j < bar {
+            fate.weak = true;
+            continue;
+        }
         // Wider than the reported widths, a component is out-of-focus light
         // only if it is [`WIDER`] standard errors wide of `w_hi`: holding
         // it there, the rest refitted, costs `WIDER^2 / 2` nats. Otherwise
