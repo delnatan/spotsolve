@@ -4,7 +4,7 @@ Emitter localization for fluorescence images, after u-track's
 `pointSourceDetection`, with frame-to-frame trajectory linking in which
 each track moves on its own diffusion scale. Each spot is fitted on its own window; with
 `fit_mixtures`, overlapping spots are fitted jointly. Every decision is a
-Poisson likelihood ratio at one bar, set per movie so that a reported spot
+likelihood ratio at one bar, set per movie so that a reported spot
 is real, not noise, with a chosen probability. Detection and fitting run in Rust, with movie frames processed
 in parallel.
 
@@ -54,14 +54,16 @@ Both return `Localizations` (one per frame for stacks):
 | `sigma_ratio` | `fit_sigma / sigma` |
 | `flags` | `(N,)` bitmask of `FitFlag` diagnostics; rows are retained |
 | `background` | Screening level map, NaN outside the processed crop |
-| `dispersion` | The frame's measured variance per unit signal |
+| `dispersion` | The camera's gain, pixel variance per ADU of light, measured from the movie |
 | `info` | `u`, per-emitter `z` and `p_real`, `fitted_background`, `seed`, `mixture`, and work counts |
 | `model_image`, `residual` | Optional diagnostic images |
 
 Flux and background use ADU above `offset`; divide flux by camera gain for
-photoelectrons. Uncertainties come from the expected Fisher information of
-each emitter's final window fit, scaled by the frame's dispersion; NaN if it
-cannot be computed. `info["z"]` is each emitter's `sqrt(2 * likelihood
+photoelectrons. Each pixel's variance is `info["read_variance"] +
+dispersion * light`, both measured from the movie without camera
+calibration. Uncertainties come from the Fisher information of each
+emitter's final window fit at those variances; NaN if it cannot be
+computed. `info["z"]` is each emitter's `sqrt(2 * likelihood
 ratio)`, at least the movie's bar `info["u"]`, and `info["p_real"]` its
 probability of being real rather than noise. `peak` varies with width and
 can exceed the brightest observed pixel when the emitter lies between
@@ -79,7 +81,7 @@ pixels.
 | `fit_mixtures` | False | Fit several emitters per window (u-track's FitMixtures) |
 | `max_mixtures` | 20 | Components per window at most |
 
-The frame is screened by a Poisson score test, seeds are placed at local
+The frame is screened by a score test on the camera's measured noise, seeds are placed at local
 maxima, and each seed's window is fitted with a constant level and
 pixel-integrated Gaussians. A spot is kept only if it gains `u^2/2` nats of
 likelihood. The movie sets `u`: every frame's spots, fitted alone at a low
@@ -90,7 +92,10 @@ adapts to each movie, and a frame's result depends on the stack it is in;
 reported widths is fitted as out-of-focus background and counted in
 `info["out_of_focus"]`. Use `fit_mixtures=True` wherever spots come closer
 than about `6 sigma`: single fits are biased by a neighbour's light and
-cannot separate pairs. See [detection](docs/DETECTION.md) for the method.
+cannot separate pairs. With mixtures, a close pair is two spots only if it
+beats one elongated spot by the same `u^2/2`, so an emitter moving within
+the exposure is one spot, flagged `ELONGATED`, and pairs closer than about
+`2 sigma` are reported as one. See [detection](docs/DETECTION.md) for the method.
 
 The ROI restricts seeding and crops work to its bounding box plus context;
 fitted positions can lie outside it. Use one mask covering the desired area,

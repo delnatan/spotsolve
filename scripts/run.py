@@ -47,10 +47,12 @@ def main(args):
                              fit_mixtures=args.mixtures)
     dt = time.time() - t
 
-    # The audit in the likelihood's own terms: dividing ADU by the measured
-    # dispersion puts a pixel's variance back at its mean.
-    d_e = (img.astype(float) - CAMERA_OFFSET) / res.dispersion
-    model = res.model_image / res.dispersion
+    # The audit in the likelihood's own terms: the read variance as a
+    # pedestal, then ADU over the measured gain, puts a pixel's variance back
+    # at its mean.
+    ped = res.info["read_variance"] / res.dispersion
+    d_e = (img.astype(float) - CAMERA_OFFSET + ped) / res.dispersion
+    model = (res.model_image + ped) / res.dispersion
     a = audit.audit_result(d_e, model, res.sigma)
     nr = (d_e - model) / np.sqrt(np.maximum(model, 1e-6))
 

@@ -3,7 +3,7 @@
 The bar on each emitter's likelihood ratio is set by the movie: the
 probability that an emitter of that ratio is real, not noise, is fitted to
 the candidates of every frame. An ROI restricts seeds; fitted centers may
-move outside it. The dispersion uses the available ROI context, so masked
+move outside it. The noise measurement uses the available ROI context, so masked
 results can differ from full-frame results.
 """
 
@@ -16,7 +16,7 @@ from .results import Localizations
 
 try:
     import spotsolve_rs as _rs
-    if getattr(_rs, "DETECT_OUTPUT_VERSION", 0) != 7:
+    if getattr(_rs, "DETECT_OUTPUT_VERSION", 0) != 8:
         raise ImportError("incompatible localization output; rebuild spotsolve_rs")
 except ImportError as error:          # pragma: no cover - build problem
     raise ImportError(
@@ -87,7 +87,12 @@ def localize(frame, sigma, *, offset=0.0, roi=None, p_real=P_REAL,
     `frame`, `offset`, flux and background use camera units (ADU). `sigma`
     is the in-focus PSF width in pixels.
 
-    The frame is screened by the Poisson score of one emitter at each pixel;
+    Every pixel's variance is the camera's noise curve at the light the
+    model puts on it, `info["read_variance"] + dispersion * light`, both
+    measured from the movie: the gain from the residuals of bright emitters,
+    the read variance from the background. No camera calibration is needed.
+
+    The frame is screened by the score of one emitter at each pixel;
     local maxima of the Laplacian of Gaussian where that score is high
     enough become seeds. Each seed is fitted alone on a window of
     `ceil(4 sigma)` px around it: a constant level plus one emitter, held
@@ -103,8 +108,8 @@ def localize(frame, sigma, *, offset=0.0, roi=None, p_real=P_REAL,
 
     An emitter is kept if it is real, not noise, with probability at least
     `p_real`. The probability comes from its likelihood ratio against the
-    level alone, `z = sqrt(2 * ratio)` in nats scaled by the frame's
-    measured dispersion: candidates fitted alone above a low bar have a
+    level alone, `z = sqrt(2 * ratio)` in nats of the Gaussian likelihood at
+    each pixel's variance: candidates fitted alone above a low bar have a
     density of `z` that noise alone, by theory, would give only in part,
     and `P(real | z)` is the part noise does not explain. The emitter is
     kept where `z >= u`, the bar at which that reaches `p_real`. A single
@@ -116,7 +121,11 @@ def localize(frame, sigma, *, offset=0.0, roi=None, p_real=P_REAL,
     `max_mixtures`; then the weakest is removed while removing it, the rest
     refitted, costs less. Neighbours inside a window are fitted with it, and
     each component is reported by the fit of the seed nearest to it; copies
-    of one emitter from two windows are merged.
+    of one emitter from two windows are merged. A close pair is two emitters
+    only if it gains `u^2 / 2` nats over one elongated spot, as an emitter
+    moving within the exposure is; otherwise it is one emitter at the
+    ellipse's centre, flagged `ELONGATED`, its width the geometric mean of
+    the ellipse's axes. Pairs closer than about `2 sigma` are so reported.
     `info["mixture"]` numbers the windows that held several components (0:
     fitted alone). Use mixtures wherever spots come closer than about
     `6 sigma`; alone, a fit is biased by a neighbour's light.
@@ -139,8 +148,8 @@ def localize_stack(stack, sigma, *, offset=0.0, roi=None, p_real=P_REAL,
     """Localize every frame of a `(T, H, W)` stack, in parallel.
 
     Returns one `Localizations` per frame, in frame order. Each frame's
-    background and dispersion are its own; the bar `u` and `P(real | z)` are
-    the movie's, fitted to the candidates of every frame, so a frame's
+    background is its own; the camera's noise curve, the bar `u` and
+    `P(real | z)` are the movie's, fitted to every frame, so a frame's
     result depends on the stack it is in. `n_threads` defaults to the machine's cores.
     `images` defaults to False here: for a long timecourse the model and
     residual are two more copies of the movie.

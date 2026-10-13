@@ -1,7 +1,7 @@
 """Emitter localization and Brownian-motion LAP tracking for microscopy.
 
 `localize` / `localize_stack` follow u-track's pointSourceDetection: a
-Poisson significance screen, one window fit per seed, and a decision whose
+significance screen on the camera's measured noise, one window fit per seed, and a decision whose
 one knob, `p_real`, is the least probability that a reported emitter is real
 rather than noise, fitted per movie. `fit_mixtures=True` fits overlapping spots jointly.
 Each returns `Localizations`; stack functions process frames in native workers.

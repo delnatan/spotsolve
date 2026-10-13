@@ -55,10 +55,13 @@ covariance are separate: finite SEs do not imply convergence.
 
 ## Uncertainty and significance
 
-SEs use the expected Fisher information of the emitter's final window fit,
-every component, width and the window's level free, scaled by the frame's
-dispersion. They are local approximations; bounds, low counts, light from
-outside the window and PSF mismatch can invalidate coverage.
+SEs use the Fisher information of the emitter's settled window fit, every
+component, width and the window's level free, at each pixel's measured
+variance (`read_variance + dispersion * light`). They are local
+approximations; bounds, low counts, light from outside the window and PSF
+mismatch can invalidate coverage. An `ELONGATED` emitter's SEs are those of
+its ellipse's centre and flux; its width's SE is that of the geometric mean
+of the axes.
 
 `z` (table column; `result.info["z"]`) is each emitter's
 `sqrt(2 * likelihood ratio)`: what removing it, the rest of its window

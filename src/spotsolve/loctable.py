@@ -45,7 +45,8 @@ FRAME_SCHEMA = {
     "median_flux": pl.Float64,
     "median_se_pos": pl.Float64,
     "background": pl.Float64,         # median of the background surface
-    "dispersion": pl.Float64,         # measured variance per unit signal, ADU
+    "dispersion": pl.Float64,         # measured camera gain, variance per ADU of light
+    "read_variance": pl.Float64,      # measured read variance, ADU^2
     "seconds": pl.Float64,            # wall clock for this frame's search
 }
 
@@ -121,6 +122,7 @@ def frame_tables(result, frame, t=0.0, pixel_size=1.0,
                               if n else float("nan")],
             "background": [_finite_median(result.background)],
             "dispersion": [float(result.dispersion)],
+            "read_variance": [float(result.info.get("read_variance", float("nan")))],
             "seconds": [float(seconds)],
         },
         schema=FRAME_SCHEMA,

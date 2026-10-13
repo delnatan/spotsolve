@@ -3,7 +3,7 @@
 `localize` and `localize_stack` follow u-track's `pointSourceDetection`
 (Aguet et al. 2013, *Dev. Cell* 26:279): screen the frame for significant
 signal, seed at local maxima, fit each seed on its own window, and with
-`fit_mixtures` fit several emitters per window. Every decision is a Poisson
+`fit_mixtures` fit several emitters per window. Every decision is a
 likelihood ratio at one bar, set per movie so that a reported emitter is
 real, not noise, with probability at least `p_real`.
 
@@ -11,34 +11,54 @@ real, not noise, with probability at least `p_real`.
 
 Work in camera units: `d = frame - offset`. A window around a seed holds a
 constant level `c` and components of flux `A`, centre `(y, x)` and width `s`,
-each a Gaussian integrated over every pixel:
+each a Gaussian integrated over every pixel, and each pixel is Gaussian of
+the variance the camera gives the light on it:
 
 ```text
 m[i,j] = c + sum_k A_k * E(i; y_k, s_k) * E(j; x_k, s_k)
 E(i; y, s) = 0.5 * [erf((i-y+0.5)/(s*sqrt(2))) - erf((i-y-0.5)/(s*sqrt(2)))]
-I(d,m) = sum_pixels [d*log(d/m) - (d-m)]
+v[i,j] = read + gain * m[i,j]
+I(d,m) = sum_pixels (d - m)^2 / (2 v)
 ```
 
-Pixels below the offset count as zero. Camera pixels are not Poisson in ADU;
-one scalar dispersion `phi`, the variance per unit mean, converts: `I/phi` is
-the log-likelihood in nats. No gain or read-noise calibration is needed;
-fluxes scale with the gain, positions and decisions do not.
+`I` is the negative log-likelihood in nats. The weights follow the model:
+each pixel's variance is that of the light the current fit puts there,
+refreshed as components are added and removed, and the reported fit is
+settled once at its own weights, as iteratively reweighted least squares
+does.
 
-`phi` is measured on each frame. The separable fourth difference `b`
-(`[1, -4, 6, -4, 1]` along each axis) has variance `70^2 phi mbar`, `mbar`
-the local mean under the weights `k^2 / 70^2`, wherever the light is smooth
-on its 5-pixel scale. `phi` is the median of `b^2 / mbar` over the median of
-`70^2 chi2_1`. Variance and mean come from the same pixels with the same
-weights, so a varying background or an emitter's light raises both alike;
-an emitter's curvature adds to `b` alone and can only raise `phi`.
+## Noise
+
+`read + gain * light` is how a camera's pixel varies: read noise (with any
+error in the offset), then shot noise, `gain` the gain times any
+excess-noise factor. Both are measured from the movie; no calibration is
+needed, and fluxes scale with the gain while positions and decisions do not.
+
+- **Background.** The separable fourth difference `b` (`[1, -4, 6, -4, 1]`
+  along each axis) of pixels of variance `v` has variance `70^2 v` wherever
+  the light is smooth on its 5-pixel scale, so `b^2 / 70^2` has the median
+  of `v chi2_1`. Its median over each 32-pixel tile, away from candidate
+  spots, against the tile's median level, is one point of the curve.
+- **Gain.** Bright emitters span a wide range of light. Probe fits (every
+  light in their windows fitted, at a bar where noise almost never takes a
+  component) leave residuals whose squares, each corrected for its pixel's
+  leverage, over `v` are `chi2_1`; the gain sets their median to that
+  law's. A median, so a neighbour's light on a few pixels does not move it.
+  Frames are probed, spread over the movie, until their pixels fix the gain.
+- **Read variance.** The background's points, less the gain's share of their
+  light: their median.
+
+No pixel is taken as quieter than the quietest background tile. Without
+bright emitters the gain is the background's variance per unit level, exact
+without read noise and otherwise an upper bound.
 
 ## Algorithm
 
 1. **Screen.** At every pixel, regress the `ceil(4 sigma)` window (cut at
    the frame's edge) on one pixel-integrated PSF and a constant. The mask
-   holds pixels whose Poisson score test of the flux,
-   `z = A |g - gbar| / sqrt(phi * c0)`, reaches 2. The noise comes from
-   the Poisson model rather than the window's residual, so a neighbour does
+   holds pixels whose score test of the flux, `z = A |g - gbar| / sqrt(V)`
+   at the window level's variance `V`, reaches 2. The noise comes from the
+   camera's curve rather than the window's residual, so a neighbour does
    not hide a spot.
 2. **Seeds.** Local maxima of the negative Laplacian of Gaussian inside the
    mask. The bar sits a full unit under the lowest height the posterior
@@ -47,7 +67,7 @@ an emitter's curvature adds to `b` alone and can only raise `phi`.
 3. **Window fits.** Pixels of other mask components are left out. Components
    are fitted by bounded Levenberg-Marquardt (Coleman-Li scaling), each with
    its own width. A component is kept only if adding it gains `u^2/2` nats:
-   `2 (I_k - I_k+1) / phi >= u^2`.
+   `2 (I_k - I_k+1) >= u^2`.
    - **Single fits** (default): one component starting at the seed, its
      centre held within `2 sigma` of it.
    - **Mixtures** (`fit_mixtures=True`): components are added where the
@@ -57,6 +77,13 @@ an emitter's curvature adds to `b` alone and can only raise `phi`.
      it, the rest refitted, costs less. Every source of light in the window
      takes a component, so a neighbour is a nuisance parameter rather than a
      bias.
+   - **Elongated spots** (mixtures): an emitter moving within the exposure
+     is one elongated spot that two round components tile. A close pair is
+     two emitters only if it gains `u^2/2` nats over one rotated Gaussian at
+     the same pixel variances; otherwise it is one emitter at the ellipse's
+     centre, flagged `ELONGATED`, its width the geometric mean of the axes.
+     Pairs closer than about `2 sigma` are not told from a streak, and are
+     reported so.
 4. **Ownership.** Each component is reported by the fit of the seed nearest
    to it, and only those are tested for removal. A component held on a
    position bound is not reported. Two windows may each place an emitter
@@ -72,17 +99,17 @@ an emitter's curvature adds to `b` alone and can only raise `phi`.
    the bound, to the window's half-side, as out-of-focus light that narrower
    components would otherwise split. It is out-of-focus light only if its
    width is 2 standard errors beyond the bound: holding it at the bound, the
-   rest refitted, costs `2` nats (`phi`-scaled). It is then counted in
+   rest refitted, costs `2` nats. It is then counted in
    `info["out_of_focus"]`, not reported. Otherwise it is an emitter at the
    bound, flagged `AT_BOUND`, if it still gains `u^2/2` there. A one-sided
    test, so an emitter on the bound is lost to its fitted width in 2.3% of
    frames; deciding on the fitted width alone would lose half.
    `width=(1, 1)` fixes every width at `sigma`.
-6. **Uncertainties.** Standard errors from the inverse expected Fisher
-   information `J^T diag(1/m) J` of each emitter's final window fit, every
-   component and the level free, scaled by `phi`.
+6. **Uncertainties.** Standard errors from the inverse Fisher information
+   `J^T diag(1/v) J` of each emitter's settled window fit, every component
+   and the level free.
 
-`info["z"]` is each emitter's `sqrt(2 * cost / phi)`, the cost being what
+`info["z"]` is each emitter's `sqrt(2 * cost)`, the cost being what
 removing it (the rest refitted) loses: at least `u`. `info["mixture"]`
 numbers the windows that held several components; `info["seed"]` is the
 seed each emitter was reported from; `info["duplicates"]` counts components
@@ -129,9 +156,10 @@ L3 = (a - b) / 4,   L2 = a / 4,   L1 = a / (2 pi) - 3 (a - b) / (8 pi)
 ```
 
 and `f0 = -dEC/dz`. With fixed widths it reduces to `EC = z exp(-z^2/2) /
-(2 pi)^(3/2) / (2 v)`. On pure Poisson noise the detector's maxima exceed
-`EC` by up to 1.4x at `z` 3-4 (Poisson skew and the width search), about
-0.3 nats, which shifts `u` by under 0.1.
+(2 pi)^(3/2) / (2 v)`. `EC` is exact for Gaussian noise. Shot noise is
+skewed, and the score, linear in the data, inherits the skew: on skewed
+noise the detector's maxima exceed `EC` at a given `z`, most with few
+counts per pixel and with an excess-noise factor.
 
 **The emitters.** `f1` is fitted from 3 to the highest candidate: heights
 are counted in 60 bins even in `log z`, each count Poisson with mean `E0 +
@@ -195,6 +223,9 @@ The bar is learned from the heights of emitters fitted alone. A
 component's `z` in a mixture is lowered by the light its neighbours share,
 so where every emitter is equally bright, as in the benchmark's pairs, the
 second of a close pair can fall under a bar set by the absence of moderate
-heights; with a spread of fluxes it does not. `phi` is one number per
-frame: it takes pixels to be independent, and read noise, whose variance
-does not grow with the mean, makes it depend on the level.
+heights; with a spread of fluxes it does not. The camera's curve is one per
+movie: it takes pixels to be independent and alike, so an sCMOS camera's
+pixel-to-pixel spread of read noise and offset enters as its median.
+Fitted to Gaussian pixels, shot noise's skew is left out, so a pure-noise
+frame's false emitters per pixel exceed the null's on skewed noise, most in
+mixtures and with an excess-noise factor.

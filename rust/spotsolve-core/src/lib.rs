@@ -1,7 +1,7 @@
 //! `spotsolve` core: emitter detection and localization.
 //!
 //! The detector is [`detect`], after u-track's `pointSourceDetection`:
-//! [`prefilter`] screens the frame by a Poisson score test and proposes
+//! [`prefilter`] screens the frame by a score test on the camera's noise and proposes
 //! LoG seeds; each is fitted on its own window by [`fit`] and kept if it
 //! is real, not noise, with the probability [`posterior`] gives its
 //! likelihood ratio over the movie. `tests/layer7_localize.rs` holds it to
@@ -22,6 +22,7 @@
 //! machines.
 
 pub mod detect;
+pub mod ellipse;
 mod frames;
 pub mod filters;
 pub mod fit;

@@ -1,31 +1,42 @@
 //! Spot detection in ADU above the camera offset, after u-track's
 //! `pointSourceDetection` (Aguet et al. 2013, *Dev. Cell* 26:279).
 //!
-//! The movie sets the bar `u` on every decision ([`localize_stack`]): each
-//! frame's seeds are fitted alone at [`posterior::CANDIDATE`], and `u` is
-//! the least root likelihood ratio from which an emitter is real, not
-//! noise, with probability `p_real` ([`Posterior`]). Each frame is then:
+//! The movie sets two things every decision rests on ([`localize_stack`]):
 //!
-//! 1. Dispersion `phi` from the frame ([`prefilter::dispersion`]).
-//! 2. Seeds: LoG maxima where the Poisson score of one emitter reaches
+//! - The camera's noise curve, pixel variance `read + gain light`
+//!   ([`prefilter::Curve`]), measured from the movie without calibration
+//!   ([`camera`]): the gain from the residuals of bright emitters, the read
+//!   variance from the background. Every pixel's variance is the curve at
+//!   the light the model puts on it.
+//! - The bar `u`: each frame's seeds are fitted alone at
+//!   [`posterior::CANDIDATE`], and `u` is the least root likelihood ratio
+//!   from which an emitter is real, not noise, with probability `p_real`
+//!   ([`Posterior`]).
+//!
+//! Each frame is then:
+//!
+//! 1. Seeds: LoG maxima where the score of one emitter reaches
 //!    [`posterior::CANDIDATE`], with the mask's labels
 //!    ([`prefilter::screen`]).
-//! 3. Each seed's window ([`crate::fit`]), `ceil(4 sigma)` px around it, holds a
+//! 2. Each seed's window ([`crate::fit`]), `ceil(4 sigma)` px around it, holds a
 //!    constant level and pixel-integrated Gaussian components; pixels of
-//!    other mask components are left out. A component is kept if adding it
-//!    gains `u^2 / 2` nats, `2 (I_k - I_k+1) / phi >= u^2`.
+//!    other mask components are left out. The likelihood is Gaussian at each
+//!    pixel's variance, reweighted as components are added and removed. A
+//!    component is kept if adding it gains `u^2 / 2` nats.
 //!    - Alone, one component starts at the seed and its centre is held
 //!      within [`CONFINE`] widths of it.
 //!    - With mixtures, components are added where the efficient score
 //!      peaks ([`propose`]) while each refit gains as much, then the
 //!      weakest is removed while removing it, the rest refitted, costs
 //!      less. Every source of light in the window takes a component, so a
-//!      neighbour is a nuisance parameter rather than a bias.
-//! 4. Each component is reported by the fit of the seed nearest to it
+//!      neighbour is a nuisance parameter rather than a bias. A close pair
+//!      is two emitters only if it gains as much over one elongated spot
+//!      ([`crate::ellipse`]), as an emitter moving within the exposure is.
+//! 3. Each component is reported by the fit of the seed nearest to it
 //!    ([`owned`]), and only those are tested for removal; copies of one
 //!    emitter from two fits are merged ([`merge`]). A component held at a
 //!    position bound is not reported.
-//! 5. Every component has its own width. Emitters are reported in `width *
+//! 4. Every component has its own width. Emitters are reported in `width *
 //!    sigma` (by default [`WIDTH`]); the null of `u` is that of a search over
 //!    position and width ([`prefilter::false_rate`]). A component may widen
 //!    past that to the window's half-side as out-of-focus light, which
@@ -33,8 +44,8 @@
 //!    reported, once it is [`WIDER`] standard errors wider than the bound,
 //!    and is otherwise an emitter held at the bound. Equal bounds fix the
 //!    width.
-//! 6. Standard errors from the reported fit's Fisher information, scaled by
-//!    `phi`.
+//! 5. The reported fit is settled at the weights its own light gives, and
+//!    standard errors come from its Fisher information.
 
 use crate::fit::{Fitter, Layout, Window};
 use crate::posterior::{self, Posterior};
@@ -80,6 +91,25 @@ pub fn widest(sigma: f64) -> f64 {
 /// fewer. A point estimate alone would drop half of those on the bound.
 pub const WIDER: f64 = 2.0;
 
+/// Root likelihood ratio of the emitters whose residuals measure the
+/// camera's gain ([`camera`]): bright enough that their own light, not the
+/// background's, sets their pixels' variance.
+pub const PROBE: f64 = 8.0;
+/// The bar on every other component of a probe's window: high enough that a
+/// window of noise almost never takes one (its expected number, the window's
+/// area times [`prefilter::false_rate`], well under 1%), since a component
+/// fitted to noise absorbs the residuals the gain is measured from.
+pub const PROBE_BAR: f64 = 4.0;
+/// Probe pixels needed to measure the gain: the median of `n` draws of
+/// chi-squared(1) has relative sd `2.33 / sqrt(n)`, 20% at 128.
+pub const PROBE_PIXELS: usize = 128;
+/// Probe pixels enough to stop probing: the gain to about 2%, which moves
+/// standard errors by 1%.
+pub const PROBE_ROWS: usize = 10_000;
+/// Frames probed at a time, fixed so that the result does not depend on
+/// the number of threads.
+pub const PROBE_CHUNK: usize = 4;
+
 /// Widths: two reports from different windows closer than this, each the
 /// other window's nearest component, are one emitter fitted twice
 /// ([`merge`]). Two fits of one emitter differ by how they share its
@@ -92,6 +122,9 @@ pub const FLAG_NOT_CONVERGED: u8 = 2;
 pub const FLAG_STALLED: u8 = 4;
 pub const FLAG_COVARIANCE: u8 = 8;
 pub const FLAG_BOUND: u8 = 16;
+/// Reported as one elongated spot rather than the close pair that tiled it
+/// ([`crate::ellipse`]); the width is the geometric mean of its axes.
+pub const FLAG_ELONGATED: u8 = 32;
 
 /// Widths from a frame edge within which an emitter is flagged
 /// [`FLAG_EDGE`]: part of its light falls outside the frame.
@@ -146,14 +179,14 @@ pub struct Output {
     pub flags: Vec<u8>,
     /// `N`: the root of each emitter's likelihood ratio, the cost of
     /// removing it with the rest of its window refitted, `sqrt(2 (I_without
-    /// - I) / phi)`; at least `u`.
+    /// - I))`, `I` in nats; at least `u`.
     pub z: Vec<f64>,
     /// `N`: the probability each emitter is real, not noise, from its `z`
     /// ([`Posterior`]); at least `p_real`.
     pub p_real: Vec<f64>,
     /// `N`: the fitted level of each emitter's window.
     pub fitted_background: Vec<f64>,
-    /// Scalar dispersion: pixel variance per unit of signal.
+    /// The camera's gain: pixel variance per ADU of light ([`camera`]).
     pub dispersion: f64,
     /// `H*W`: the screening level (the window regression's constant); NaN
     /// outside the processed crop.
@@ -181,6 +214,15 @@ pub struct Output {
     /// Components [`WIDER`] than the reported widths, fitted as
     /// out-of-focus light and returned as background.
     pub out_of_focus: usize,
+    /// `(m, r^2 / (1 - h))` on the pixels of bright emitters: the model's
+    /// light and the leverage-corrected squared residual ([`camera`]).
+    resid: Vec<[f64; 2]>,
+    /// The frame's points of its noise curve ([`prefilter::noise_points`]),
+    /// and its variance per unit level ([`prefilter::dispersion`]).
+    points: Vec<[f64; 3]>,
+    phi: f64,
+    /// The camera's read variance, ADU^2 ([`camera`]).
+    pub read_variance: f64,
 }
 
 /// One emitter as fitted, in crop coordinates.
@@ -203,9 +245,19 @@ struct Spot {
     mixture: u32,
 }
 
+/// Each pixel's variance is the camera's `curve` at the light the window's
+/// model puts on it.
+struct Noise {
+    curve: prefilter::Curve,
+    /// Fit only bright seeds, for their residuals ([`camera`]).
+    probe: bool,
+}
+
 /// What became of one seed's window.
 #[derive(Default)]
 struct Fate {
+    /// See [`Output`]'s `resid`.
+    resid: Vec<[f64; 2]>,
     spots: Vec<Spot>,
     weak: bool,
     unconfined: bool,
@@ -220,18 +272,13 @@ struct Fate {
     components: Vec<(f64, f64)>,
 }
 
-/// `I(d, c)` of the used pixels for a constant level alone, at its minimum
-/// `c = mean(max(d, 0))`: `I` reads a pixel below the offset as 0 counts,
-/// as in the fitted models.
+/// `I(d, c)` of the used pixels for a constant level alone, at its minimum,
+/// the variance-weighted mean.
 fn level_divergence(win: &Window) -> f64 {
-    let (n, sum) = win.d.iter().zip(&win.used).filter(|p| *p.1).fold((0.0, 0.0), |(n, s), (d, _)| (n + 1.0, s + d.max(0.0)));
-    let c = (sum / n).max(prefilter::LEVEL_FLOOR);
-    win.d
-        .iter()
-        .zip(&win.used)
-        .filter(|p| *p.1)
-        .map(|(&d, _)| if d > 0.0 { d * (d / c).ln() } else { 0.0 } - (d - c))
-        .sum()
+    let used = || win.d.iter().zip(&win.v).zip(&win.used).filter(|p| *p.1).map(|p| p.0);
+    let (sw, swd) = used().fold((0.0, 0.0), |(a, b), (&d, &v)| (a + 1.0 / v, b + d / v));
+    let c = swd / sw;
+    used().map(|(&d, &v)| 0.5 * (d - c) * (d - c) / v).sum()
 }
 
 /// Parameter bounds of components in one window: the level, each
@@ -287,7 +334,7 @@ fn propose(win: &Window, fitter: &mut Fitter, theta: &[f64], lay: Layout, k1: &[
     if projected {
         chol.forward_in_place(&mut lg);
     }
-    let weighted = |v: &dyn Fn(usize) -> f64| -> Vec<f64> { (0..p).map(|q| if win.used[q] { v(q) / lin.m[q] } else { 0.0 }).collect() };
+    let weighted = |v: &dyn Fn(usize) -> f64| -> Vec<f64> { (0..p).map(|q| if win.used[q] { v(q) / win.v[q] } else { 0.0 }).collect() };
     let k2: Vec<f64> = k1.iter().map(|v| v * v).collect();
     let u_map = prefilter::correlate(&weighted(&|q| win.d[q] - lin.m[q]), rows, cols, k1);
     let i_map = prefilter::correlate(&weighted(&|_| 1.0), rows, cols, &k2);
@@ -340,7 +387,7 @@ fn propose(win: &Window, fitter: &mut Fitter, theta: &[f64], lay: Layout, k1: &[
 /// `u^2 / 2` nats, then the weakest is removed while removing it, the rest
 /// refitted, costs less than that. Without mixtures, at most one.
 #[allow(clippy::too_many_arguments)]
-fn fit_seed(d: &[f64], h: usize, w: usize, sc: &Screen, seed: usize, at: &[bool], s: &Settings, phi: f64, u: f64, k1: &[f64], fitter: &mut Fitter) -> Fate {
+fn fit_seed(d: &[f64], h: usize, w: usize, sc: &Screen, seed: usize, at: &[bool], s: &Settings, u: f64, k1: &[f64], fitter: &mut Fitter, noise: &Noise) -> Fate {
     let mut fate = Fate::default();
     let (sy, sx) = (seed / w, seed % w);
     let r = s.radius();
@@ -356,8 +403,16 @@ fn fit_seed(d: &[f64], h: usize, w: usize, sc: &Screen, seed: usize, at: &[bool]
             used.push(sc.labels[i] == 0 || sc.labels[i] == own);
         }
     }
-    let win = Window::new(rows, cols, wd, used);
+    let level0 = sc.background[seed];
+    let mut win = Window::new(rows, cols, wd, used, vec![noise.curve.at(level0); rows * cols]);
     let dmax = win.d.iter().zip(&win.used).filter(|p| *p.1).fold(1.0f64, |m, (&v, _)| m.max(v));
+    let dmin = win.d.iter().zip(&win.used).filter(|p| *p.1).fold(0.0f64, |m, (&v, _)| m.min(v));
+    // Each pixel's variance from the light the model puts there: the
+    // variance of the light being tested, not of a hypothesis about it.
+    let reweight = |win: &mut Window, fitter: &mut Fitter, theta: &[f64], lay: Layout| {
+        let m = fitter.model(win, theta, lay).to_vec();
+        win.v = m.iter().map(|&m| noise.curve.at(m)).collect();
+    };
     let (cy, cx) = ((sy - y0) as f64, (sx - x0) as f64);
     // Alone, a component is held near its seed; in a mixture anywhere in
     // the window.
@@ -367,7 +422,7 @@ fn fit_seed(d: &[f64], h: usize, w: usize, sc: &Screen, seed: usize, at: &[bool]
     let (w_lo, w_hi) = s.widths();
     let w_fit = if w_lo >= w_hi { (w_lo, w_lo) } else { (w_lo, r as f64) };
     let b = Bounds {
-        level: (prefilter::LEVEL_FLOOR, 2.0 * dmax),
+        level: (dmin - (dmax - dmin), 2.0 * dmax),
         flux: (0.0, 10.0 * dmax / psf::peak_factor(s.sigma)),
         centre: if s.fit_mixtures {
             (-0.5, rows as f64 - 0.5, -0.5, cols as f64 - 0.5)
@@ -376,8 +431,8 @@ fn fit_seed(d: &[f64], h: usize, w: usize, sc: &Screen, seed: usize, at: &[bool]
         },
         width: (w_fit.0, w_fit.1),
     };
-    let tol = FIT_TOL * phi;
-    let bar = u * u * phi / 2.0;
+    let tol = FIT_TOL;
+    let bar = u * u / 2.0;
     let max_k = if s.fit_mixtures { s.max_mixtures.max(1) } else { 1 };
     let lay = Layout { k: 0, sigma: (w_lo >= w_hi).then_some(w_lo) };
     let held = |theta: &[f64], at: &[bool]| {
@@ -385,15 +440,18 @@ fn fit_seed(d: &[f64], h: usize, w: usize, sc: &Screen, seed: usize, at: &[bool]
         (0..lay.k).any(|j| at[lay.at(j) + 1] || at[lay.at(j) + 2])
     };
 
-    let mut theta = vec![sc.background[seed].clamp(b.level.0, b.level.1)];
+    let mut theta = vec![level0.clamp(b.level.0, b.level.1)];
     // The level alone: the null the first component is tested against.
-    let null = level_divergence(&win);
-    let mut div = null;
+    let mut div = level_divergence(&win);
 
     // Forward: each new component where the efficient score peaks.
     let mut fit = None;
     let mut k = 0;
     while k < max_k {
+        if k > 0 {
+            reweight(&mut win, fitter, &theta, lay.with(k));
+            div = fitter.divergence(&win, &theta, lay.with(k));
+        }
         // Alone, the component starts at its seed. In a mixture the seed
         // only centres the window: every component, the first too, starts
         // where the efficient score peaks, and ownership decides which are
@@ -443,12 +501,12 @@ fn fit_seed(d: &[f64], h: usize, w: usize, sc: &Screen, seed: usize, at: &[bool]
         let q = lay.at(j);
         owned(seed, theta[q + 1] + y0 as f64, theta[q + 2] + x0 as f64, w, h, at)
     };
-    let removal = |fitter: &mut Fitter, theta: &[f64], j: usize, div: f64| {
+    let removal = |fitter: &mut Fitter, win: &Window, theta: &[f64], j: usize, div: f64| {
         let k = k_of(theta);
         let (lo, hi) = b.of(lay.with(k - 1));
         let mut start = theta.to_vec();
         start.drain(lay.at(j)..lay.at(j) + lay.stride());
-        let f = fitter.fit(&win, &start, lay.with(k - 1), &lo, &hi, FIT_MAX_ITER, tol);
+        let f = fitter.fit(win, &start, lay.with(k - 1), &lo, &hi, FIT_MAX_ITER, tol);
         (f.divergence - div, f)
     };
     // One component left costs its gain over the level alone, which every
@@ -457,14 +515,16 @@ fn fit_seed(d: &[f64], h: usize, w: usize, sc: &Screen, seed: usize, at: &[bool]
     let mut cost: Vec<Option<f64>>;
     loop {
         let k = k_of(&theta);
+        reweight(&mut win, fitter, &theta, lay.with(k));
+        div = fitter.divergence(&win, &theta, lay.with(k));
         if k == 1 {
-            cost = vec![Some(null - div)];
+            cost = vec![Some(level_divergence(&win) - div)];
             break;
         }
         cost = vec![None; k];
         let mut weakest: Option<(f64, crate::fit::Fit)> = None;
         for j in (0..k).filter(|&j| mine(&theta, j)) {
-            let (c, f) = removal(fitter, &theta, j, div);
+            let (c, f) = removal(fitter, &win, &theta, j, div);
             cost[j] = Some(c);
             if weakest.as_ref().is_none_or(|w| c < w.0) {
                 weakest = Some((c, f));
@@ -473,7 +533,6 @@ fn fit_seed(d: &[f64], h: usize, w: usize, sc: &Screen, seed: usize, at: &[bool]
         match weakest {
             Some((c, f)) if c < bar => {
                 fate.removed += 1;
-                div = f.divergence;
                 theta = f.theta.clone();
                 fit = f;
             }
@@ -482,6 +541,21 @@ fn fit_seed(d: &[f64], h: usize, w: usize, sc: &Screen, seed: usize, at: &[bool]
     }
 
     let lay = lay.with(k_of(&theta));
+    // Settle: refit once at the weights the fit's own light gives, as
+    // iteratively reweighted least squares does, so that the estimate is
+    // efficient and its standard errors are its own. Fits until now held the
+    // weights of the model before them, which lacks the light they added.
+    // Only fits that may be reported or enter the posterior need it.
+    if cost.iter().flatten().any(|&c| 2.0 * c >= posterior::Z_LO * posterior::Z_LO) {
+        let (lo, hi) = b.of(lay);
+        fit = fitter.fit(&win, &theta, lay, &lo, &hi, FIT_MAX_ITER, tol);
+        theta = fit.theta.clone();
+        reweight(&mut win, fitter, &theta, lay);
+    }
+    div = fitter.divergence(&win, &theta, lay);
+    if lay.k == 1 {
+        cost[0] = Some(level_divergence(&win) - div);
+    }
     let mut common = 0;
     if !fit.converged {
         common |= FLAG_NOT_CONVERGED;
@@ -493,17 +567,132 @@ fn fit_seed(d: &[f64], h: usize, w: usize, sc: &Screen, seed: usize, at: &[bool]
         common |= FLAG_BOUND;
     }
     fate.components = (0..lay.k).map(|j| (theta[lay.at(j) + 1] + y0 as f64, theta[lay.at(j) + 2] + x0 as f64)).collect();
-    let var = fitter.variances(&win, &theta, lay, phi).filter(|v| v.iter().all(|&v| v > 0.0));
+    // The brightest component this seed reports, with every light in its
+    // window fitted: its residuals measure the variance of light
+    // ([`camera`]).
+    let brightest = (0..lay.k).filter_map(|j| cost[j].map(|c| (c, j))).max_by(|a, b| a.0.total_cmp(&b.0));
+    if let Some((_, j)) = brightest.filter(|&(c, j)| noise.probe && 2.0 * c >= PROBE * PROBE && !(lay.at(j) + 1..lay.at(j) + lay.stride()).any(|q| fit.at_bound[q])) {
+        let q = lay.at(j);
+        let (ey, ex, sg) = (theta[q + 1], theta[q + 2], lay.sigma(&theta, j));
+        if let Some(lev) = fitter.leverages(&win, &theta, lay) {
+            let m = fitter.model(&win, &theta, lay).to_vec();
+            for r in 0..rows {
+                for c in 0..cols {
+                    let i = r * cols + c;
+                    if win.used[i] && lev[i] < 0.9 && (r as f64 - ey).powi(2) + (c as f64 - ex).powi(2) <= 4.0 * sg * sg {
+                        fate.resid.push([m[i], (win.d[i] - m[i]).powi(2) / (1.0 - lev[i])]);
+                    }
+                }
+            }
+        }
+    }
+    // Elongation: a close pair is two emitters only if it gains the bar over
+    // one elongated spot at the same pixel variances ([`crate::ellipse`]);
+    // otherwise it is one, at the ellipse's centre.
+    let mut consumed = vec![false; lay.k];
+    if s.fit_mixtures && lay.k > 1 && !noise.probe {
+        let total = fitter.model(&win, &theta, lay).to_vec();
+        let comp = |fitter: &mut Fitter, j: usize| -> Vec<f64> {
+            let q = lay.at(j);
+            let mut t = vec![0.0];
+            t.extend_from_slice(&theta[q..q + lay.stride()]);
+            fitter.model(&win, &t, lay.with(1)).to_vec()
+        };
+        let centre = |j: usize| (theta[lay.at(j) + 1], theta[lay.at(j) + 2]);
+        for j in 0..lay.k {
+            if consumed[j] || cost[j].is_none() || !mine(&theta, j) {
+                continue;
+            }
+            let (yj, xj) = centre(j);
+            // Partners are emitters themselves: within the reported widths
+            // and free of their bounds.
+            let emitter = |i: usize| fit.at_bound[lay.at(i) + 1] || fit.at_bound[lay.at(i) + 2];
+            let emitter = |i: usize| !emitter(i);
+            if !emitter(j) {
+                continue;
+            }
+            let near = (0..lay.k)
+                .filter(|&i| i != j && !consumed[i] && emitter(i))
+                .map(|i| (i, ((centre(i).0 - yj).powi(2) + (centre(i).1 - xj).powi(2)).sqrt()))
+                .filter(|&(i, d)| d <= 2.0 * (lay.sigma(&theta, i) + lay.sigma(&theta, j)))
+                .min_by(|a, b| a.1.total_cmp(&b.1));
+            let Some((i, sep)) = near else { continue };
+            let (li, lj) = (comp(fitter, i), comp(fitter, j));
+            let other: Vec<f64> = total.iter().zip(li.iter().zip(&lj)).map(|(t, (a, b))| t - theta[0] - a - b).collect();
+            let (ai, aj) = (theta[lay.at(i)], theta[lay.at(j)]);
+            let a = (ai + aj).max(1e-12);
+            let (yc, xc) = ((ai * centre(i).0 + aj * yj) / a, (ai * centre(i).1 + aj * xj) / a);
+            let sm = 0.5 * (lay.sigma(&theta, i) + lay.sigma(&theta, j));
+            let start = [theta[0], ai + aj, yc, xc, (sm * sm + 0.25 * sep * sep).sqrt().ln(), sm.ln(), (centre(i).1 - xj).atan2(centre(i).0 - yj)];
+            let (wl, wr) = (w_lo.ln(), (r as f64).ln());
+            let lo = [b.level.0, 0.0, b.centre.0, b.centre.2, wl, wl, -10.0];
+            let hi = [b.level.1, 2.0 * b.flux.1, b.centre.1, b.centre.3, wr, wr, 10.0];
+            let ef = crate::ellipse::fit(&win, &other, start, lo, hi, tol);
+            if ef.divergence - div >= bar {
+                continue;
+            }
+            consumed[i] = true;
+            consumed[j] = true;
+            fate.components.retain(|&(cy, cx)| (cy, cx) != (centre(i).0 + y0 as f64, centre(i).1 + x0 as f64) && (cy, cx) != (yj + y0 as f64, xj + x0 as f64));
+            let (ey, ex) = (ef.theta[2] + y0 as f64, ef.theta[3] + x0 as f64);
+            fate.components.push((ey, ex));
+            if !owned(seed, ey, ex, w, h, at) {
+                fate.others += 1;
+                continue;
+            }
+            // Its cost: the level alone in its place, the rest held.
+            let pts = || (0..win.d.len()).filter(|&q| win.used[q]);
+            let (sw, swd) = pts().fold((0.0, 0.0), |(s0, s1), q| (s0 + 1.0 / win.v[q], s1 + (win.d[q] - other[q]) / win.v[q]));
+            let c = swd / sw;
+            let null: f64 = pts().map(|q| 0.5 * (win.d[q] - other[q] - c).powi(2) / win.v[q]).sum();
+            let cost_e = null - ef.divergence;
+            if cost_e < bar {
+                fate.weak = true;
+                continue;
+            }
+            let mut flags = common | FLAG_ELONGATED;
+            let width = (0.5 * (ef.theta[4] + ef.theta[5])).exp();
+            // The width's SE through the log axes, their covariance left out.
+            let (se, se_s) = match ef.var {
+                Some(v) => ([v[1].sqrt(), v[2].sqrt(), v[3].sqrt()], 0.5 * width * (v[4] + v[5]).sqrt()),
+                None => {
+                    flags |= FLAG_COVARIANCE;
+                    ([f64::NAN; 3], f64::NAN)
+                }
+            };
+            fate.spots.push(Spot {
+                y: ey,
+                x: ex,
+                a: ef.theta[1],
+                s: width,
+                se,
+                se_s,
+                c: ef.theta[0],
+                z: (2.0 * cost_e).sqrt(),
+                flags,
+                seed,
+                window: 0,
+                mixture: seed as u32 + 1,
+            });
+        }
+    }
+    let var = fitter.variances(&win, &theta, lay).filter(|v| v.iter().all(|&v| v > 0.0));
     for j in 0..lay.k {
+        if consumed[j] {
+            continue;
+        }
         let q = lay.at(j);
         if fit.at_bound[q + 1] || fit.at_bound[q + 2] {
+            // Alone, settled onto its confinement.
+            fate.unconfined |= !s.fit_mixtures;
             continue;
         }
-        if !mine(&theta, j) {
+        // Owned when its cost was measured: a settling refit that moves it
+        // nearer another seed leaves it to that seed's fit.
+        let Some(mut cost_j) = cost[j].filter(|_| mine(&theta, j)) else {
             fate.others += 1;
             continue;
-        }
-        let mut cost_j = cost[j].expect("an owned component's cost");
+        };
         // Wider than the reported widths, a component is out-of-focus light
         // only if it is [`WIDER`] standard errors wide of `w_hi`: holding
         // it there, the rest refitted, costs `WIDER^2 / 2` nats. Otherwise
@@ -515,12 +704,12 @@ fn fit_seed(d: &[f64], h: usize, w: usize, sc: &Screen, seed: usize, at: &[bool]
             start[q + 3] = w_hi;
             let f = fitter.fit(&win, &start, lay, &lo, &hi, FIT_MAX_ITER, tol);
             let excess = f.divergence - div;
-            if excess >= WIDER * WIDER * phi / 2.0 || cost_j - excess < bar || f.at_bound[q + 1] || f.at_bound[q + 2] || !mine(&f.theta, j) {
+            if excess >= WIDER * WIDER / 2.0 || cost_j - excess < bar || f.at_bound[q + 1] || f.at_bound[q + 2] || !mine(&f.theta, j) {
                 fate.out_of_focus += 1;
                 continue;
             }
             cost_j -= excess;
-            let v = fitter.variances(&win, &f.theta, lay, phi).filter(|v| v.iter().all(|&v| v > 0.0));
+            let v = fitter.variances(&win, &f.theta, lay).filter(|v| v.iter().all(|&v| v > 0.0));
             Some((f, v))
         } else {
             None
@@ -555,7 +744,7 @@ fn fit_seed(d: &[f64], h: usize, w: usize, sc: &Screen, seed: usize, at: &[bool]
             se,
             se_s,
             c: theta[0],
-            z: (2.0 * cost_j / phi).sqrt(),
+            z: (2.0 * cost_j).sqrt(),
             flags,
             seed,
             window: 0,
@@ -673,23 +862,27 @@ pub fn localize(d: &[f64], h: usize, w: usize, roi: Option<&[bool]>, s: &Setting
     localize_raw(d, h, w, 0.0, roi, s)
 }
 
-/// One frame at the bar `u`.
-fn localize_with(d: &[f64], h: usize, w: usize, roi: Option<&[bool]>, s: &Settings, u: f64, fitter: &mut Fitter) -> Output {
+/// One frame at the bar `u` on the camera's noise `curve`; `None` probes
+/// the frame for it instead, on the frame's own ([`camera`]).
+#[allow(clippy::too_many_arguments)]
+fn localize_with(d: &[f64], h: usize, w: usize, roi: Option<&[bool]>, s: &Settings, u: f64, fitter: &mut Fitter, curve: Option<prefilter::Curve>) -> Output {
     assert_eq!(d.len(), h * w);
     let [r0, r1, c0, c1] = match roi {
         None => [0, h, 0, w],
         Some(m) => match roi_crop(m, h, w, s) {
             Some(b) => b,
-            None => return Output { background: vec![f64::NAN; h * w], dispersion: f64::NAN, u, ..Output::default() },
+            None => return Output { background: vec![f64::NAN; h * w], dispersion: f64::NAN, read_variance: f64::NAN, u, ..Output::default() },
         },
     };
     let (ch, cw) = (r1 - r0, c1 - c0);
     let cut = |v: &[f64]| -> Vec<f64> { (r0..r1).flat_map(|r| v[r * w + c0..r * w + c1].iter().copied()).collect() };
     let dc = cut(d);
     let rc: Option<Vec<bool>> = roi.map(|m| (r0..r1).flat_map(|r| m[r * w + c0..r * w + c1].iter().copied()).collect());
-    let phi = prefilter::dispersion(&dc, ch, cw);
-    let sc = prefilter::screen(&dc, ch, cw, s.sigma, phi, posterior::CANDIDATE, rc.as_deref());
-    let mut out = Output { dispersion: phi, u, n_seeds: sc.seeds.len(), ..Output::default() };
+    let sc = prefilter::screen(&dc, ch, cw, s.sigma, posterior::CANDIDATE, rc.as_deref(), curve);
+    let noise = Noise { curve: sc.curve, probe: curve.is_none() };
+    let mut out = Output { dispersion: sc.curve.gain, read_variance: sc.curve.read, u, n_seeds: sc.seeds.len(), ..Output::default() };
+    out.points = sc.points.clone();
+    out.phi = sc.phi;
     out.seeds = sc.seeds.iter().flat_map(|&i| [(i / cw + r0) as f64, (i % cw + c0) as f64]).collect();
     let k1 = prefilter::psf_kernel1d(s.sigma);
     let mut at = vec![false; ch * cw];
@@ -698,9 +891,10 @@ fn localize_with(d: &[f64], h: usize, w: usize, roi: Option<&[bool]>, s: &Settin
     }
     let mut spots = Vec::new();
     let mut fates = Vec::with_capacity(sc.seeds.len());
-    for &seed in &sc.seeds {
-        let mut fate = fit_seed(&dc, ch, cw, &sc, seed, &at, s, phi, u, &k1, fitter);
+    for &seed in sc.seeds.iter().filter(|&&q| !noise.probe || sc.z[q] >= PROBE) {
+        let mut fate = fit_seed(&dc, ch, cw, &sc, seed, &at, s, u, &k1, fitter, &noise);
         out.tally(&fate);
+        out.resid.append(&mut fate.resid);
         spots.extend(fate.spots.drain(..).map(|p| Spot { window: fates.len(), ..p }));
         fates.push(fate);
     }
@@ -751,8 +945,24 @@ pub fn localize_stack(
     assert_eq!(raw.len(), n * h * w);
     let frame = |t: usize| -> Vec<f64> { raw[t * h * w..(t + 1) * h * w].iter().map(|&r| r - offset).collect() };
     let alone = Settings { fit_mixtures: false, ..*s };
+    // Probes fit every light in their windows, so that a neighbour or an
+    // unresolved pair is not read as noise.
+    let probe = Settings { fit_mixtures: true, ..*s };
+    // The curve is the movie's: frames are probed, spread evenly over it in a
+    // fixed order, until their pixels measure the gain.
+    let order = spread(n);
+    let mut probes = Vec::new();
+    for chunk in order.chunks(PROBE_CHUNK) {
+        probes.extend(crate::frames::map(chunk.len(), n_threads, Fitter::default, |k, fitter| localize_with(&frame(chunk[k]), h, w, roi, &probe, PROBE_BAR, fitter, None)));
+        if probes.iter().map(|o: &Output| o.resid.len()).sum::<usize>() >= PROBE_ROWS {
+            break;
+        }
+    }
+    let points: Vec<[f64; 3]> = probes.iter().flat_map(|o| o.points.iter().copied()).collect();
+    let phi = probes.iter().map(|o| o.phi).sum::<f64>() / probes.len() as f64;
+    let k = camera(probes.iter().flat_map(|o| o.resid.iter()), &points, phi);
     let candidates = crate::frames::map(n, n_threads, Fitter::default, |t, fitter| {
-        localize_with(&frame(t), h, w, roi, &alone, posterior::CANDIDATE, fitter)
+        localize_with(&frame(t), h, w, roi, &alone, posterior::CANDIDATE, fitter, Some(k))
     });
     let area = n as f64 * roi.map_or((h * w) as f64, |m| m.iter().filter(|&&v| v).count() as f64);
     let (w_lo, w_hi) = s.widths();
@@ -762,7 +972,7 @@ pub fn localize_stack(
     // Fitted alone, the frames' emitters are their candidates above `u`;
     // mixtures refit every frame at `u`.
     let mut out = if s.fit_mixtures {
-        crate::frames::map(n, n_threads, Fitter::default, |t, fitter| localize_with(&frame(t), h, w, roi, s, u, fitter))
+        crate::frames::map(n, n_threads, Fitter::default, |t, fitter| localize_with(&frame(t), h, w, roi, s, u, fitter, Some(k)))
     } else {
         candidates.into_iter().map(|o| o.above(u)).collect()
     };
@@ -772,9 +982,72 @@ pub fn localize_stack(
     out
 }
 
+/// `0..n` in an order that spreads any prefix evenly over the movie: by the
+/// bit-reversed index.
+fn spread(n: usize) -> Vec<usize> {
+    if n <= 1 {
+        return (0..n).collect();
+    }
+    let bits = usize::BITS - (n - 1).leading_zeros();
+    (0..1usize << bits).map(|i| i.reverse_bits() >> (usize::BITS - bits)).filter(|&i| i < n).collect()
+}
+
+/// The camera's noise curve ([`prefilter::Curve`]), measured from the movie.
+/// Its gain is the value at which bright emitters' residuals have the size
+/// the curve gives them: each squared residual, corrected for the leverage
+/// `h` of its pixel that the fit absorbs, over the curve at the model's
+/// light, is chi-squared with one degree of freedom, and the gain sets its
+/// median to that law's. Emitters span a wide range of light, so the gain
+/// is determined in any frame that holds bright ones; a median, so a
+/// neighbour's light on a few of their pixels does not move it. The read
+/// variance then follows from the background ([`prefilter::read_given`]).
+/// With fewer than [`PROBE_PIXELS`], the gain is the background's variance
+/// per unit level, `phi` ([`prefilter::dispersion`]): exact without read
+/// noise, and otherwise an upper bound, read variance being positive.
+fn camera<'a>(rows: impl Iterator<Item = &'a [f64; 2]> + Clone, points: &[[f64; 3]], phi: f64) -> prefilter::Curve {
+    let n = rows.clone().count();
+    let fallback = prefilter::fit_curve(points);
+    if n < PROBE_PIXELS {
+        let gain = phi;
+        return prefilter::Curve { read: prefilter::read_given(points, gain), gain, floor: fallback.floor };
+    }
+    let curve = |gain: f64| prefilter::Curve { read: prefilter::read_given(points, gain), gain, floor: fallback.floor };
+    // Pixels whose ratio exceeds the median of chi-squared(1), less half: a
+    // decreasing function of the gain, zero at the answer.
+    let excess = |g: f64| {
+        let c = curve(g);
+        rows.clone().filter(|&&[m, r2]| r2 / c.at(m) > prefilter::CHI2_1_MEDIAN).count() as f64 - 0.5 * n as f64
+    };
+    if excess(0.0) <= 0.0 {
+        return curve(0.0);
+    }
+    // Start from the background's slope, else its variance: any positive
+    // start doubles to a bracket.
+    let start = if fallback.gain > 0.0 { fallback.gain } else { fallback.read.max(f64::MIN_POSITIVE) };
+    let (mut lo, mut hi) = (0.0, start);
+    while excess(hi) > 0.0 {
+        hi *= 2.0;
+    }
+    while hi - lo > 1e-12 * hi {
+        let g = 0.5 * (lo + hi);
+        if excess(g) > 0.0 { lo = g } else { hi = g }
+    }
+    curve(0.5 * (lo + hi))
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    #[test]
+    fn spread_orders_every_frame_once_prefixes_evenly() {
+        assert_eq!(spread(5), [0, 4, 2, 1, 3]);
+        for n in [0, 1, 2, 7, 39, 64] {
+            let mut o = spread(n);
+            o.sort();
+            assert_eq!(o, (0..n).collect::<Vec<_>>());
+        }
+    }
 
     /// Deterministic standard normals: an LCG through Box-Muller.
     pub(crate) fn normals(n: usize, mut state: u64) -> Vec<f64> {

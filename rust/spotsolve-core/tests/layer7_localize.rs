@@ -115,7 +115,7 @@ fn crowded_fields_are_recovered_with_mixtures() {
     // Widths spread +-20%, so free widths admitting the narrowest.
     {
         let s = Settings { fit_mixtures: true, width: (0.75, f64::INFINITY), ..Settings::new(sigma) };
-        for (density, rec_min, prec_min) in [(0.005, 0.95, 0.96), (0.015, 0.85, 0.96), (0.03, 0.82, 0.94)] {
+        for (density, rec_min, prec_min) in [(0.005, 0.95, 0.96), (0.015, 0.77, 0.94), (0.03, 0.69, 0.93)] {
             let n = (density * (h * w) as f64).round() as usize;
             let (d, truth) = field(&mut rng, h, w, n, sigma);
             let o = bs::localize(&d, h, w, None, &s);

@@ -10,7 +10,8 @@ exact Poisson maximum-likelihood amplitude. Positive and negative peaks
 identify patches to inspect; neither proves an emitter is missing or spurious.
 
 Inputs use units where variance approximately equals the mean (for ADU data,
-divide data and model by dispersion). The default peak threshold is a
+add `read_variance / dispersion` to data and model, then divide both by
+`dispersion`). The default peak threshold is a
 heuristic diagnostic level, not a calibrated false-positive probability.
 """
 
@@ -26,7 +27,8 @@ def score_map(d_e, model, sigma, truncate=4.0):
     """Per-pixel score z for adding one PSF, as described in the module docstring.
 
     `d_e` and `model` must be in units where Var = mean: ADU above the offset
-    divided by the result's `dispersion`. These are not calibrated photon counts.
+    plus `read_variance / dispersion`, divided by the result's `dispersion`.
+    These are not calibrated photon counts.
     """
     d_e = np.asarray(d_e, dtype=float)
     m = np.maximum(np.asarray(model, dtype=float), 1e-6)

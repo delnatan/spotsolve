@@ -5,15 +5,15 @@
 //!    ceil(4 sigma)`, on one pixel-integrated PSF `g` and a constant:
 //!    `A = <g - gbar, d> / |g - gbar|^2`. The window stops at the frame's
 //!    edge; every sum is over the pixels inside it. The score test of
-//!    `A = 0` under Poisson noise of dispersion `phi`, the level profiled,
-//!    is
+//!    `A = 0` on pixels of variance `V`, the level profiled, is
 //!
 //!    ```text
-//!    z = A |g - gbar| / sqrt(phi c0),    c0 = mean of d over the window
+//!    z = A |g - gbar| / sqrt(V)
 //!    ```
 //!
-//!    The noise comes from the Poisson model, not the window's residual,
-//!    so a neighbour in the window does not hide a spot.
+//!    `V` is the pixel variance the camera's noise curve gives the window's
+//!    level ([`Curve`]), not the window's residual, so a neighbour in the
+//!    window does not hide a spot.
 //! 2. **Mask.** Pixels whose score reaches a bar.
 //! 3. **Seeds.** Local maxima of the negative Laplacian of Gaussian over a
 //!    `2 ceil(sigma) + 1` square, inside the mask.
@@ -35,6 +35,14 @@ pub struct Screen {
     /// Regression flux and level at each pixel.
     pub amplitude: Vec<f64>,
     pub background: Vec<f64>,
+    /// Pixel variance at each pixel's level.
+    pub variance: Vec<f64>,
+    /// The noise curve the score used. Without one given, the frame's
+    /// points of its own ([`noise_points`]) and its variance per unit level
+    /// ([`dispersion`]); otherwise empty and NaN.
+    pub curve: Curve,
+    pub points: Vec<[f64; 3]>,
+    pub phi: f64,
     pub mask: Vec<bool>,
     /// Component of each mask pixel, from 1; 0 outside the mask.
     pub labels: Vec<u32>,
@@ -45,8 +53,10 @@ pub struct Screen {
 /// The median of chi-squared with one degree of freedom, `Phi^-1(0.75)^2`.
 pub const CHI2_1_MEDIAN: f64 = 0.454_936_423_119_572_8;
 
-/// Lowest mean a score's variance is taken at, in ADU.
+/// Lowest mean [`dispersion`] divides by, in ADU.
 pub const LEVEL_FLOOR: f64 = 1e-3;
+/// px: the side of the tiles [`noise_points`] takes medians over.
+pub const TILE: usize = 32;
 
 /// The centred pixel-integrated unit-flux PSF along one axis, radius
 /// `ceil(4 sigma)`; the 2-D kernel is its outer product.
@@ -101,8 +111,9 @@ fn axis_sums(k: &[f64], n: usize) -> Vec<[f64; 3]> {
         .collect()
 }
 
-/// Score, flux and level of one emitter of width `sigma` at every pixel.
-pub fn score(d: &[f64], h: usize, w: usize, sigma: f64, phi: f64) -> (Vec<f64>, Vec<f64>, Vec<f64>) {
+/// Score times the noise's sd, `A |g - gbar|`, flux and level of one
+/// emitter of width `sigma` at every pixel.
+pub fn score(d: &[f64], h: usize, w: usize, sigma: f64) -> (Vec<f64>, Vec<f64>, Vec<f64>) {
     let k = psf_kernel1d(sigma);
     let fg = correlate(d, h, w, &k);
     let fu = correlate(d, h, w, &vec![1.0; k.len()]);
@@ -116,10 +127,9 @@ pub fn score(d: &[f64], h: usize, w: usize, sigma: f64, phi: f64) -> (Vec<f64>, 
             let (s1, s2, n) = (sy[y][0] * sx[x][0], sy[y][1] * sx[x][1], sy[y][2] * sx[x][2]);
             let den = s2 - s1 * s1 / n;
             let a = (fg[i] - s1 * fu[i] / n) / den;
-            let c0 = (fu[i] / n).max(LEVEL_FLOOR);
             amp[i] = a;
             bg[i] = (fu[i] - a * s1) / n;
-            z[i] = a * den.sqrt() / (phi * c0).sqrt();
+            z[i] = a * den.sqrt();
         }
     }
     (z, amp, bg)
@@ -161,19 +171,37 @@ pub fn label(mask: &[bool], h: usize, w: usize) -> Vec<u32> {
     labels
 }
 
-/// Screen a frame `d` (ADU above the offset) of dispersion `phi`: the mask
+/// Screen a frame `d` (ADU above the offset) on the camera's noise
+/// `curve`, or, without one, the frame's own ([`fit_curve`]): the mask
 /// holds every pixel whose score at `sigma`, which also sets the LoG,
 /// reaches `bar`. Seeds are confined to `roi`.
-pub fn screen(d: &[f64], h: usize, w: usize, sigma: f64, phi: f64, bar: f64, roi: Option<&[bool]>) -> Screen {
+pub fn screen(d: &[f64], h: usize, w: usize, sigma: f64, bar: f64, roi: Option<&[bool]>, curve: Option<Curve>) -> Screen {
     assert_eq!(d.len(), h * w);
-    let (z, amplitude, background) = score(d, h, w, sigma, phi);
+    let (mut z, amplitude, background) = score(d, h, w, sigma);
+    // Emitters stay out of the noise curve: pixels whose score reaches `bar`
+    // at the frame's variance per unit mean, a first guess, are left out.
+    // A frame without the camera's curve measures its own.
+    let (phi, points, curve) = match curve {
+        Some(c) => (f64::NAN, Vec::new(), c),
+        None => {
+            let phi = dispersion(d, h, w);
+            let quiet: Vec<bool> = z.iter().zip(&background).map(|(&c, &l)| c < bar * (phi * l.max(LEVEL_FLOOR)).sqrt()).collect();
+            let points = noise_points(d, h, w, &background, &quiet);
+            let curve = fit_curve(&points);
+            (phi, points, curve)
+        }
+    };
+    let variance: Vec<f64> = background.iter().map(|&l| curve.at(l)).collect();
+    for (z, v) in z.iter_mut().zip(&variance) {
+        *z /= v.sqrt();
+    }
     let mask: Vec<bool> = z.iter().map(|&v| v >= bar).collect();
     let neg_log: Vec<f64> = filters::gaussian_laplace(d, h, w, sigma).into_iter().map(|v| -v).collect();
     let size = 2 * sigma.ceil() as usize + 1;
     let local_max = filters::maximum_filter(&neg_log, h, w, size);
     let seeds = maxima(&neg_log, &local_max, &mask, roi);
     let labels = label(&mask, h, w);
-    Screen { z, amplitude, background, mask, labels, seeds }
+    Screen { z, amplitude, background, variance, curve, points, phi, mask, labels, seeds }
 }
 
 /// Expected local maxima above `u`, per pixel, of the likelihood-ratio
@@ -240,14 +268,100 @@ pub fn dispersion(d: &[f64], h: usize, w: usize) -> f64 {
     median(&ratio) / (CHI2_1_MEDIAN * 70.0 * 70.0)
 }
 
+/// A camera's noise: pixel variance `read + gain light` at `light` ADU
+/// above the offset, `read` the read noise's variance (and any error in the
+/// offset), `gain` the variance per ADU of light (the gain times any
+/// excess-noise factor), and no less than `floor`, the quietest background
+/// measured: a model's light near or below zero is not a quieter pixel.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Curve {
+    pub read: f64,
+    pub gain: f64,
+    pub floor: f64,
+}
+
+impl Curve {
+    pub fn at(&self, light: f64) -> f64 {
+        (self.read + self.gain * light).max(self.floor).max(f64::MIN_POSITIVE)
+    }
+}
+
+/// The quietest of `points`' variances; 0 without points.
+pub fn quietest(points: &[[f64; 3]]) -> f64 {
+    if points.is_empty() { 0.0 } else { points.iter().map(|p| p[1]).fold(f64::INFINITY, f64::min) }
+}
+
+/// Points of the frame's noise curve where no emitter is: per tile of
+/// [`TILE`] px, over its `quiet` pixels, `[median level, median variance,
+/// pixels]`. The separable fourth difference `b_ij` of pixels of variance
+/// `v` has variance `70^2 v` wherever the light is smooth on the scale of
+/// its kernel (see [`dispersion`]), so `b^2 / (70^2 CHI2_1_MEDIAN)` has
+/// median `v`. One tile's median scatters widely, neighbouring fourth
+/// differences sharing most of their pixels; a curve pools them.
+pub fn noise_points(d: &[f64], h: usize, w: usize, level: &[f64], quiet: &[bool]) -> Vec<[f64; 3]> {
+    const K: [f64; 5] = [1.0, -4.0, 6.0, -4.0, 1.0];
+    if h < 5 || w < 5 {
+        return Vec::new();
+    }
+    let b = filters::separable(d, h, w, &K, &K);
+    let inner = |r: usize, c: usize| r >= 2 && r < h - 2 && c >= 2 && c < w - 2;
+    let mut pts = Vec::new();
+    for r0 in (0..h).step_by(TILE) {
+        for c0 in (0..w).step_by(TILE) {
+            let idx: Vec<usize> = (r0..(r0 + TILE).min(h)).flat_map(|r| (c0..(c0 + TILE).min(w)).filter(move |&c| inner(r, c)).map(move |c| r * w + c)).filter(|&i| quiet[i]).collect();
+            if idx.len() >= TILE * TILE / 4 {
+                let v: Vec<f64> = idx.iter().map(|&i| b[i] * b[i] / (CHI2_1_MEDIAN * 70.0 * 70.0)).collect();
+                pts.push([median(&idx.iter().map(|&i| level[i]).collect::<Vec<_>>()), median(&v), idx.len() as f64]);
+            }
+        }
+    }
+    pts
+}
+
+/// The noise curve through `points` by weighted least squares, each point
+/// weighted by its pixels over the fitted variance squared (weights from
+/// the points' own noisy medians would favour those that read low), both
+/// coefficients non-negative as read variance and gain are. Where levels
+/// barely vary only the variance at the frame's level is determined.
+pub fn fit_curve(points: &[[f64; 3]]) -> Curve {
+    let mean = points.iter().map(|p| p[1]).sum::<f64>() / points.len().max(1) as f64;
+    let (mut read, mut gain) = (mean.max(f64::MIN_POSITIVE), 0.0);
+    for _ in 0..3 {
+        let (s0, s1, s2, t0, t1) = points.iter().fold((0.0, 0.0, 0.0, 0.0, 0.0), |(s0, s1, s2, t0, t1), p| {
+            let q = p[2] / (Curve { read, gain, floor: 0.0 }.at(p[0])).powi(2);
+            (s0 + q, s1 + q * p[0], s2 + q * p[0] * p[0], t0 + q * p[1], t1 + q * p[0] * p[1])
+        });
+        if s0.is_nan() || s0 <= 0.0 {
+            break;
+        }
+        let det = s0 * s2 - s1 * s1;
+        (read, gain) = if det > 1e-12 * s0 * s2 { ((s2 * t0 - s1 * t1) / det, (s0 * t1 - s1 * t0) / det) } else { (t0 / s0, 0.0) };
+        if gain < 0.0 {
+            (read, gain) = (t0 / s0, 0.0);
+        } else if read < 0.0 {
+            (read, gain) = (0.0, if s2 > 0.0 { t1 / s2 } else { 0.0 });
+        }
+    }
+    Curve { read: read.max(0.0), gain, floor: quietest(points) }
+}
+
+/// The read variance on `points` given the `gain`: the median of each
+/// point's variance less its light's, at least 0.
+pub fn read_given(points: &[[f64; 3]], gain: f64) -> f64 {
+    if points.is_empty() {
+        return 0.0;
+    }
+    median(&points.iter().map(|p| p[1] - gain * p[0]).collect::<Vec<_>>()).max(0.0)
+}
+
 fn median(v: &[f64]) -> f64 {
     let mut s = v.to_vec();
-    s.sort_by(f64::total_cmp);
     let n = s.len();
+    let (lo, &mut hi, _) = s.select_nth_unstable_by(n / 2, f64::total_cmp);
     if n % 2 == 0 {
-        0.5 * (s[n / 2 - 1] + s[n / 2])
+        0.5 * (lo.iter().copied().fold(f64::NEG_INFINITY, f64::max) + hi)
     } else {
-        s[n / 2]
+        hi
     }
 }
 
@@ -260,7 +374,7 @@ mod tests {
     fn score_matches_a_direct_regression() {
         let (h, w, sigma) = (9, 14, 1.3);
         let d: Vec<f64> = (0..h * w).map(|i| 20.0 + ((i * 37) % 11) as f64).collect();
-        let (z, a, c) = score(&d, h, w, sigma, 1.7);
+        let (z, a, c) = score(&d, h, w, sigma);
         let k = psf_kernel1d(sigma);
         let r = (k.len() / 2) as isize;
         for y in 0..h as isize {
@@ -282,43 +396,54 @@ mod tests {
                 let i = (y * w as isize + x) as usize;
                 assert!((a[i] - sgd / sgg).abs() < 1e-9 * (1.0 + a[i].abs()));
                 assert!((c[i] - (dbar - sgd / sgg * gbar)).abs() < 1e-9 * (1.0 + c[i].abs()));
-                assert!((z[i] - sgd / (1.7 * dbar * sgg).sqrt()).abs() < 1e-9 * (1.0 + z[i].abs()));
+                assert!((z[i] - sgd / sgg.sqrt()).abs() < 1e-9 * (1.0 + z[i].abs()));
             }
         }
     }
 
-    /// Seeds above `u` on Poisson noise number about [`false_rate`]: seeds
-    /// are maxima of the LoG, not of the score, and the level is fitted, so
-    /// the rate is an approximation; hold it within a factor 1.5 where the
-    /// count is large enough to measure.
+    /// On Gaussian noise the score has unit variance, and its maxima above
+    /// `u` number about [`false_rate`] at a fixed width: on the pixel lattice
+    /// and with the level fitted, the count is approximate.
     #[test]
-    fn noise_seeds_meet_the_false_rate() {
-        let (side, frames, sigma, u) = (128, 24, 1.45, 3.5);
+    fn noise_maxima_meet_the_false_rate() {
+        let (side, frames, sigma, u) = (256, 12, 1.45, 3.5);
         let fp = 1e6 * false_rate(u, sigma, sigma);
-        let mut state = 99u64;
-        let mut uni = || {
-            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-            ((state >> 11) as f64 + 0.5) / (1u64 << 53) as f64
-        };
-        let mut seeds = 0;
-        for _ in 0..frames {
-            let d: Vec<f64> = (0..side * side)
-                .map(|_| {
-                    let (l, mut k, mut p) = ((-20.0f64).exp(), 0.0, 1.0);
-                    loop {
-                        p *= uni();
-                        if p <= l {
-                            return k;
-                        }
-                        k += 1.0;
+        let (mut maxima, mut var) = (0, 0.0);
+        for f in 0..frames {
+            let d: Vec<f64> = crate::detect::tests::normals(side * side, 99 + f as u64).iter().map(|v| 20.0 + 20f64.sqrt() * v).collect();
+            let z = screen(&d, side, side, sigma, u, None, None).z;
+            let r = (4.0 * sigma).ceil() as usize;
+            let inner: Vec<f64> = (r..side - r).flat_map(|y| (r..side - r).map(move |x| y * side + x)).map(|i| z[i]).collect();
+            var += inner.iter().map(|v| v * v).sum::<f64>() / (inner.len() * frames) as f64;
+            for y in r..side - r {
+                for x in r..side - r {
+                    let v = z[y * side + x];
+                    if v >= u && (y - 1..=y + 1).all(|yy| (x - 1..=x + 1).all(|xx| z[yy * side + xx] <= v)) {
+                        maxima += 1;
                     }
-                })
-                .collect();
-            let phi = dispersion(&d, side, side);
-            seeds += screen(&d, side, side, sigma, phi, u, None).seeds.len();
+                }
+            }
         }
-        let per_mpx = seeds as f64 * 1e6 / (frames * side * side) as f64;
-        assert!(per_mpx > fp / 1.5 && per_mpx < fp * 1.5, "{per_mpx} per Mpx at u = {u}");
+        let per_mpx = maxima as f64 * 1e6 / (frames * (side - 12) * (side - 12)) as f64;
+        assert!((var - 1.0).abs() < 0.03, "score variance {var}");
+        assert!(per_mpx > 0.7 * fp && per_mpx < 1.3 * fp, "{per_mpx} per Mpx at u = {u}, predicted {fp}");
+    }
+
+    /// On a background rising across the frame, with read noise and gain,
+    /// the frame's curve: within 5% wherever tiles measured it.
+    #[test]
+    fn the_noise_curve_follows_the_background() {
+        let (h, w) = (200, 260);
+        let z = crate::detect::tests::normals(h * w, 9);
+        let level: Vec<f64> = (0..h * w).map(|i| 1.0 + 30.0 * (i % w) as f64 / (w - 1) as f64).collect();
+        let truth = Curve { read: 8.0, gain: 2.5, floor: 0.0 };
+        let d: Vec<f64> = (0..h * w).map(|i| level[i] + truth.at(level[i]).sqrt() * z[i]).collect();
+        let points = noise_points(&d, h, w, &level, &vec![true; h * w]);
+        let c = fit_curve(&points);
+        // Below the darkest tile the floor holds: the curve is measured above it.
+        let darkest = points.iter().map(|p| p[0]).fold(f64::INFINITY, f64::min);
+        let worst = level.iter().filter(|&&l| l >= darkest).map(|&l| (c.at(l) / truth.at(l) - 1.0).abs()).fold(0.0, f64::max);
+        assert!(worst < 0.05, "{c:?}, worst {worst}");
     }
 
     #[test]

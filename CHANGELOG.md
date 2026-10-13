@@ -26,6 +26,25 @@ The detection bar is now Bayesian and set per movie. Breaking API change.
   `AT_BOUND`. Deciding on the fitted width alone dropped half of the
   emitters on the bound, so particles near it vanished from frame to frame.
 
+The noise model is the camera's, measured from the movie. Breaking change
+to `dispersion`, and the output version is 8.
+
+- Each pixel's variance is `read + gain * light`, the light the model puts
+  on it, and every fit is a Gaussian likelihood at those variances,
+  reweighted as components are added and removed and settled once at the
+  reported fit's own weights. The scalar dispersion `phi = variance / mean`
+  is gone: with read noise it overstated the variance at spot peaks and
+  understated `z` on dark backgrounds, so faint spots went unreported.
+- Both are measured without calibration: the gain from the
+  leverage-corrected residuals of bright emitters, probed in frames spread
+  over the movie, and the read variance from the background's fourth
+  differences. `dispersion` is now the gain; `info["read_variance"]` and a
+  `read_variance` frame-table column are new.
+- With mixtures, a close pair is two emitters only if it gains `u^2 / 2`
+  nats over one elongated spot (a rotated Gaussian): an emitter moving
+  within the exposure is one spot, flagged `FitFlag.ELONGATED`, not two.
+  Pairs closer than about `2 sigma` are reported as one elongated emitter.
+
 ## 0.5.0 (2026-10-06)
 
 The linker is rebuilt for movies that mix mobilities; see

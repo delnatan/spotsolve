@@ -24,6 +24,8 @@ class FitFlag(IntFlag):
     STALLED = 4
     COVARIANCE_UNAVAILABLE = 8
     AT_BOUND = 16
+    # One elongated spot, not the close pair that tiled it.
+    ELONGATED = 32
 
 
 @dataclass(frozen=True)
@@ -44,9 +46,9 @@ class Localizations:
     offset and the fitted local level.
     """
     se: np.ndarray
-    """(N, 3) standard errors of `(flux, y, x)`, from the expected Fisher
-    information of the emitter's final window fit (every component and the
-    level free), scaled by the frame's dispersion. NaN without a covariance.
+    """(N, 3) standard errors of `(flux, y, x)`, from the Fisher information
+    of the emitter's final window fit (every component and the level free)
+    at each pixel's variance. NaN without a covariance.
     """
     fit_sigma: np.ndarray
     """(N,) each emitter's own fitted width, px; `sigma` when widths are
@@ -63,8 +65,9 @@ class Localizations:
     sigma: float
     """Reference width used for candidate searching and fit initialization, px."""
     dispersion: float
-    """The frame's measured pixel variance per unit of signal, ADU: about the
-    camera gain plus `gain^2 * read_noise^2 / background`.
+    """The camera's gain, measured from the movie: pixel variance per ADU of
+    light. A pixel's variance is `info["read_variance"] + dispersion *
+    light`.
     """
     info: dict = field(default_factory=dict)
     """Method-specific work counts, settings and fit diagnostics."""

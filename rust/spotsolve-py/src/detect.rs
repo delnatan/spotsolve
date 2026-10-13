@@ -65,6 +65,7 @@ fn give<'py>(py: Python<'py>, o: detect::Output, h: usize, w: usize) -> PyResult
     info.set_item("z", o.z.into_pyarray(py))?;
     info.set_item("p_real", o.p_real.into_pyarray(py))?;
     info.set_item("dispersion", o.dispersion)?;
+    info.set_item("read_variance", o.read_variance)?;
     info.set_item("u", o.u)?;
     info.set_item("seeds", o.n_seeds)?;
     info.set_item("weak", o.weak)?;
@@ -90,7 +91,7 @@ fn give<'py>(py: Python<'py>, o: detect::Output, h: usize, w: usize) -> PyResult
 }
 
 /// Localize one raw frame. Everything is in ADU above `offset`; the
-/// background and dispersion are measured from the frame.
+/// background and the camera's noise are measured from the frame.
 #[pyfunction]
 #[pyo3(signature = (raw, sigma, offset=0.0, *, roi=None, p_real=detect::P_REAL, width=detect::WIDTH, fit_mixtures=false, max_mixtures=detect::MAX_MIXTURES))]
 #[allow(clippy::too_many_arguments)]
@@ -184,7 +185,7 @@ fn detect_render(
 }
 
 pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
-    m.add("DETECT_OUTPUT_VERSION", 7)?;
+    m.add("DETECT_OUTPUT_VERSION", 8)?;
     m.add_function(wrap_pyfunction!(detect_localize, m)?)?;
     m.add_function(wrap_pyfunction!(detect_localize_stack, m)?)?;
     m.add_function(wrap_pyfunction!(detect_render, m)?)?;

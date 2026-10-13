@@ -1,9 +1,9 @@
-//! One window's Poisson fit: a constant background and `k` pixel-integrated
-//! Gaussians,
+//! One window's fit: a constant background and `k` pixel-integrated
+//! Gaussians, each pixel Gaussian of known variance `v`,
 //!
 //! ```text
 //! m[r, c] = c0 + sum_k A_k E(r; y_k, s_k) E(c; x_k, s_k)
-//! I(d, m) = sum_used [d log(d / m) - (d - m)]
+//! I(d, m) = sum_used (d - m)^2 / (2 v)
 //! ```
 //!
 //! in window-local pixels (`[0, 0]` is the window's first pixel). Pixels not
@@ -16,9 +16,9 @@
 //! scoring) with Coleman-Li affine scaling: parameters stay strictly inside
 //! their bounds, and a coordinate's step shrinks with its distance to the
 //! bound it heads for, so a flux cannot collapse onto its floor in one step
-//! while the positions have yet to adapt. `I / phi` is the log-likelihood
-//! in nats for a camera of dispersion `phi`; [`Fitter::variances`] are the
-//! diagonal of the inverse expected Fisher information scaled by `phi`.
+//! while the positions have yet to adapt. `I` is the negative
+//! log-likelihood in nats, up to a constant; [`Fitter::variances`] are the
+//! diagonal of the inverse Fisher information.
 
 use crate::linalg::Chol;
 use crate::psf;
@@ -41,13 +41,16 @@ pub struct Window {
     pub d: Vec<f64>,
     /// Pixels in the likelihood.
     pub used: Vec<bool>,
+    /// Each pixel's variance, ADU^2.
+    pub v: Vec<f64>,
 }
 
 impl Window {
-    pub fn new(rows: usize, cols: usize, d: Vec<f64>, used: Vec<bool>) -> Self {
+    pub fn new(rows: usize, cols: usize, d: Vec<f64>, used: Vec<bool>, v: Vec<f64>) -> Self {
         assert_eq!(d.len(), rows * cols);
         assert_eq!(used.len(), rows * cols);
-        Self { rows, cols, d, used }
+        assert_eq!(v.len(), rows * cols);
+        Self { rows, cols, d, used, v }
     }
 }
 
@@ -91,7 +94,7 @@ pub struct Linear {
     pub m: Vec<f64>,
     /// `dm / dtheta`, `n x pixels`.
     pub jac: Vec<f64>,
-    /// Gradient of `I` and its expected Fisher information, `n x n`.
+    /// Gradient of `I` and its Fisher information, `n x n`.
     pub g: Vec<f64>,
     pub f: Vec<f64>,
 }
@@ -100,7 +103,7 @@ pub struct Linear {
 #[derive(Clone, Debug)]
 pub struct Fit {
     pub theta: Vec<f64>,
-    /// `I` at `theta`; divide by `phi` for nats.
+    /// `I` at `theta`, nats.
     pub divergence: f64,
     pub iterations: usize,
     pub converged: bool,
@@ -130,9 +133,9 @@ pub struct Fitter {
     m: Vec<f64>,
     /// The used pixels (row-major indices), and the Jacobian `dm / dtheta`
     /// on them parameter-major, `jt[a * used + q]`, with its rows weighted
-    /// by `1 / m` in `jw`. Rows are padded to a multiple of [`BLOCK`].
+    /// by `1 / v` in `jw`. Rows are padded to a multiple of [`BLOCK`].
     pix: Vec<usize>,
-    /// On the used pixels: `1 / m` and the score residual `1 - d / m`.
+    /// On the used pixels: `1 / v` and the weighted residual `(m - d) / v`.
     wt: Vec<f64>,
     res: Vec<f64>,
     jt: Vec<f64>,
@@ -211,25 +214,14 @@ impl Fitter {
         &self.m
     }
 
-    /// `I(d, m)` over the used pixels, with `0 log 0 = 0`; infinite where
-    /// the model is not positive.
+    /// `I(d, m)` over the used pixels.
     pub fn divergence(&mut self, w: &Window, theta: &[f64], lay: Layout) -> f64 {
         self.evaluate(w, theta, lay);
         self.current_divergence(w)
     }
 
     fn current_divergence(&self, w: &Window) -> f64 {
-        let mut total = 0.0;
-        for ((&d, &m), &u) in w.d.iter().zip(&self.m).zip(&w.used) {
-            if !u {
-                continue;
-            }
-            if !(m > 0.0) {
-                return f64::INFINITY;
-            }
-            total += if d > 0.0 { d * (d / m).ln() } else { 0.0 } - (d - m);
-        }
-        total
+        w.d.iter().zip(&self.m).zip(&w.v).zip(&w.used).filter(|p| *p.1).map(|(((&d, &m), &v), _)| 0.5 * (d - m) * (d - m) / v).sum()
     }
 
     /// The Jacobian `dm / dtheta` at the last evaluated `theta` on the used
@@ -269,7 +261,7 @@ impl Fitter {
         }
     }
 
-    /// Gradient of `I` and expected Fisher information `J^T diag(1/m) J` at
+    /// Gradient of `I` and Fisher information `J^T diag(1/v) J` at
     /// the last evaluated `theta`, into `self.g` and `self.f`. Every entry
     /// is one sum over the used pixels in raster order; the information is
     /// summed in `BLOCK x BLOCK` tiles held in registers.
@@ -286,9 +278,8 @@ impl Fitter {
         self.wt.clear();
         self.res.clear();
         for &q in &self.pix {
-            let m = self.m[q];
-            self.wt.push(1.0 / m);
-            self.res.push(1.0 - w.d[q].max(0.0) / m);
+            self.wt.push(1.0 / w.v[q]);
+            self.res.push((self.m[q] - w.d[q]) / w.v[q]);
         }
         for a in 0..n {
             let j = &self.jt[a * nu..(a + 1) * nu];
@@ -324,7 +315,7 @@ impl Fitter {
 
     /// The fit linearized at `theta`: the model, the Jacobian `dm / dtheta`
     /// parameter-major over every pixel (zero on unused ones), and the
-    /// gradient and expected Fisher information of `I`.
+    /// gradient and Fisher information of `I`.
     pub fn linearize(&mut self, w: &Window, theta: &[f64], lay: Layout) -> Linear {
         self.evaluate(w, theta, lay);
         self.normal(w, theta, lay);
@@ -339,7 +330,7 @@ impl Fitter {
     }
 
     /// Minimize `I` from `theta0` within `[lo, hi]`, until no parameter can
-    /// lower it by more than `tol` (in `I` units: nats times `phi`) moving
+    /// lower it by more than `tol` nats moving
     /// alone ([`coordinate_gain`]), or `max_iter` steps.
     #[allow(clippy::too_many_arguments)]
     pub fn fit(
@@ -432,10 +423,35 @@ impl Fitter {
         Fit { theta: t, divergence: cur, iterations, converged, stalled, at_bound }
     }
 
-    /// The variances of the estimates: the diagonal of the inverse expected
-    /// Fisher information at `theta`, times `phi`. `None` when the
-    /// information cannot be factored.
-    pub fn variances(&mut self, w: &Window, theta: &[f64], lay: Layout, phi: f64) -> Option<Vec<f64>> {
+    /// Each pixel's leverage `J_i F^-1 J_i^T / v_i` at `theta`, the fraction
+    /// of its variance the fit absorbs: its residual has variance `v_i (1 -
+    /// h_i)`. 0 on unused pixels; `None` when the information cannot be
+    /// factored.
+    pub fn leverages(&mut self, w: &Window, theta: &[f64], lay: Layout) -> Option<Vec<f64>> {
+        let n = lay.n();
+        self.evaluate(w, theta, lay);
+        self.normal(w, theta, lay);
+        self.chol.ensure(n);
+        if !self.chol.factor(&self.f, n) {
+            return None;
+        }
+        let nu = self.pix.len();
+        let mut out = vec![0.0; w.rows * w.cols];
+        let mut col = vec![0.0; n];
+        for (k, &q) in self.pix.iter().enumerate() {
+            for (a, c) in col.iter_mut().enumerate() {
+                *c = self.jt[a * nu + k];
+            }
+            self.chol.forward_in_place(&mut col);
+            out[q] = self.wt[k] * col.iter().map(|v| v * v).sum::<f64>();
+        }
+        Some(out)
+    }
+
+    /// The variances of the estimates: the diagonal of the inverse Fisher
+    /// information at `theta`. `None` when the information cannot be
+    /// factored.
+    pub fn variances(&mut self, w: &Window, theta: &[f64], lay: Layout) -> Option<Vec<f64>> {
         let n = lay.n();
         self.evaluate(w, theta, lay);
         self.normal(w, theta, lay);
@@ -445,7 +461,6 @@ impl Fitter {
         }
         let mut var = vec![0.0; n];
         self.chol.inv_diag(&mut var, &mut self.scratch);
-        var.iter_mut().for_each(|v| *v *= phi);
         Some(var)
     }
 }
@@ -480,8 +495,8 @@ fn tile(x: [&[f64]; BLOCK], y: [&[f64]; BLOCK], nu: usize) -> [[f64; BLOCK]; BLO
 /// The most any one parameter can lower the objective's quadratic model by
 /// moving alone, downhill and within its bounds: `g^2 / (2 F)` when the
 /// Newton step fits, else `g r - F r^2 / 2` with `r` the room to the bound.
-/// In the objective's units, so the test against `tol` does not depend on
-/// parameter units or the camera gain.
+/// In nats, so the test against `tol` does not depend on parameter units or
+/// the camera gain.
 fn coordinate_gain(t: &[f64], g: &[f64], f: &[f64], lo: &[f64], hi: &[f64]) -> f64 {
     let p = t.len();
     (0..p)
