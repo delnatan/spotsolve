@@ -3,10 +3,11 @@
 //! # Model
 //!
 //! Detection `a` in frame `f` is linked to `b` in `f + 1` when that is more
-//! likely than `a` going unseen and `b` being new. The gain of the link is
+//! likely, by the odds of a switch against a break, than `a` going unseen and
+//! `b` being new. The gain of the link is
 //!
 //! ```text
-//!     log p_a(d) - log lambda
+//!     log p_a(d) - log lambda - SWITCH_COST
 //! ```
 //!
 //! `p_a` is the step density `a`'s track predicts: 2-D Gaussians of per-axis
@@ -22,20 +23,24 @@
 //! `lambda = (1 - q)^2 rho / q` prices a track end: `rho` is the density of
 //! other detections around a detection and `q` the chance that a detection
 //! continues into the next frame, so `(1 - q) rho` is the density of new
-//! detections and `(1 - q) / q` the odds that a track goes unseen.
+//! detections and `(1 - q) / q` the odds that a track goes unseen. Without
+//! `SWITCH_COST` each link would be the most probable call; a wrong link
+//! switches two identities, which costs more than the break a missed link
+//! makes.
 //!
 //! # Read from the movie, without links
 //!
 //! - `g`, the detector's gap: same-frame detections closer than about `g` are
 //!   reported as one. It is the radius at which the same-frame pair density
 //!   first reaches half its mean over `[R/2, R]`.
-//! - `r0 = g / 2`: a next-frame detection within `r0` is the same particle,
-//!   because anything else had to move at least `g - r0`. `r0` is never below
-//!   three standard deviations of an immobile particle's step, so a table
-//!   without a gap still counts immobile continuations.
-//! - `q`: the share of detections with a detection within `r0` in the next
-//!   frame, averaged with the previous frame so that reversing time changes
-//!   nothing.
+//! - `r0 = g / 2`: a detection within `r0` in another frame is at the same
+//!   spot, because anything else had to be at least `g - r0` away. `r0` is
+//!   never below three standard deviations of an immobile particle's step, so
+//!   a table without a gap still finds immobile spots.
+//! - `q`: the detections within `R` in the next frame, less the count of
+//!   others around a detection in that frame, per detection. What is left is
+//!   each detection's own continuation, however far it moved. Averaged with
+//!   the previous frame, so that reversing time changes nothing.
 //! - `rho`: the same-frame pair density within `R`.
 //!
 //! # A new track
@@ -69,6 +74,10 @@ const N_D: usize = 8;
 /// each step, so a track that took another particle's step does not keep
 /// that particle's history.
 const FORGET: f64 = 0.05;
+
+/// Log odds a link must reach: a wrong link, which switches two identities,
+/// costs `exp(SWITCH_COST)` times a missed one, which only breaks a track.
+const SWITCH_COST: f64 = 2.5;
 
 /// Frames on each side of a new track's first detection read for its
 /// occupancy prior.
@@ -213,23 +222,32 @@ fn gap(frames: &[Frame], pos: &[f64], r: f64, bin: f64, n: usize) -> f64 {
     }
 }
 
+/// Detections of `other` within `r` of each detection of `fr`, summed.
+fn pairs_within(fr: &Frame, other: &Frame, pos: &[f64], r: f64) -> f64 {
+    let mut count = 0.0;
+    for &a in &fr.rows {
+        other.cells.near([pos[2 * a], pos[2 * a + 1]], |k| {
+            if d2(pos, a, other.rows[k]) < r * r {
+                count += 1.0;
+            }
+        });
+    }
+    count
+}
+
 fn movie_stats(frames: &[Frame], pos: &[f64], r: f64, se2_med: f64, n: usize) -> Stats {
     // Positions are not known finer than their error: the histogram bin.
     let bin = se2_med.sqrt();
     let r0 = (gap(frames, pos, r, bin, n) / 2.0).max(3.0 * (2.0 * se2_med).sqrt());
-    let mut pairs = 0.0;
-    for fr in frames {
-        for (k, &a) in fr.rows.iter().enumerate() {
-            fr.cells.near([pos[2 * a], pos[2 * a + 1]], |k2| {
-                if k2 > k && d2(pos, a, fr.rows[k2]) < r * r {
-                    pairs += 2.0;
-                }
-            });
-        }
-    }
+    // Each frame's mean count of other same-frame detections within R.
+    let others: Vec<f64> =
+        frames.iter().map(|fr| pairs_within(fr, fr, pos, r) / fr.rows.len() as f64 - 1.0).collect();
+    let pairs: f64 = frames.iter().zip(&others).map(|(fr, s)| s * fr.rows.len() as f64).sum();
     // One pseudo-pair keeps a movie with no neighbours finite.
     let rho = (pairs + 1.0) / (n as f64 * std::f64::consts::PI * r * r);
-    // Continuation both ways in time, with the rule of succession.
+    // Continuation both ways in time: the detections within R in the next
+    // frame, less that frame's own count of others around a detection. What
+    // is left is the detection's own continuation, however far it moved.
     let (t_lo, t_hi) = (frames[0].t, frames[frames.len() - 1].t);
     let (mut cont, mut tried) = (0.0f64, 0.0f64);
     for fr in frames {
@@ -237,18 +255,14 @@ fn movie_stats(frames: &[Frame], pos: &[f64], r: f64, se2_med: f64, n: usize) ->
             if (step == 1 && fr.t == t_hi) || (step == -1 && fr.t == t_lo) {
                 continue; // the movie ends there
             }
-            let next = frame_at(frames, fr.t + step);
-            for &a in &fr.rows {
-                tried += 1.0;
-                if let Some(nf) = next {
-                    if nf.cells.any_within([pos[2 * a], pos[2 * a + 1]], r0, &nf.rows, pos) {
-                        cont += 1.0;
-                    }
-                }
+            tried += fr.rows.len() as f64;
+            if let Ok(i) = frames.binary_search_by_key(&(fr.t + step), |f| f.t) {
+                cont += pairs_within(fr, &frames[i], pos, r) - fr.rows.len() as f64 * others[i];
             }
         }
     }
-    let q = (cont + 1.0) / (tried + 2.0);
+    // The rule of succession, on a count that noise can take outside [0, tried].
+    let q = (cont.clamp(0.0, tried) + 1.0) / (tried + 2.0);
     Stats { r0, rho, log_lambda: 2.0 * (1.0 - q).ln() + rho.ln() - q.ln() }
 }
 
@@ -359,7 +373,7 @@ impl Model<'_> {
                         let b = cur.rows[k];
                         let dd = d2(self.pos, a, b);
                         if dd < r2 {
-                            let g = self.log_pred(&w[a], a, b, dd) - self.stats.log_lambda;
+                            let g = self.log_pred(&w[a], a, b, dd) - self.stats.log_lambda - SWITCH_COST;
                             if g > 0.0 {
                                 edges.push((k, g));
                             }
@@ -481,12 +495,13 @@ mod tests {
 
     /// Particles on a `field`-px square, each with its own `D` (px^2/frame),
     /// seen with probability `p`, localization error `se`; a detection closer
-    /// than `gap` to one already kept in its frame is dropped, as a detector
-    /// would. -> (frame, pos, se, particle id).
+    /// than `gap` to one already kept in its frame is merged into the nearest,
+    /// as a detector would. -> (frame, pos, se, the particles each row stands
+    /// for, the kept one first).
     fn movie(rng: &mut Rng, d: &[f64], n_frames: i64, field: f64, p: f64, se: f64, gap: f64)
-             -> (Vec<i64>, Vec<f64>, Vec<f64>, Vec<usize>) {
+             -> (Vec<i64>, Vec<f64>, Vec<f64>, Vec<Vec<usize>>) {
         let mut x: Vec<[f64; 2]> = d.iter().map(|_| [rng.uniform() * field, rng.uniform() * field]).collect();
-        let (mut fr, mut pos, mut who) = (Vec::new(), Vec::new(), Vec::new());
+        let (mut fr, mut pos, mut who): (Vec<i64>, Vec<f64>, Vec<Vec<usize>>) = (Vec::new(), Vec::new(), Vec::new());
         for t in 0..n_frames {
             if t > 0 {
                 for (xi, &di) in x.iter_mut().zip(d) {
@@ -495,22 +510,55 @@ mod tests {
                     xi[1] = (xi[1] + s * rng.normal()).rem_euclid(field);
                 }
             }
-            let mut kept: Vec<[f64; 2]> = Vec::new();
+            let first = fr.len();
             for (i, xi) in x.iter().enumerate() {
                 if rng.uniform() >= p {
                     continue;
                 }
                 let o = [xi[0] + se * rng.normal(), xi[1] + se * rng.normal()];
-                if kept.iter().all(|k| (k[0] - o[0]).hypot(k[1] - o[1]) >= gap) {
-                    kept.push(o);
-                    fr.push(t);
-                    pos.extend_from_slice(&o);
-                    who.push(i);
+                let near = (first..fr.len())
+                    .map(|k| ((pos[2 * k] - o[0]).hypot(pos[2 * k + 1] - o[1]), k))
+                    .min_by(|a, b| a.0.total_cmp(&b.0));
+                match near {
+                    Some((dist, k)) if dist < gap => who[k].push(i),
+                    _ => {
+                        fr.push(t);
+                        pos.extend_from_slice(&o);
+                        who.push(vec![i]);
+                    }
                 }
             }
         }
         let n = fr.len();
         (fr, pos, vec![se; 2 * n], who)
+    }
+
+    /// The share of detections whose particle, or one merged into it, is
+    /// detected within `r` in the next frame, both ways in time.
+    fn continuation(fr: &[i64], pos: &[f64], who: &[Vec<usize>], n_frames: i64, r: f64) -> f64 {
+        let mut at: std::collections::HashMap<(i64, usize), usize> = std::collections::HashMap::new();
+        for (i, (&t, ws)) in fr.iter().zip(who).enumerate() {
+            for &w in ws {
+                at.insert((t, w), i);
+            }
+        }
+        let (mut cont, mut tried) = (0.0, 0.0);
+        for (i, (&t, ws)) in fr.iter().zip(who).enumerate() {
+            for step in [1, -1] {
+                if (0..n_frames).contains(&(t + step)) {
+                    tried += 1.0;
+                    let hit = ws.iter().any(|&w| at.get(&(t + step, w)).is_some_and(|&j| d2(pos, i, j) < r * r));
+                    cont += hit as u8 as f64;
+                }
+            }
+        }
+        cont / tried
+    }
+
+    /// The continuation `q` that the movie's `lambda` and `rho` imply.
+    fn q_of(s: &Stats) -> f64 {
+        let lam = s.log_lambda.exp() / s.rho;
+        ((2.0 + lam) - ((2.0 + lam).powi(2) - 4.0).sqrt()) / 2.0
     }
 
     /// Linked pairs, each as (lower row, higher row).
@@ -559,31 +607,33 @@ mod tests {
         let rho_true = fr.len() as f64 / 30.0 / (l * l) * inside * (1.0 - g * g / (r * r));
         assert!((s.rho / rho_true - 1.0).abs() < 0.03, "rho {} vs {rho_true}", s.rho);
         // The true continuation, both ways in time, against q from lambda.
-        let seen: std::collections::HashSet<(i64, usize)> = fr.iter().copied().zip(who.iter().copied()).collect();
-        let (mut cont, mut tried) = (0.0, 0.0);
-        for (&t, &w) in fr.iter().zip(&who) {
-            for step in [1, -1] {
-                if (0..30).contains(&(t + step)) {
-                    tried += 1.0;
-                    cont += seen.contains(&(t + step, w)) as u8 as f64;
-                }
-            }
-        }
-        let lam = s.log_lambda.exp() / s.rho;
-        let q = ((2.0 + lam) - ((2.0 + lam).powi(2) - 4.0).sqrt()) / 2.0;
-        assert!((q - cont / tried).abs() < 0.02, "q {q} vs {}", cont / tried);
+        let (q, truth) = (q_of(&s), continuation(&fr, &pos, &who, 30, r));
+        assert!((q - truth).abs() < 0.02, "q {q} vs {truth}");
     }
 
     #[test]
-    fn a_table_without_a_gap_still_counts_immobile_continuations() {
+    fn the_continuation_does_not_depend_on_how_far_particles_move() {
+        // Seen 70% of the time behind a 2.5 px gap; immobile, or with an rms
+        // 2-D step of 4 px, three times r0.
+        for (d, seed) in [(0.0, 0x51ed_270b_2c3a_9e11u64), (4.0, 0x7f4a_7c15_9e37_79b9)] {
+            let mut rng = Rng(seed);
+            let (r, n_frames) = (15.0, 40);
+            let (fr, pos, _, who) = movie(&mut rng, &vec![d; 400], n_frames, 250.0, 0.7, 0.2, 2.5);
+            let (_, s) = model_for(&fr, &pos, 0.2, r);
+            let (q, truth) = (q_of(&s), continuation(&fr, &pos, &who, n_frames, r));
+            assert!((q - truth).abs() < 0.02, "D {d}: q {q} vs {truth}");
+        }
+    }
+
+    #[test]
+    fn a_table_without_a_gap_still_gives_r0_and_the_continuation() {
         let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
         let d = vec![0.0; 300];
-        let (fr, pos, _, _) = movie(&mut rng, &d, 20, 200.0, 0.9, 0.2, 0.0);
+        let (fr, pos, _, who) = movie(&mut rng, &d, 20, 200.0, 0.9, 0.2, 0.0);
         let (_, s) = model_for(&fr, &pos, 0.2, 10.0);
         assert!(s.r0 >= 3.0 * (2.0f64 * 0.04).sqrt() - 1e-12);
-        let lam = s.log_lambda.exp() / s.rho;
-        let q = ((2.0 + lam) - ((2.0 + lam).powi(2) - 4.0).sqrt()) / 2.0;
-        assert!(q > 0.85, "q {q}");
+        let (q, truth) = (q_of(&s), continuation(&fr, &pos, &who, 20, 10.0));
+        assert!((q - truth).abs() < 0.02, "q {q} vs {truth}");
     }
 
     #[test]

@@ -36,15 +36,19 @@ def rstep(d):
     return 3 * np.sqrt(4 * d + 4 * SE_PX**2)
 
 
-def movie(seed, density, d_fast_um, n_frames=100, gap=2.5):
-    """Particles confined to the discs, `density` per px^2 of disc: 30%
-    immobile, 50% at 0.3 um^2/s, 20% at `d_fast_um`. Each is seen with its
-    own probability, uniform on (0.4, 0.99), and same-frame detections
-    closer than `gap` are reported as one, as a detector would.
+MIXED = (0.3, 0.5, 0.2)
+MOBILE = (0.0, 0.7, 0.3)
+
+
+def movie(seed, density, d_fast_um, n_frames=100, gap=2.5, mix=MIXED):
+    """Particles confined to the discs, `density` per px^2 of disc, in the
+    class shares `mix`: immobile, 0.3 um^2/s and `d_fast_um`. Each is seen
+    with its own probability, uniform on (0.4, 0.99), and same-frame
+    detections closer than `gap` are reported as one, as a detector would.
     -> (locs, class per row, the particles each row stands for)"""
     rng = np.random.default_rng(seed)
     n = int(round(density * len(CELL_C) * np.pi * CELL_R**2))
-    cls = rng.choice(3, n, p=(0.3, 0.5, 0.2))
+    cls = rng.choice(3, n, p=mix)
     d = np.array([0.0, 0.3 * UM2S, d_fast_um * UM2S])[cls]
     p_seen = rng.uniform(0.4, 0.99, n)
     home = CELL_C[rng.integers(len(CELL_C), size=n)]
@@ -209,19 +213,38 @@ def test_no_link_is_longer_than_max_step_and_a_missed_frame_ends_a_track():
 RADII = (1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5, 5.0, 6.0, 7.0, 8.5, 10.0, 12.0, 14.0)
 
 
-@pytest.mark.parametrize("density,d_fast_um", [(GEM_LIKE, 2.5), (DENSE, 1.0)])
-def test_no_class_switches_more_than_crocker_grier_at_its_best_radius(density, d_fast_um):
+@pytest.mark.parametrize("density,d_fast_um,mix",
+                         [(GEM_LIKE, 2.5, MIXED), (DENSE, 1.0, MIXED), (GEM_LIKE, 2.5, MOBILE)])
+def test_no_class_switches_more_than_crocker_grier_at_its_best_radius(density, d_fast_um, mix):
     """Per seed, the linker's switches at its own recall minus the
-    reference's least at that recall, for each class; the mean over seeds
-    may not be positive."""
+    reference's least at that recall, for each class present; the mean over
+    seeds may not be positive. One movie holds no immobile particles."""
     max_step = rstep(d_fast_um * UM2S)
-    excess = {k: [] for k in CLASSES}
+    present = [k for k, share in zip(CLASSES, mix) if share > 0]
+    excess = {k: [] for k in present}
     for seed in range(300, 309):
-        locs, cls, members = movie(seed, density, d_fast_um)
+        locs, cls, members = movie(seed, density, d_fast_um, mix=mix)
         ref = [score(locs, crocker_grier(locs, r), cls, members) for r in RADII if r <= max_step]
         ours = score(locs, spotsolve.link(locs, max_step)["track_id"].to_numpy(), cls, members)
-        for k in CLASSES:
+        for k in present:
             f = frontier([s[k] for s in ref])
             excess[k].append(ours[k][1] - f(ours[k][0]))
-    for k in CLASSES:
+    for k in present:
         assert np.mean(excess[k]) <= 0.0, f"{k}: {np.round(excess[k], 2)} switches/100 over the reference"
+
+
+def test_a_class_links_alike_whatever_shares_its_movie():
+    """Slow and fast particles reach the same recall whether or not a third
+    of the movie is immobile: what the linker reads from the movie must not
+    depend on how far its particles move."""
+    max_step = rstep(2.5 * UM2S)
+    recall = {mix: {k: [] for k in ("slow", "fast")} for mix in (MIXED, MOBILE)}
+    for mix in (MIXED, MOBILE):
+        for seed in range(300, 304):
+            locs, cls, members = movie(seed, GEM_LIKE, 2.5, mix=mix)
+            ours = score(locs, spotsolve.link(locs, max_step)["track_id"].to_numpy(), cls, members)
+            for k in ("slow", "fast"):
+                recall[mix][k].append(ours[k][0])
+    for k in ("slow", "fast"):
+        with_immobile, without = np.mean(recall[MIXED][k]), np.mean(recall[MOBILE][k])
+        assert abs(with_immobile - without) < 0.03, f"{k}: recall {with_immobile:.2f} vs {without:.2f}"

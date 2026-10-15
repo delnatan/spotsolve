@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased
+
+- The linker's continuation `q`, which prices a track end, counted only
+  detections that stayed within half the detector gap, so it measured how
+  many particles barely move rather than how many are seen again. How a
+  particle linked depended on what else shared the movie: without immobile
+  particles slow recall fell from 0.87 to 0.75, and a movie of fast particles
+  alone linked 5% of its steps. `q` is now the next-frame detections within
+  `max_step` in excess of the same-frame neighbour count, which reads every
+  continuation however far it moved.
+- A link must now beat its alternative by `c = 2.5` nats, the price of an
+  identity switch against a break. Before, this margin came from the biased
+  `q` and varied with the movie's mobility.
 ## 0.5.1 (2026-10-14)
 
 The detection bar is now Bayesian and set per movie. Breaking API change.
