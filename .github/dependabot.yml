@@ -7,3 +7,8 @@ updates:
     groups:
       actions:
         patterns: ['*']
+    # Major versions can change how the release workflow behaves; take them
+    # by hand.
+    ignore:
+      - dependency-name: '*'
+        update-types: ['version-update:semver-major']
