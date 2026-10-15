@@ -1,159 +1,76 @@
 # spotsolve
 
-Emitter localization for fluorescence images, after u-track's
-`pointSourceDetection`, with frame-to-frame trajectory linking in which
-each track moves on its own diffusion scale. Each spot is fitted on its own window; with
-`fit_mixtures`, overlapping spots are fitted jointly. Every decision is a
-likelihood ratio at one bar, set per movie so that a reported spot
-is real, not noise, with a chosen probability. Detection and fitting run in Rust, with movie frames processed
-in parallel.
+Emitter localization for fluorescence movies, after u-track's
+`pointSourceDetection`, and frame-to-frame linking in which each track moves
+on its own diffusion scale. Detection and fitting run in Rust, frames in
+parallel.
 
 ## Install
 
-Requires Python 3.10+. Download the wheel for your platform from a GitHub
-release or the **Build and test wheels** Actions artifacts, then install the
-`.whl` file with `python -m pip install path/to/filename.whl`. Wheels bundle
-the Rust extension; a Rust toolchain is only needed for source builds.
-
-For development, with Rust installed and an environment activated:
+Requires Python 3.10+. Install the wheel for your platform from a GitHub
+release with `python -m pip install path/to/filename.whl`; wheels bundle the
+Rust extension. For development, with Rust installed:
 
 ```sh
 python -m pip install -e ".[dev,test]"
+maturin develop --release    # after changing Rust code
 ```
 
-After changing Rust code, run `maturin develop --release` from the repository
-root. Add `.[scripts]` for movie I/O and plotting. See the
-[build guide](docs/BUILDING.md) for supported platforms, release artifacts,
-and migration from the old separate `spotsolve-rs` installation.
+See the [build guide](docs/BUILDING.md).
 
 ## Detect spots
 
 ```python
 import spotsolve
 
-# frame: (H, W), stack: (T, H, W), in camera units (ADU). The gain is the
-# camera's pixel variance per ADU of light: from its calibration, or
-# measured from a movie.
-gain = spotsolve.estimate_gain(stack, sigma=1.45, offset=100)
-locs = spotsolve.localize(frame, sigma=1.45, gain=gain, offset=100)
-movie = spotsolve.localize_stack(stack, sigma=1.45, gain=gain, offset=100, n_threads=5)
-
-# Crowded spots: fit several emitters per window.
-locs = spotsolve.localize(frame, sigma=1.45, gain=gain, offset=100, fit_mixtures=True)
-
-# Stricter: report only spots at least 99% likely to be real, not 90%.
-movie = spotsolve.localize_stack(stack, sigma=1.45, gain=gain, offset=100, p_real=0.99)
+# stack: (T, H, W) in camera units (ADU).
+gain = spotsolve.estimate_gain(stack, sigma=1.45, offset=100)   # or the camera's calibration
+movie = spotsolve.localize_stack(stack, sigma=1.45, gain=gain, offset=100,
+                                 fit_mixtures=True)
+locs = movie[0]
+locs.positions, locs.amplitudes, locs.se    # (y, x) px; flux; SEs of (flux, y, x)
 ```
 
-Both return `Localizations` (one per frame for stacks):
-
-| Field | Meaning |
-|---|---|
-| `positions` | `(N, 2)` coordinates `(y, x)` in pixels; centers are integers |
-| `amplitudes` | `(N,)` total flux of the pixel-integrated Gaussian, above the local level |
-| `peak` | `(N,)` model signal above the level for a pixel centered on the emitter |
-| `se` | `(N, 3)` standard errors of `(flux, y, x)` |
-| `fit_sigma`, `sigma_se` | Fitted width and its standard error, in pixels |
-| `sigma_ratio` | `fit_sigma / sigma` |
-| `flags` | `(N,)` bitmask of `FitFlag` diagnostics; rows are retained |
-| `background` | Screening level map, NaN outside the processed crop |
-| `dispersion` | The camera's gain, as given |
-| `info` | `u`, per-emitter `z` and `p_real`, `fitted_background`, `seed`, `mixture`, and work counts |
-| `model_image`, `residual` | Optional diagnostic images |
-
-Flux and background use ADU above `offset`; divide flux by camera gain for
-photoelectrons. Each pixel's variance is `info["read_variance"] +
-gain * light`, the read variance measured from the background given the
-gain. Uncertainties come from the Fisher information of each
-emitter's final window fit at those variances; NaN if it cannot be
-computed. `info["z"]` is each emitter's `sqrt(2 * likelihood
-ratio)`, at least the movie's bar `info["u"]`, and `info["p_real"]` its
-probability of being real rather than noise. `peak` varies with width and
-can exceed the brightest observed pixel when the emitter lies between
-pixels.
-
-## Detection controls
+Each pixel's variance is `read + gain * light`, the camera's noise at the
+light the model puts on it. The frame is screened by a score test, seeds are
+placed at local maxima, and each seed's window is fitted with a constant
+level and pixel-integrated Gaussians at maximum quasi-likelihood under that
+noise (the Poisson likelihood for a Poisson camera). A spot is kept only if
+it gains `u^2/2` nats of quasi-likelihood, where the movie sets `u`: the bar
+at which a spot is real, not noise, with probability `p_real`. A frame's
+result therefore depends on the stack it is in; `localize(frame, ...)` treats
+one frame as a movie of one. Standard errors come from each spot's Fisher
+information. See [detection](docs/DETECTION.md) for the method.
 
 | Setting | Default | Effect |
 |---|---|---|
 | `sigma` | required | In-focus PSF width, px |
-| `gain` | required | Pixel variance per ADU of light: the camera's conversion gain (ADU per photoelectron) times any excess-noise factor (2 for an EMCCD). `estimate_gain` measures it from a movie |
+| `gain` | required | Pixel variance per ADU of light: the conversion gain (ADU per photoelectron) times any excess-noise factor (2 for an EMCCD). It scales every test and standard error |
 | `offset` | 0 | Camera offset, ADU |
+| `p_real` | 0.9 | Least probability that a reported spot is real; higher is stricter |
+| `fit_mixtures` | False | Fit several emitters per window, so neighbours are fitted rather than biasing each other. Use it wherever spots come closer than about `6 sigma` |
+| `motion_blur` | False | With mixtures, a close pair is one elongated spot (flagged `ELONGATED`) unless two fit better, for exposures in which emitters streak |
+| `width` | `(1.0, 1.5)` | Reported widths, multiples of `sigma`; wider light is fitted as out-of-focus background. Equal bounds fix the width |
 | `roi` | None | `(H, W)` bool mask of where seeds may be placed |
-| `p_real` | 0.9 | Least probability that a reported spot is real, not noise; higher is stricter |
-| `width` | `(1.0, 1.5)` | Reported widths, as multiples of `sigma`; light 2 standard errors wider is fitted as out-of-focus background, and an emitter less wide is reported at the upper bound. The upper bound is capped near `2 sigma`. Equal bounds fix the width |
-| `fit_mixtures` | False | Fit several emitters per window (u-track's FitMixtures) |
-| `max_mixtures` | 20 | Components per window at most |
-| `motion_blur` | False | With mixtures, report a close pair as one elongated spot unless two fit better |
 
-The frame is screened by a score test on the camera's noise, seeds are placed at local
-maxima, and each seed's window is fitted with a constant level and
-pixel-integrated Gaussians at maximum quasi-likelihood under the camera's
-noise (the Poisson likelihood for a Poisson camera). A spot is kept only if
-it gains `u^2/2` nats of quasi-likelihood. The movie sets `u`: every frame's spots, fitted alone at a low
-bar, have a density of `z` that noise alone explains only in part, and `u`
-is where the probability of being real reaches `p_real`. The bar therefore
-adapts to each movie, and a frame's result depends on the stack it is in;
-`localize` treats a frame as a movie of one. Light 2 standard errors wider than the
-reported widths is fitted as out-of-focus background and counted in
-`info["out_of_focus"]`. Use `fit_mixtures=True` wherever spots come closer
-than about `6 sigma`: single fits are biased by a neighbour's light and
-cannot separate pairs. With `motion_blur=True` as well, a close pair is two
-spots only if it beats one elongated spot by the same `u^2/2`, so an emitter
-moving within the exposure is one spot, flagged `ELONGATED`, and pairs
-closer than about `2 sigma` are reported as one; leave it off where the
-exposure is short enough that emitters stay round. See [detection](docs/DETECTION.md) for the method.
+**Choosing `sigma`.** Detect a few frames and take `sigma` from the narrow,
+in-focus end of the `fit_sigma` histogram. A pile-up at the lower bound means
+`sigma` is set too wide.
 
-The ROI restricts seeding and crops work to its bounding box plus context;
-fitted positions can lie outside it. Use one mask covering the desired area,
-not separate tile calls.
+**Choosing `gain`.** From the camera's calibration, or `estimate_gain`, which
+reads the residuals of a movie's bright spots. The read variance is measured
+from the background given the gain.
 
-## Masks, images and speed
+**Long runs.** Pass `progress=spotsolve.Progress()` to `localize_stack` and
+read it from another thread; `progress.cancel()` stops the run. Split a stack
+into several calls and each becomes a movie of its own.
 
-Stack functions default to all machine cores; `n_threads` limits the
-native frame workers. Results stay in frame order and are identical across
-worker counts. `images=False` avoids returning model/residual images; it is
-the default except for single-frame `localize`.
-
-On a 10-core Apple M5, real 256x256 GEM frames (about 240 spots per frame
-single, 555 with mixtures; best of three runs):
-
-| Workload | Single fits | Mixtures |
-|---|---:|---:|
-| First five frames, serial | 0.11 s | 1.20 s |
-| First five frames, five workers | 0.03 s | 0.30 s |
-| All 49 frames, ten workers | 0.19 s | 1.91 s |
-
-## Choose a detection width
-
-`sigma` is the in-focus PSF width: the narrowest a spot can be. Inspect a
-`fit_sigma` histogram from a few frames and take `sigma` from its narrow,
-in-focus mode:
-
-```python
-import numpy as np
-
-preview = spotsolve.localize_stack(stack[:3], sigma=1.2, gain=gain, offset=100,
-                                   fit_mixtures=True)
-widths = np.concatenate([result.fit_sigma for result in preview])
-counts, bin_edges = np.histogram(widths, bins="auto")
-```
-
-Many fits at the lower bound mean `sigma` is set too wide; to admit
-narrower fits, lower `width[0]`, at the cost of a slightly stricter
-threshold. Many at the upper bound mean it is set too narrow. To report
-defocused emitters too, raise `width[1]` (up to about 2); more haze is
-then reported as emitters. `width=(1, 1)` fixes every width at `sigma`: a
-little more recall when spots really are all in focus, but mixtures split
-wider spots in two.
+Fits are reported, not discarded: each row carries `FitFlag` diagnostics,
+and cuts are left to the [localization-quality guide](docs/LOCALIZATION_QUALITY.md).
 
 ## Link detections
 
-For filtering, see the
-[localization-quality guide](docs/LOCALIZATION_QUALITY.md).
-
 ```python
-import polars as pl
 from spotsolve import loctable
 
 parts, next_id = [], 0
@@ -161,54 +78,19 @@ for t, result in enumerate(movie):
     rows, _ = loctable.frame_tables(result, frame=t, loc_id0=next_id)
     parts.append(rows)
     next_id += len(rows)
-locs = loctable.concat(parts)
-# Optional post-processing; the original table retains every measurement.
-usable = locs.filter(pl.col("flags") == 0)
-usable = loctable.filter_quality(usable)  # require usable coordinates and errors
-# Optional precision cut: max_se_pos=0.5 (pixels; calibrate for your data).
+locs = loctable.filter_quality(loctable.concat(parts))
 
-tracks = spotsolve.link(usable, max_step=6.5)  # pixels
-tracks.select("track_id", "frame", "y", "x")
-
-# Tracks of at least four frames:
-long = tracks.filter(pl.len().over("track_id") >= 4)
+tracks = spotsolve.link(locs, max_step=6.5)    # pixels
 ```
 
 Each track predicts its next step from its own diffusion coefficient,
 inferred from its steps so far, so immobile, slow and fast particles in one
-movie are each linked on their own scale. `max_step` is the largest step
-considered: about three times the rms step of the fastest particles of
-interest. The linker also reads `se_y` and `se_x`; everything else it needs
-is measured from the movie. The result is the input table plus `track_id`,
-in the same row order. A missed detection ends a track. See
-[tracking](docs/TRACKING.md) for the model and validation.
+movie are each linked on their own scale. `max_step` is the one setting: the
+largest step considered, about three times the rms step of the fastest
+particles of interest. The linker reads each detection's `se_y` and `se_x`
+and measures everything else from the movie. A missed detection ends a
+track. See [tracking](docs/TRACKING.md) for the model.
 
-## Development
+## More
 
-```sh
-python -m pytest -q
-cargo test --release --workspace --manifest-path rust/Cargo.toml
-```
-
-Tests cover the window fit's derivatives and error calibration, simulation
-recovery, the false-positive rate on noise, fit flags, tables and linking.
-`scripts/benchmark_detection.py` scores the detector on seeded scenarios.
-
-[Documentation index](docs/README.md) · [Source map and validation](docs/README.md#implementation)
-
-## Measurement-first output
-
-Localization does not discard fitted spots for brightness or width. Use
-`fit_sigma`, `sigma_se`, `flux`, `se_flux` and fit flags to choose downstream
-criteria. Candidate screening and emitter-count selection still determine
-which sources are fitted; this is not an exhaustive list of image maxima.
-
-`FitFlag` reports edge support, non-convergence, stalling, unavailable
-covariance and active bounds. Zero flags
-does not prove a correct PSF or calibrated uncertainty. The three-sigma edge
-support and numerical tolerances are explicit conventions, not object classes.
-See [fit diagnostics](docs/LOCALIZATION_QUALITY.md).
-
-Changes between versions, including removed and renamed API, are listed in
-the [changelog](CHANGELOG.md). Rebuild the Rust extension when updating a
-source install.
+[Documentation index](docs/README.md) · [Changelog](CHANGELOG.md)
