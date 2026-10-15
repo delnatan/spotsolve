@@ -18,7 +18,7 @@ The detection bar is now Bayesian and set per movie. Breaking API change.
   longer lost for want of a seed. The width bank of seed bars is removed.
 - With single fits a movie is fitted once; with mixtures, once alone and
   once at `u`.
-- On pure noise `u` rises to about 5: under 1 false emitter per 10^6
+- On pure noise `u` rises to about 5: under 2 false emitters per 10^6
   pixels in movies (16 before).
 - A component fitted wider than the reported widths is out-of-focus light
   only if its width is 2 standard errors beyond the upper bound (holding it
