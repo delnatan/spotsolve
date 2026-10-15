@@ -11,6 +11,7 @@ use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 use spotsolve_core::detect;
+use std::sync::Arc;
 
 type Arr1 = Py<PyArray1<f64>>;
 type Arr2 = Py<PyArray2<f64>>;
@@ -128,11 +129,46 @@ fn detect_localize<'py>(
     give(py, o, h, w)
 }
 
+/// A stack's localization as another thread sees it (`detect::Progress`):
+/// `done` frame fits of `total`, and `cancel()` to stop it.
+#[pyclass(frozen, name = "Progress")]
+struct Progress {
+    inner: Arc<detect::Progress>,
+}
+
+#[pymethods]
+impl Progress {
+    #[new]
+    fn new() -> Self {
+        Self { inner: Arc::new(detect::Progress::default()) }
+    }
+
+    #[getter]
+    fn done(&self) -> usize {
+        self.inner.done()
+    }
+
+    #[getter]
+    fn total(&self) -> usize {
+        self.inner.total()
+    }
+
+    #[getter]
+    fn cancelled(&self) -> bool {
+        self.inner.cancelled()
+    }
+
+    fn cancel(&self) {
+        self.inner.cancel();
+    }
+}
+
 /// Localize every frame of a raw `(T, H, W)` stack on `n_threads` workers,
 /// at the movie's bar: `P(real | z)` is fitted to every frame's candidates.
-/// Returns one tuple per frame, in frame order.
+/// Returns one tuple per frame, in frame order; `None` if `progress` was
+/// cancelled.
 #[pyfunction]
-#[pyo3(signature = (raw, sigma, offset=0.0, *, gain, roi=None, p_real=detect::P_REAL, width=detect::WIDTH, fit_mixtures=false, max_mixtures=detect::MAX_MIXTURES, motion_blur=false, n_threads=1))]
+#[pyo3(signature = (raw, sigma, offset=0.0, *, gain, roi=None, p_real=detect::P_REAL, width=detect::WIDTH, fit_mixtures=false, max_mixtures=detect::MAX_MIXTURES, motion_blur=false, n_threads=1, progress=None))]
 #[allow(clippy::too_many_arguments)]
 fn detect_localize_stack<'py>(
     py: Python<'py>,
@@ -147,7 +183,8 @@ fn detect_localize_stack<'py>(
     max_mixtures: usize,
     motion_blur: bool,
     n_threads: usize,
-) -> PyResult<Vec<Frame<'py>>> {
+    progress: Option<Bound<'py, Progress>>,
+) -> PyResult<Option<Vec<Frame<'py>>>> {
     let sh = raw.shape();
     let (n, h, w) = (sh[0], sh[1], sh[2]);
     let r = raw
@@ -160,10 +197,11 @@ fn detect_localize_stack<'py>(
     let roi = roi_slice(&roi, h, w)?.map(|m| m.to_vec());
     let s = settings(sigma, gain, p_real, width, fit_mixtures, max_mixtures, motion_blur)?;
     let r = r.to_vec();
+    let watch = progress.map_or_else(|| Arc::new(detect::Progress::default()), |p| p.get().inner.clone());
     let outs = py.detach(|| {
-        detect::localize_stack(&r, n, h, w, offset, roi.as_deref(), &s, n_threads.max(1))
+        detect::localize_stack_observed(&r, n, h, w, offset, roi.as_deref(), &s, n_threads.max(1), &watch)
     });
-    outs.into_iter().map(|o| give(py, o, h, w)).collect()
+    outs.map(|outs| outs.into_iter().map(|o| give(py, o, h, w)).collect()).transpose()
 }
 
 /// The camera's gain, pixel variance per ADU of light, measured from the
@@ -226,6 +264,7 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(detect_localize, m)?)?;
     m.add_function(wrap_pyfunction!(detect_localize_stack, m)?)?;
     m.add_function(wrap_pyfunction!(detect_estimate_gain, m)?)?;
+    m.add_class::<Progress>()?;
     m.add_function(wrap_pyfunction!(detect_render, m)?)?;
     // The detector's defaults, read by `spotsolve.native` so Python states
     // no second copy of them.

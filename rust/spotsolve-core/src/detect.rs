@@ -48,6 +48,8 @@
 //!    width.
 //! 5. Standard errors come from the reported fit's Fisher information.
 
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
 use crate::fit::{Fitter, Layout, Window};
 use crate::posterior::{self, Posterior};
 use crate::prefilter::{self, Screen};
@@ -941,6 +943,36 @@ pub fn localize_raw(raw: &[f64], h: usize, w: usize, offset: f64, roi: Option<&[
     localize_stack(raw, 1, h, w, offset, roi, s, 1).pop().expect("one frame")
 }
 
+/// A stack's localization as another thread sees it: frames fitted of
+/// `total` (each frame once alone and, with mixtures, once more), and a
+/// request to stop. Watching does not change the result.
+#[derive(Debug, Default)]
+pub struct Progress {
+    done: AtomicUsize,
+    total: AtomicUsize,
+    cancel: AtomicBool,
+}
+
+impl Progress {
+    pub fn done(&self) -> usize {
+        self.done.load(Ordering::Relaxed)
+    }
+
+    pub fn total(&self) -> usize {
+        self.total.load(Ordering::Relaxed)
+    }
+
+    /// Ask the localization to stop: frames not yet started are skipped and
+    /// it returns `None`.
+    pub fn cancel(&self) {
+        self.cancel.store(true, Ordering::Relaxed);
+    }
+
+    pub fn cancelled(&self) -> bool {
+        self.cancel.load(Ordering::Relaxed)
+    }
+}
+
 /// Localize every frame of a stack, `d = raw - offset` in ADU, on
 /// `n_threads` workers, in frame order. `raw` is `n*H*W`. The camera's
 /// curve is the movie's: the given gain, and the read variance its
@@ -959,8 +991,36 @@ pub fn localize_stack(
     s: &Settings,
     n_threads: usize,
 ) -> Vec<Output> {
+    localize_stack_observed(raw, n, h, w, offset, roi, s, n_threads, &Progress::default()).expect("not cancelled")
+}
+
+/// [`localize_stack`], reporting to `progress` as frames are fitted; `None`
+/// once it is cancelled.
+#[allow(clippy::too_many_arguments)]
+pub fn localize_stack_observed(
+    raw: &[f64],
+    n: usize,
+    h: usize,
+    w: usize,
+    offset: f64,
+    roi: Option<&[bool]>,
+    s: &Settings,
+    n_threads: usize,
+    progress: &Progress,
+) -> Option<Vec<Output>> {
     assert_eq!(raw.len(), n * h * w);
+    progress.done.store(0, Ordering::Relaxed);
+    progress.total.store(n * if s.fit_mixtures { 2 } else { 1 }, Ordering::Relaxed);
     let frame = |t: usize| -> Vec<f64> { raw[t * h * w..(t + 1) * h * w].iter().map(|&r| r - offset).collect() };
+    // Each frame's fit, counted; skipped once cancelled.
+    let fitted = |t: usize, fitter: &mut Fitter, s: &Settings, u: f64, k: prefilter::Curve| -> Output {
+        if progress.cancelled() {
+            return Output::default();
+        }
+        let o = localize_with(&frame(t), h, w, roi, s, u, fitter, Some(k));
+        progress.done.fetch_add(1, Ordering::Relaxed);
+        o
+    };
     let points: Vec<[f64; 3]> = crate::frames::map(n, n_threads, || (), |t, _| {
         Crop::of(&frame(t), h, w, roi, s).map_or_else(Vec::new, |c| {
             let (ch, cw) = (c.bounds[1] - c.bounds[0], c.bounds[3] - c.bounds[2]);
@@ -972,9 +1032,10 @@ pub fn localize_stack(
     .collect();
     let k = prefilter::Curve::of(s.gain, &points);
     let alone = Settings { fit_mixtures: false, ..*s };
-    let candidates = crate::frames::map(n, n_threads, Fitter::default, |t, fitter| {
-        localize_with(&frame(t), h, w, roi, &alone, posterior::CANDIDATE, fitter, Some(k))
-    });
+    let candidates = crate::frames::map(n, n_threads, Fitter::default, |t, fitter| fitted(t, fitter, &alone, posterior::CANDIDATE, k));
+    if progress.cancelled() {
+        return None;
+    }
     let area = n as f64 * roi.map_or((h * w) as f64, |m| m.iter().filter(|&&v| v).count() as f64);
     let (w_lo, w_hi) = s.widths();
     let heights: Vec<f64> = candidates.iter().flat_map(|o| o.z.iter().copied()).collect();
@@ -983,14 +1044,17 @@ pub fn localize_stack(
     // Fitted alone, the frames' emitters are their candidates above `u`;
     // mixtures refit every frame at `u`.
     let mut out = if s.fit_mixtures {
-        crate::frames::map(n, n_threads, Fitter::default, |t, fitter| localize_with(&frame(t), h, w, roi, s, u, fitter, Some(k)))
+        crate::frames::map(n, n_threads, Fitter::default, |t, fitter| fitted(t, fitter, s, u, k))
     } else {
         candidates.into_iter().map(|o| o.above(u)).collect()
     };
+    if progress.cancelled() {
+        return None;
+    }
     for o in &mut out {
         o.p_real = o.z.iter().map(|&z| post.p_real(z)).collect();
     }
-    out
+    Some(out)
 }
 
 /// The camera's gain, pixel variance per ADU of light, measured from a movie
@@ -1178,5 +1242,30 @@ pub(crate) mod tests {
         let v = o[0].read_variance + gain * 10.0;
         assert!((v / cam.at(10.0) - 1.0).abs() < 0.05, "background variance {v}");
         assert!(o.iter().all(|o| o.amp.len() == 1));
+    }
+
+    /// Observed, a stack gives what it gives unobserved and counts every
+    /// frame fit; cancelled before it starts, it gives nothing.
+    #[test]
+    fn progress_counts_frames_and_cancels() {
+        let (h, w, n) = (31, 31, 6);
+        let raw: Vec<f64> = (0..n as u64)
+            .flat_map(|i| {
+                let mut d = psf::model(&[10.0, 800.0, 15.2, 14.7, 1.2], h, w);
+                for (v, z) in d.iter_mut().zip(normals(h * w, 40 + i)) {
+                    *v += v.sqrt() * z;
+                }
+                d
+            })
+            .collect();
+        let s = Settings { fit_mixtures: true, ..Settings::new(1.2, 1.0) };
+        let p = Progress::default();
+        let seen = localize_stack_observed(&raw, n, h, w, 0.0, None, &s, 2, &p).expect("not cancelled");
+        let plain = localize_stack(&raw, n, h, w, 0.0, None, &s, 2);
+        assert_eq!((p.done(), p.total()), (2 * n, 2 * n));
+        assert!(seen.iter().zip(&plain).all(|(a, b)| a.pos == b.pos && a.z == b.z));
+        let stop = Progress::default();
+        stop.cancel();
+        assert!(localize_stack_observed(&raw, n, h, w, 0.0, None, &s, 2, &stop).is_none());
     }
 }

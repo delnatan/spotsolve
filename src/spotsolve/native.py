@@ -24,12 +24,22 @@ except ImportError as error:          # pragma: no cover - build problem
         "spotsolve needs its bundled Rust extension; reinstall a compatible wheel "
         "or run `maturin develop --release` from the repository root") from error
 
-__all__ = ["localize", "localize_stack", "estimate_gain", "P_REAL", "MAX_MIXTURES", "WIDTH"]
+__all__ = ["localize", "localize_stack", "estimate_gain", "Progress", "Cancelled",
+           "P_REAL", "MAX_MIXTURES", "WIDTH"]
 
 P_REAL = float(_rs.DETECT_P_REAL)
 """Default least probability that a reported emitter is real, not noise."""
 MAX_MIXTURES = int(_rs.DETECT_MAX_MIXTURES)
 WIDTH = tuple(float(v) for v in _rs.DETECT_WIDTH)
+
+Progress = _rs.Progress
+Progress.__doc__ = """A `localize_stack` run as another thread sees it: `done` frame fits of
+`total` (each frame once alone and, with mixtures, once more), and
+`cancel()` to stop it. Watching does not change the result."""
+
+
+class Cancelled(Exception):
+    """`localize_stack` stopped because its `progress` was cancelled."""
 
 
 def _positive_int(value, name):
@@ -161,7 +171,7 @@ def localize(frame, sigma, *, gain, offset=0.0, roi=None, p_real=P_REAL,
 
 def localize_stack(stack, sigma, *, gain, offset=0.0, roi=None, p_real=P_REAL,
                    width=WIDTH, fit_mixtures=False, max_mixtures=MAX_MIXTURES,
-                   motion_blur=False, n_threads=None, images=False):
+                   motion_blur=False, n_threads=None, images=False, progress=None):
     """Localize every frame of a `(T, H, W)` stack, in parallel.
 
     Returns one `Localizations` per frame, in frame order. Each frame's
@@ -170,12 +180,19 @@ def localize_stack(stack, sigma, *, gain, offset=0.0, roi=None, p_real=P_REAL,
     result depends on the stack it is in. `n_threads` defaults to the machine's cores.
     `images` defaults to False here: for a long timecourse the model and
     residual are two more copies of the movie.
+
+    To follow a long run, pass a `Progress` and read it from another thread;
+    its `cancel()` stops the run, which then raises `Cancelled`. Split into
+    several calls instead, each would be a movie of its own, with its own
+    read variance, bar `u` and `P(real | z)`.
     """
     raw = np.ascontiguousarray(stack, dtype=float)
     if raw.ndim != 3:
         raise ValueError(f"expected a (T, H, W) stack, got shape {raw.shape}")
     kw = _kw(sigma, gain, offset, roi, raw.shape[1:], p_real, width, fit_mixtures, max_mixtures, motion_blur)
-    outs = _rs.detect_localize_stack(raw, **kw, n_threads=_threads(n_threads))
+    outs = _rs.detect_localize_stack(raw, **kw, n_threads=_threads(n_threads), progress=progress)
+    if outs is None:
+        raise Cancelled("localize_stack was cancelled")
     return [_result(o, raw[t], kw, images) for t, o in enumerate(outs)]
 
 

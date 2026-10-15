@@ -48,6 +48,10 @@ output version is 9.
 - The read variance is measured from the background's fourth differences
   given the gain. `dispersion` is now the gain as given;
   `info["read_variance"]` and a `read_variance` frame-table column are new.
+- `localize_stack(..., progress=Progress())` reports frames fitted from
+  another thread, and `progress.cancel()` stops the run (`Cancelled`). A
+  stack split into several calls is several movies, each with its own read
+  variance and bar; one watched call is one movie.
 - `motion_blur=True`, with mixtures, tests a close pair against one
   elongated spot (a rotated Gaussian): it is two emitters only if it gains
   `u^2 / 2` nats over it, so an emitter moving within the exposure is one

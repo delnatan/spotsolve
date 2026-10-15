@@ -241,3 +241,30 @@ def test_edge_flag_does_not_depend_on_a_width_reporting_band():
 def test_native_wrapper_requires_positive_integer_counts(value):
     with pytest.raises(ValueError, match="n_threads"):
         L.localize_stack(np.ones((1, 16, 16)), 1.2, gain=GAIN, n_threads=value)
+
+
+def test_a_watched_stack_gives_what_it_gives_unwatched():
+    import threading
+    stack = np.stack([_sim(s).image for s in (17, 18, 19)])
+    plain = L.localize_stack(stack, SIGMA, gain=GAIN, fit_mixtures=True, n_threads=2)
+    progress = L.Progress()
+    seen = []
+    stop = threading.Event()
+
+    def watch():
+        while not stop.is_set():
+            seen.append(progress.done)
+    watcher = threading.Thread(target=watch)
+    watcher.start()
+    watched = L.localize_stack(stack, SIGMA, gain=GAIN, fit_mixtures=True, n_threads=2, progress=progress)
+    stop.set()
+    watcher.join()
+    assert (progress.done, progress.total) == (6, 6)
+    assert seen == sorted(seen)
+    for a, b in zip(plain, watched):
+        np.testing.assert_array_equal(a.positions, b.positions)
+        np.testing.assert_array_equal(a.info["z"], b.info["z"])
+    cancelled = L.Progress()
+    cancelled.cancel()
+    with pytest.raises(L.Cancelled):
+        L.localize_stack(stack, SIGMA, gain=GAIN, progress=cancelled)
