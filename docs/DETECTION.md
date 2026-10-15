@@ -187,6 +187,13 @@ spread evenly over a decade of `z`, is added to every bin as pseudo-counts:
 a movie's emitters outweigh it many times over, and with few candidates it
 keeps `f1` from vanishing between them.
 
+A candidate is not evidence for itself: each height is judged on `f1`
+fitted without the candidate nearest to it, its own where it is one.
+Where noise expects well under one candidate, as in a small frame or ROI,
+a lone noise maximum would otherwise raise `f1` at its own height and
+pass; it is judged on the prior and the other candidates instead. In a
+movie the one count left out changes nothing.
+
 `P(real)` is the probability of not being noise. Haze and other misfit
 that the Gaussian model reads as signal are emitters to it.
 

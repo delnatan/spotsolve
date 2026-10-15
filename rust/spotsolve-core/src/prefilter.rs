@@ -328,11 +328,34 @@ impl Curve {
         } else {
             (self.at(0.0), f64::INFINITY)
         };
-        let flat = |t: f64| (d * t - 0.5 * t * t) / floor;
         let (a, g) = (self.read, self.gain);
-        let linear = |t: f64| (d + a / g) / g * (a + g * t).ln() - t / g;
-        let antiderivative = |t: f64| if t < kink { flat(t) } else { flat(kink) + linear(t) - linear(kink) };
-        antiderivative(d) - antiderivative(mu)
+        // `integral from t0 to t1 of (d - t) / V(t) dt` on one side of the
+        // kink, each in a form free of cancellation: on the line, with `V0 =
+        // V(t0)` and `r = g (t1 - t0) / V0`, it is `(d - t1) ln(1 + r) / g +
+        // V0 ((1 + r) ln(1 + r) - r) / g^2`, which tends to the flat form as
+        // `g` does, however large `read / gain` is.
+        let piece = |t0: f64, t1: f64| {
+            if t0 < kink || t1 < kink {
+                (t1 - t0) * (2.0 * d - t0 - t1) / (2.0 * floor)
+            } else {
+                let v0 = a + g * t0;
+                let r = g * (t1 - t0) / v0;
+                (d - t1) * r.ln_1p() / g + v0 * excess_entropy(r) / (g * g)
+            }
+        };
+        if (mu < kink) == (d < kink) { piece(mu, d) } else { piece(mu, kink) + piece(kink, d) }
+    }
+}
+
+/// `(1 + r) ln(1 + r) - r`, accurate for small `r`, where it is `r^2 / 2`.
+fn excess_entropy(r: f64) -> f64 {
+    if r.abs() < 1e-2 {
+        // Its series, sum over k >= 2 of (-1)^k r^k / (k (k - 1)), to k = 9:
+        // the next term is under 1e-16 of the first.
+        let term = |k: i32| (if k % 2 == 0 { 1.0 } else { -1.0 }) / (k * (k - 1)) as f64;
+        (2..10).rev().fold(0.0, |acc, k| (acc + term(k)) * r) * r
+    } else {
+        (1.0 + r) * r.ln_1p() - r
     }
 }
 
@@ -495,6 +518,30 @@ mod tests {
         let (below, above) = (cam.deviance(3.0, kink - 1e-9), cam.deviance(3.0, kink + 1e-9));
         assert!((below - above).abs() < 1e-8 && cam.deviance(3.0, 3.0) == 0.0);
         assert!([-4.0, 0.0, 0.5, 2.0, 9.0].iter().all(|&mu| cam.deviance(3.0, mu) > 0.0 || mu == 3.0));
+    }
+
+    /// The deviance is its integral, by Simpson's rule, on every side of
+    /// the kink, however far read noise outweighs shot noise.
+    #[test]
+    fn the_deviance_is_its_integral_at_any_read_noise() {
+        // Split at the kink, where the integrand's slope jumps.
+        let simpson = |c: &Curve, d: f64, mu: f64| {
+            let rule = |t0: f64, t1: f64| {
+                let n = 20_000;
+                let h = (t1 - t0) / n as f64;
+                let f = |t: f64| (d - t) / c.at(t);
+                h / 3.0 * (0..=n).map(|i| f(t0 + i as f64 * h) * if i == 0 || i == n { 1.0 } else if i % 2 == 1 { 4.0 } else { 2.0 }).sum::<f64>()
+            };
+            let kink = (c.floor - c.read) / c.gain;
+            if (mu < kink) == (d < kink) { rule(mu, d) } else { rule(mu, kink) + rule(kink, d) }
+        };
+        for gain in [2.5, 1e-3, 1e-6, 1e-9] {
+            let cam = Curve { read: 100.0, gain, floor: 100.0 + 5.0 * gain };
+            for (d, mu) in [(120.0, 95.0), (80.0, 101.0), (2.0, 9.0), (9.0, 2.0), (100.3, 100.0)] {
+                let (got, want) = (cam.deviance(d, mu), simpson(&cam, d, mu));
+                assert!((got - want).abs() < 1e-9 * want, "gain {gain}, d {d}, mu {mu}: {got} vs {want}");
+            }
+        }
     }
 
     /// On a background rising across the frame, with read noise and gain,

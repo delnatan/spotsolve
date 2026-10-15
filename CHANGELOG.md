@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.5.3 (2026-10-15)
+
+Detection fixes. Movies are unchanged; single small frames and small ROIs
+report fewer noise maxima.
+
+- A candidate is no longer evidence for itself. `P(real | z)` is judged on
+  `f1` fitted without the candidate nearest to `z`. Where noise expects
+  well under one candidate (a small frame or ROI), a lone noise maximum
+  raised `f1` at its own height and was reported: pure-noise frames of
+  20x20 px gave about 150 false emitters per 10^6 px, 40x40 about 16; now
+  about 5 and 1. A lone faint emitter in such a frame is now judged on the
+  prior alone.
+- The quasi-likelihood deviance is computed without cancellation. Its
+  rounding error grew as `(read / gain)^2`; with read noise far above shot
+  noise (a tiny `gain`) fits stalled and noise was reported.
+
 ## 0.5.2 (2026-10-15)
 
 Linking fixes. Track ids change on most movies; the API does not.

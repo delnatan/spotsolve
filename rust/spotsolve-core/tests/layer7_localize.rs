@@ -138,3 +138,19 @@ fn pure_noise_is_not_reported() {
     println!("noise: {n} reported, u = {:.2}", out[0].u);
     assert!(n <= 2, "{n} reported at u = {}", out[0].u);
 }
+
+/// A frame is a movie of one: small frames of noise, each localized on
+/// its own, report next to nothing, though noise candidates are many.
+#[test]
+fn small_frames_of_noise_are_not_reported() {
+    let (side, frames, sigma) = (20, 400, 1.45);
+    let mut rng = Rng(19);
+    let n: usize = (0..frames)
+        .map(|_| {
+            let raw: Vec<f64> = (0..side * side).map(|_| rng.poisson(20.0)).collect();
+            bs::localize(&raw, side, side, None, &Settings::new(sigma, 1.0)).amp.len()
+        })
+        .sum();
+    println!("small noise frames: {n} reported");
+    assert!(n <= 4, "{n} reported in {frames} frames");
+}
