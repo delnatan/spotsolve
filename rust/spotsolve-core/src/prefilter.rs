@@ -171,6 +171,24 @@ pub fn label(mask: &[bool], h: usize, w: usize) -> Vec<u32> {
     labels
 }
 
+/// The frame's points of its noise curve where no emitter is
+/// ([`noise_points`]), and its variance per unit level ([`dispersion`]).
+/// Emitters stay out of the points: pixels whose score (`z_sd`, the score
+/// times the noise's sd, from [`score`]) reaches `bar` at that variance per
+/// unit level, a first guess, are left out.
+fn quiet_points(d: &[f64], h: usize, w: usize, z_sd: &[f64], level: &[f64], bar: f64) -> (Vec<[f64; 3]>, f64) {
+    let phi = dispersion(d, h, w);
+    let quiet: Vec<bool> = z_sd.iter().zip(level).map(|(&c, &l)| c < bar * (phi * l.max(LEVEL_FLOOR)).sqrt()).collect();
+    (noise_points(d, h, w, level, &quiet), phi)
+}
+
+/// The points of a frame's noise curve over its background, emitters at
+/// `bar` at width `sigma` left out ([`quiet_points`]).
+pub fn background_points(d: &[f64], h: usize, w: usize, sigma: f64, bar: f64) -> Vec<[f64; 3]> {
+    let (z, _, level) = score(d, h, w, sigma);
+    quiet_points(d, h, w, &z, &level, bar).0
+}
+
 /// Screen a frame `d` (ADU above the offset) on the camera's noise
 /// `curve`, or, without one, the frame's own ([`fit_curve`]): the mask
 /// holds every pixel whose score at `sigma`, which also sets the LoG,
@@ -178,15 +196,10 @@ pub fn label(mask: &[bool], h: usize, w: usize) -> Vec<u32> {
 pub fn screen(d: &[f64], h: usize, w: usize, sigma: f64, bar: f64, roi: Option<&[bool]>, curve: Option<Curve>) -> Screen {
     assert_eq!(d.len(), h * w);
     let (mut z, amplitude, background) = score(d, h, w, sigma);
-    // Emitters stay out of the noise curve: pixels whose score reaches `bar`
-    // at the frame's variance per unit mean, a first guess, are left out.
-    // A frame without the camera's curve measures its own.
     let (phi, points, curve) = match curve {
         Some(c) => (f64::NAN, Vec::new(), c),
         None => {
-            let phi = dispersion(d, h, w);
-            let quiet: Vec<bool> = z.iter().zip(&background).map(|(&c, &l)| c < bar * (phi * l.max(LEVEL_FLOOR)).sqrt()).collect();
-            let points = noise_points(d, h, w, &background, &quiet);
+            let (points, phi) = quiet_points(d, h, w, &z, &background, bar);
             let curve = fit_curve(&points);
             (phi, points, curve)
         }
@@ -281,6 +294,16 @@ pub struct Curve {
 }
 
 impl Curve {
+    /// A camera counting photons without read noise, in photons.
+    pub const POISSON: Curve = Curve { read: 0.0, gain: 1.0, floor: 1e-3 };
+
+    /// The curve of a camera of `gain` over the background `points`
+    /// ([`noise_points`]): the read variance from them given the gain
+    /// ([`read_given`]), no pixel quieter than the quietest of them.
+    pub fn of(gain: f64, points: &[[f64; 3]]) -> Self {
+        Curve { read: read_given(points, gain), gain, floor: quietest(points) }
+    }
+
     pub fn at(&self, light: f64) -> f64 {
         (self.read + self.gain * light).max(self.floor).max(f64::MIN_POSITIVE)
     }

@@ -65,9 +65,8 @@ class Localizations:
     sigma: float
     """Reference width used for candidate searching and fit initialization, px."""
     dispersion: float
-    """The camera's gain, measured from the movie: pixel variance per ADU of
-    light. A pixel's variance is `info["read_variance"] + dispersion *
-    light`.
+    """The camera's gain, as given: pixel variance per ADU of light. A
+    pixel's variance is `info["read_variance"] + dispersion * light`.
     """
     info: dict = field(default_factory=dict)
     """Method-specific work counts, settings and fit diagnostics."""

@@ -41,8 +41,12 @@ def main(args):
         img = img[y0:y1, x0:x1]
     print(f"{args.image}  {img.shape}")
 
+    gain = args.gain
+    if gain is None:
+        gain = spotsolve.estimate_gain(img, sigma=args.sigma, offset=CAMERA_OFFSET)
+        print(f"gain {gain:.3f} (estimated from the image)")
     t = time.time()
-    res = spotsolve.localize(img, sigma=args.sigma, offset=CAMERA_OFFSET,
+    res = spotsolve.localize(img, sigma=args.sigma, gain=gain, offset=CAMERA_OFFSET,
                              p_real=args.p_real,
                              fit_mixtures=args.mixtures,
                              motion_blur=args.motion_blur)
@@ -110,6 +114,8 @@ if __name__ == "__main__":
     ap.add_argument("--frame", type=int, default=0,
                     help="which frame, if the file is a stack")
     ap.add_argument("--sigma", type=float, default=1.2)
+    ap.add_argument("--gain", type=float, default=None,
+                    help="camera gain, pixel variance per ADU of light (default: estimated from the image)")
     ap.add_argument("--p-real", type=float, default=spotsolve.P_REAL)
     ap.add_argument("--mixtures", action="store_true", help="fit overlapping spots jointly (u-track FitMixtures)")
     ap.add_argument("--motion-blur", action="store_true", help="with --mixtures, report a close pair as one elongated spot unless two fit better")

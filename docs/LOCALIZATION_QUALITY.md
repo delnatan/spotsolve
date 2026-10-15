@@ -11,7 +11,7 @@ import polars as pl
 import spotsolve
 from spotsolve import loctable
 
-result = spotsolve.localize(frame_img, sigma=1.45, offset=100)
+result = spotsolve.localize(frame_img, sigma=1.45, gain=gain, offset=100)
 locs, summary = loctable.frame_tables(result, frame=0)
 
 # Optional downstream selection. Keep locs for inspection and alternate cuts.
@@ -55,9 +55,11 @@ covariance are separate: finite SEs do not imply convergence.
 
 ## Uncertainty and significance
 
-SEs use the Fisher information of the emitter's settled window fit, every
-component, width and the window's level free, at each pixel's measured
-variance (`read_variance + dispersion * light`). They are local
+SEs use the Fisher information of the emitter's window fit, every
+component, width and the window's level free, at each pixel's variance
+under the camera's curve (`read_variance + gain * light`). They scale with
+the square root of the gain given, so a gain off by a factor puts SEs off by
+its root. They are local
 approximations; bounds, low counts, light from outside the window and PSF
 mismatch can invalidate coverage. An `ELONGATED` emitter's SEs are those of
 its ellipse's centre and flux; its width's SE is that of the geometric mean

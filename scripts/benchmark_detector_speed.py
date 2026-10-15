@@ -18,7 +18,7 @@ from time import perf_counter
 import numpy as np
 import tifffile
 
-from spotsolve import P_REAL, localize_stack
+from spotsolve import P_REAL, estimate_gain, localize_stack
 
 
 def _update(digest, value):
@@ -51,6 +51,8 @@ def main():
     parser.add_argument("image", type=Path)
     parser.add_argument("--sigma", type=float, required=True)
     parser.add_argument("--offset", type=float, default=0.0)
+    parser.add_argument("--gain", type=float, default=None,
+                        help="camera gain (default: estimated from the frames)")
     parser.add_argument("--p-real", type=float, default=P_REAL)
     parser.add_argument("--mixtures", action="store_true", help="fit overlapping spots jointly (u-track FitMixtures)")
     parser.add_argument("--frames", type=int, default=5)
@@ -67,7 +69,9 @@ def main():
     if stack.ndim != 3 or len(stack) < args.frames:
         parser.error("expected a grayscale stack with at least --frames frames")
     stack = np.ascontiguousarray(stack[:args.frames])
-    settings = dict(sigma=args.sigma, offset=args.offset,
+    gain = args.gain if args.gain is not None else estimate_gain(
+        stack, sigma=args.sigma, offset=args.offset, n_threads=args.threads)
+    settings = dict(sigma=args.sigma, gain=gain, offset=args.offset,
                     p_real=args.p_real, fit_mixtures=args.mixtures,
                     images=True)
     localize_stack(stack[:1], n_threads=args.threads, **settings)

@@ -27,8 +27,9 @@ SHAPE = (128, 128)
 
 
 def detector(name, **kw):
-    return lambda f: spotsolve.localize(f, SIGMA, images=False,
-                                        fit_mixtures=name == "mixtures", **kw)
+    # Frames are Poisson in photons, gain 1, unless scaled.
+    return lambda f, gain=1.0: spotsolve.localize(f, SIGMA, gain=gain, images=False,
+                                                  fit_mixtures=name == "mixtures", **kw)
 
 
 def render(positions, fluxes, shape=SHAPE, bg=BG):
@@ -46,9 +47,9 @@ def grid_positions(rng, spacing, border=8.0):
     return p + rng.uniform(-0.5, 0.5, p.shape)
 
 
-def run(det, frame):
+def run(det, frame, gain=1.0):
     t = perf_counter()
-    r = det(frame)
+    r = det(frame, gain)
     return r, perf_counter() - t
 
 
@@ -136,7 +137,7 @@ def noise(det, rng, frames):
         n_est, secs = 0, 0.0
         for _ in range(frames):
             frame = gain * rng.poisson(BG / gain, SHAPE).astype(float)
-            r, t = run(det, frame)
+            r, t = run(det, frame, gain)
             n_est += len(r.positions)
             secs += t
         out[f"gain_{gain:g}"] = dict(

@@ -31,15 +31,18 @@ and migration from the old separate `spotsolve-rs` installation.
 ```python
 import spotsolve
 
-# frame: (H, W), stack: (T, H, W), in camera units (ADU).
-locs = spotsolve.localize(frame, sigma=1.45, offset=100)
-movie = spotsolve.localize_stack(stack, sigma=1.45, offset=100, n_threads=5)
+# frame: (H, W), stack: (T, H, W), in camera units (ADU). The gain is the
+# camera's pixel variance per ADU of light: from its calibration, or
+# measured from a movie.
+gain = spotsolve.estimate_gain(stack, sigma=1.45, offset=100)
+locs = spotsolve.localize(frame, sigma=1.45, gain=gain, offset=100)
+movie = spotsolve.localize_stack(stack, sigma=1.45, gain=gain, offset=100, n_threads=5)
 
 # Crowded spots: fit several emitters per window.
-locs = spotsolve.localize(frame, sigma=1.45, offset=100, fit_mixtures=True)
+locs = spotsolve.localize(frame, sigma=1.45, gain=gain, offset=100, fit_mixtures=True)
 
 # Stricter: report only spots at least 99% likely to be real, not 90%.
-movie = spotsolve.localize_stack(stack, sigma=1.45, offset=100, p_real=0.99)
+movie = spotsolve.localize_stack(stack, sigma=1.45, gain=gain, offset=100, p_real=0.99)
 ```
 
 Both return `Localizations` (one per frame for stacks):
@@ -54,14 +57,14 @@ Both return `Localizations` (one per frame for stacks):
 | `sigma_ratio` | `fit_sigma / sigma` |
 | `flags` | `(N,)` bitmask of `FitFlag` diagnostics; rows are retained |
 | `background` | Screening level map, NaN outside the processed crop |
-| `dispersion` | The camera's gain, pixel variance per ADU of light, measured from the movie |
+| `dispersion` | The camera's gain, as given |
 | `info` | `u`, per-emitter `z` and `p_real`, `fitted_background`, `seed`, `mixture`, and work counts |
 | `model_image`, `residual` | Optional diagnostic images |
 
 Flux and background use ADU above `offset`; divide flux by camera gain for
 photoelectrons. Each pixel's variance is `info["read_variance"] +
-dispersion * light`, both measured from the movie without camera
-calibration. Uncertainties come from the Fisher information of each
+gain * light`, the read variance measured from the background given the
+gain. Uncertainties come from the Fisher information of each
 emitter's final window fit at those variances; NaN if it cannot be
 computed. `info["z"]` is each emitter's `sqrt(2 * likelihood
 ratio)`, at least the movie's bar `info["u"]`, and `info["p_real"]` its
@@ -74,6 +77,7 @@ pixels.
 | Setting | Default | Effect |
 |---|---|---|
 | `sigma` | required | In-focus PSF width, px |
+| `gain` | required | Pixel variance per ADU of light: the camera's conversion gain (ADU per photoelectron) times any excess-noise factor (2 for an EMCCD). `estimate_gain` measures it from a movie |
 | `offset` | 0 | Camera offset, ADU |
 | `roi` | None | `(H, W)` bool mask of where seeds may be placed |
 | `p_real` | 0.9 | Least probability that a reported spot is real, not noise; higher is stricter |
@@ -82,10 +86,11 @@ pixels.
 | `max_mixtures` | 20 | Components per window at most |
 | `motion_blur` | False | With mixtures, report a close pair as one elongated spot unless two fit better |
 
-The frame is screened by a score test on the camera's measured noise, seeds are placed at local
+The frame is screened by a score test on the camera's noise, seeds are placed at local
 maxima, and each seed's window is fitted with a constant level and
-pixel-integrated Gaussians. A spot is kept only if it gains `u^2/2` nats of
-likelihood. The movie sets `u`: every frame's spots, fitted alone at a low
+pixel-integrated Gaussians at maximum quasi-likelihood under the camera's
+noise (the Poisson likelihood for a Poisson camera). A spot is kept only if
+it gains `u^2/2` nats of quasi-likelihood. The movie sets `u`: every frame's spots, fitted alone at a low
 bar, have a density of `z` that noise alone explains only in part, and `u`
 is where the probability of being real reaches `p_real`. The bar therefore
 adapts to each movie, and a frame's result depends on the stack it is in;
@@ -128,7 +133,7 @@ in-focus mode:
 ```python
 import numpy as np
 
-preview = spotsolve.localize_stack(stack[:3], sigma=1.2, offset=100,
+preview = spotsolve.localize_stack(stack[:3], sigma=1.2, gain=gain, offset=100,
                                    fit_mixtures=True)
 widths = np.concatenate([result.fit_sigma for result in preview])
 counts, bin_edges = np.histogram(widths, bins="auto")

@@ -1,14 +1,14 @@
 //! LAYER 3: the window fit ([`spotsolve_core::fit`]).
 //!
-//! Derivatives against finite differences; on simulated Poisson windows
-//! weighted by their variance, position and flux errors against the
-//! reported variances; bounds, masked pixels and two-component recovery, at
+//! Derivatives against finite differences; on simulated Poisson windows,
+//! position and flux errors against the reported variances; bounds, masked pixels and two-component recovery, at
 //! one width and at each its own.
 
 mod common;
 
 use common::Rng;
 use spotsolve_core::fit::{Fitter, Layout, Window};
+use spotsolve_core::prefilter::Curve;
 
 
 const SIGMA: f64 = 1.45;
@@ -17,7 +17,7 @@ const HALF: usize = 6;
 const SIDE: usize = 2 * HALF + 1;
 
 fn clean(rows: usize, cols: usize, theta: &[f64], lay: Layout) -> Vec<f64> {
-    let w = Window::new(rows, cols, vec![0.0; rows * cols], vec![true; rows * cols], vec![1.0; rows * cols]);
+    let w = Window::new(rows, cols, vec![0.0; rows * cols], vec![true; rows * cols], Curve::POISSON);
     Fitter::default().model(&w, theta, lay).to_vec()
 }
 
@@ -43,7 +43,7 @@ fn derivatives_match_finite_differences() {
     let m0 = clean(rows, cols, &theta, lay);
     let d: Vec<f64> = m0.iter().map(|&m| rng.poisson(m) - 2.0).collect();
     let used: Vec<bool> = (0..rows * cols).map(|q| q % 7 != 3).collect();
-    let w = Window::new(rows, cols, d, used.clone(), m0.clone());
+    let w = Window::new(rows, cols, d, used.clone(), Curve::POISSON);
     let mut f = Fitter::default();
     let lin = f.linearize(&w, &theta, lay);
     let (g, info) = (&lin.g, &lin.f);
@@ -89,7 +89,7 @@ fn error_spread(lay: Layout, trials: usize) -> Vec<(f64, f64)> {
         }
         let m = clean(SIDE, SIDE, &truth, lay);
         let d: Vec<f64> = m.iter().map(|&m| rng.poisson(m)).collect();
-        let w = Window::new(SIDE, SIDE, d, vec![true; SIDE * SIDE], m);
+        let w = Window::new(SIDE, SIDE, d, vec![true; SIDE * SIDE], Curve::POISSON);
         let mut start = vec![15.0, 500.0, c, c];
         if lay.sigma.is_none() {
             start.push(SIGMA);
@@ -133,12 +133,12 @@ fn bounds_hold_and_are_reported() {
     let mut f = Fitter::default();
     // An emitter outside the position box: x stops on its bound.
     let d = clean(SIDE, SIDE, &[20.0, 800.0, c, c + 3.5], lay);
-    let fit = f.fit(&Window::new(SIDE, SIDE, d.clone(), vec![true; SIDE * SIDE], d), &[20.0, 500.0, c, c], lay, &lo, &hi, 100, 1e-6);
+    let fit = f.fit(&Window::new(SIDE, SIDE, d, vec![true; SIDE * SIDE], Curve::POISSON), &[20.0, 500.0, c, c], lay, &lo, &hi, 100, 1e-6);
     assert_eq!(fit.at_bound, [false, false, false, true]);
     assert!(fit.theta.iter().zip(lo.iter().zip(&hi)).all(|(t, (l, h))| l < t && t < h));
     // Flat background: the flux falls far below its standard error and the
     // level is found.
-    let w = Window::new(SIDE, SIDE, vec![20.0; SIDE * SIDE], vec![true; SIDE * SIDE], vec![20.0; SIDE * SIDE]);
+    let w = Window::new(SIDE, SIDE, vec![20.0; SIDE * SIDE], vec![true; SIDE * SIDE], Curve::POISSON);
     let fit = f.fit(&w, &[15.0, 500.0, c, c], lay, &lo, &hi, 100, 1e-6);
     let var = f.variances(&w, &fit.theta, lay).unwrap();
     assert!(fit.converged && fit.theta[1] < 0.1 * var[1].sqrt(), "{fit:?}");
@@ -162,8 +162,8 @@ fn unused_pixels_do_not_enter() {
     let (lo, hi) = bounds(lay, c, 2.0);
     let start = [15.0, 500.0, c, c, SIGMA];
     let mut f = Fitter::default();
-    let a = f.fit(&Window::new(SIDE, SIDE, d, used.clone(), m.clone()), &start, lay, &lo, &hi, 100, 1e-6);
-    let b = f.fit(&Window::new(SIDE, SIDE, other, used, m), &start, lay, &lo, &hi, 100, 1e-6);
+    let a = f.fit(&Window::new(SIDE, SIDE, d, used.clone(), Curve::POISSON), &start, lay, &lo, &hi, 100, 1e-6);
+    let b = f.fit(&Window::new(SIDE, SIDE, other, used, Curve::POISSON), &start, lay, &lo, &hi, 100, 1e-6);
     assert_eq!(a.theta, b.theta);
     assert_eq!(a.divergence, b.divergence);
 }
@@ -182,7 +182,7 @@ fn two_components_recover_a_close_pair() {
     };
     let d = clean(SIDE, SIDE, &truth, lay);
     let (lo, hi) = bounds(lay, c, 3.0);
-    let fit = Fitter::default().fit(&Window::new(SIDE, SIDE, d.clone(), vec![true; SIDE * SIDE], d), &start, lay, &lo, &hi, 100, 1e-12);
+    let fit = Fitter::default().fit(&Window::new(SIDE, SIDE, d, vec![true; SIDE * SIDE], Curve::POISSON), &start, lay, &lo, &hi, 100, 1e-12);
     assert!(fit.converged, "{fit:?}");
     for (got, want) in fit.theta.iter().zip(&truth) {
         assert!((got - want).abs() < 1e-4 * want.abs().max(1.0), "{:?} vs {truth:?}", fit.theta);

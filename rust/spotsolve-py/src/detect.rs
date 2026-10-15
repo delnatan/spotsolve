@@ -17,7 +17,8 @@ type Arr2 = Py<PyArray2<f64>>;
 /// `(positions, amplitudes, sigmas, se, sigma_se, flags, background, info)`.
 type Frame<'py> = (Arr2, Arr1, Arr1, Arr2, Arr1, Py<PyArray1<u8>>, Arr2, Bound<'py, PyDict>);
 
-fn settings(sigma: f64, p_real: f64, width: (f64, f64), fit_mixtures: bool, max_mixtures: usize, motion_blur: bool) -> PyResult<detect::Settings> {
+#[allow(clippy::too_many_arguments)]
+fn settings(sigma: f64, gain: f64, p_real: f64, width: (f64, f64), fit_mixtures: bool, max_mixtures: usize, motion_blur: bool) -> PyResult<detect::Settings> {
     if !(width.0 > 0.0 && width.0.is_finite() && width.0 <= width.1) {
         return Err(PyValueError::new_err("`width` must be 0 < lo <= hi"));
     }
@@ -27,10 +28,13 @@ fn settings(sigma: f64, p_real: f64, width: (f64, f64), fit_mixtures: bool, max_
     if !(sigma.is_finite() && sigma > 0.0) {
         return Err(PyValueError::new_err("`sigma` must be positive"));
     }
+    if !(gain.is_finite() && gain > 0.0) {
+        return Err(PyValueError::new_err("`gain` must be positive and finite"));
+    }
     if !(p_real > 0.0 && p_real < 1.0) {
         return Err(PyValueError::new_err("`p_real` must lie strictly between 0 and 1"));
     }
-    Ok(detect::Settings { sigma, p_real, width, fit_mixtures, max_mixtures, motion_blur })
+    Ok(detect::Settings { sigma, gain, p_real, width, fit_mixtures, max_mixtures, motion_blur })
 }
 
 fn check_offset(offset: f64) -> PyResult<()> {
@@ -90,16 +94,18 @@ fn give<'py>(py: Python<'py>, o: detect::Output, h: usize, w: usize) -> PyResult
     ))
 }
 
-/// Localize one raw frame. Everything is in ADU above `offset`; the
-/// background and the camera's noise are measured from the frame.
+/// Localize one raw frame. Everything is in ADU above `offset`; `gain` is
+/// the camera's pixel variance per ADU of light, and the background is
+/// measured from the frame.
 #[pyfunction]
-#[pyo3(signature = (raw, sigma, offset=0.0, *, roi=None, p_real=detect::P_REAL, width=detect::WIDTH, fit_mixtures=false, max_mixtures=detect::MAX_MIXTURES, motion_blur=false))]
+#[pyo3(signature = (raw, sigma, offset=0.0, *, gain, roi=None, p_real=detect::P_REAL, width=detect::WIDTH, fit_mixtures=false, max_mixtures=detect::MAX_MIXTURES, motion_blur=false))]
 #[allow(clippy::too_many_arguments)]
 fn detect_localize<'py>(
     py: Python<'py>,
     raw: PyReadonlyArray2<'_, f64>,
     sigma: f64,
     offset: f64,
+    gain: f64,
     roi: Option<PyReadonlyArray2<'_, bool>>,
     p_real: f64,
     width: (f64, f64),
@@ -117,7 +123,7 @@ fn detect_localize<'py>(
     }
     check_offset(offset)?;
     let roi = roi_slice(&roi, h, w)?.map(|m| m.to_vec());
-    let s = settings(sigma, p_real, width, fit_mixtures, max_mixtures, motion_blur)?;
+    let s = settings(sigma, gain, p_real, width, fit_mixtures, max_mixtures, motion_blur)?;
     let o = py.detach(|| detect::localize_raw(&r, h, w, offset, roi.as_deref(), &s));
     give(py, o, h, w)
 }
@@ -126,13 +132,14 @@ fn detect_localize<'py>(
 /// at the movie's bar: `P(real | z)` is fitted to every frame's candidates.
 /// Returns one tuple per frame, in frame order.
 #[pyfunction]
-#[pyo3(signature = (raw, sigma, offset=0.0, *, roi=None, p_real=detect::P_REAL, width=detect::WIDTH, fit_mixtures=false, max_mixtures=detect::MAX_MIXTURES, motion_blur=false, n_threads=1))]
+#[pyo3(signature = (raw, sigma, offset=0.0, *, gain, roi=None, p_real=detect::P_REAL, width=detect::WIDTH, fit_mixtures=false, max_mixtures=detect::MAX_MIXTURES, motion_blur=false, n_threads=1))]
 #[allow(clippy::too_many_arguments)]
 fn detect_localize_stack<'py>(
     py: Python<'py>,
     raw: PyReadonlyArray3<'_, f64>,
     sigma: f64,
     offset: f64,
+    gain: f64,
     roi: Option<PyReadonlyArray2<'_, bool>>,
     p_real: f64,
     width: (f64, f64),
@@ -151,12 +158,40 @@ fn detect_localize_stack<'py>(
     }
     check_offset(offset)?;
     let roi = roi_slice(&roi, h, w)?.map(|m| m.to_vec());
-    let s = settings(sigma, p_real, width, fit_mixtures, max_mixtures, motion_blur)?;
+    let s = settings(sigma, gain, p_real, width, fit_mixtures, max_mixtures, motion_blur)?;
     let r = r.to_vec();
     let outs = py.detach(|| {
         detect::localize_stack(&r, n, h, w, offset, roi.as_deref(), &s, n_threads.max(1))
     });
     outs.into_iter().map(|o| give(py, o, h, w)).collect()
+}
+
+/// The camera's gain, pixel variance per ADU of light, measured from the
+/// bright emitters of a raw `(T, H, W)` stack (`detect::estimate_gain`).
+#[pyfunction]
+#[pyo3(signature = (raw, sigma, offset=0.0, *, roi=None, width=detect::WIDTH, n_threads=1))]
+fn detect_estimate_gain(
+    py: Python<'_>,
+    raw: PyReadonlyArray3<'_, f64>,
+    sigma: f64,
+    offset: f64,
+    roi: Option<PyReadonlyArray2<'_, bool>>,
+    width: (f64, f64),
+    n_threads: usize,
+) -> PyResult<f64> {
+    let sh = raw.shape();
+    let (n, h, w) = (sh[0], sh[1], sh[2]);
+    let r = raw
+        .as_slice()
+        .map_err(|_| PyValueError::new_err("`raw` must be a C-contiguous float64 array"))?;
+    if n == 0 || h == 0 || w == 0 || r.iter().any(|v| !v.is_finite()) {
+        return Err(PyValueError::new_err("`raw` must be finite and non-empty"));
+    }
+    check_offset(offset)?;
+    settings(sigma, 1.0, detect::P_REAL, width, true, detect::MAX_MIXTURES, false)?;
+    let roi = roi_slice(&roi, h, w)?.map(|m| m.to_vec());
+    let r = r.to_vec();
+    Ok(py.detach(|| detect::estimate_gain(&r, n, h, w, offset, roi.as_deref(), sigma, width, n_threads.max(1))))
 }
 
 /// `background` plus every emitter at its own width, truncated at
@@ -187,9 +222,10 @@ fn detect_render(
 }
 
 pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
-    m.add("DETECT_OUTPUT_VERSION", 8)?;
+    m.add("DETECT_OUTPUT_VERSION", 9)?;
     m.add_function(wrap_pyfunction!(detect_localize, m)?)?;
     m.add_function(wrap_pyfunction!(detect_localize_stack, m)?)?;
+    m.add_function(wrap_pyfunction!(detect_estimate_gain, m)?)?;
     m.add_function(wrap_pyfunction!(detect_render, m)?)?;
     // The detector's defaults, read by `spotsolve.native` so Python states
     // no second copy of them.

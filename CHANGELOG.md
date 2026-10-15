@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.5.1 (2026-10-14)
 
 The detection bar is now Bayesian and set per movie. Breaking API change.
 
@@ -26,22 +26,28 @@ The detection bar is now Bayesian and set per movie. Breaking API change.
   `AT_BOUND`. Deciding on the fitted width alone dropped half of the
   emitters on the bound, so particles near it vanished from frame to frame.
 
-The noise model is the camera's, measured from the movie. Breaking change
-to `dispersion`, and the output version is 8.
+The noise model is the camera's, and the camera's gain is an input.
+Breaking change: `localize` and `localize_stack` require `gain`, and the
+output version is 9.
 
 - Each pixel's variance is `read + gain * light`, the light the model puts
-  on it, and every fit is least squares at those variances, reweighted as
-  components are added and removed and settled once at the reported fit's
-  own weights: a quasi-likelihood fit. Every decision, and `z`, compares
-  its deviance, the Poisson deviance for a Poisson camera, so `P(real)`
-  holds its null on dark sCMOS and EMCCD frames too. The scalar dispersion `phi = variance / mean`
-  is gone: with read noise it overstated the variance at spot peaks and
-  understated `z` on dark backgrounds, so faint spots went unreported.
-- Both are measured without calibration: the gain from the
-  leverage-corrected residuals of bright emitters, probed in frames spread
-  over the movie, and the read variance from the background's fourth
-  differences. `dispersion` is now the gain; `info["read_variance"]` and a
-  `read_variance` frame-table column are new.
+  on it. Every window is fitted at maximum quasi-likelihood under that
+  variance, by Fisher scoring with the weights of the current model, and
+  every decision, and `z`, compares its deviance: the Poisson likelihood
+  for a Poisson camera, so `P(real)` holds its null on dark sCMOS and EMCCD
+  frames too. The scalar dispersion `phi = variance / mean` is gone: with
+  read noise it overstated the variance at spot peaks and understated `z`
+  on dark backgrounds, so faint spots went unreported.
+- `gain` is pixel variance per ADU of light: the conversion gain times any
+  excess-noise factor (2 for an EMCCD). The gain is the quasi-likelihood's
+  dispersion: it scales every likelihood ratio and standard error, and
+  decides whether a bright spot's misfit takes a second component.
+- `estimate_gain(stack, sigma, offset=...)` measures it from a movie, from
+  the leverage-corrected residuals of bright emitters, where the camera's
+  calibration is not at hand.
+- The read variance is measured from the background's fourth differences
+  given the gain. `dispersion` is now the gain as given;
+  `info["read_variance"]` and a `read_variance` frame-table column are new.
 - `motion_blur=True`, with mixtures, tests a close pair against one
   elongated spot (a rotated Gaussian): it is two emitters only if it gains
   `u^2 / 2` nats over it, so an emitter moving within the exposure is one

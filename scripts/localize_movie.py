@@ -44,9 +44,15 @@ def main(args):
     print(f"{args.image}: frames {first}..{first + len(stack) - 1}, "
           f"{stack.shape[1]}x{stack.shape[2]} px, sigma={args.sigma}")
 
+    gain = args.gain
+    if gain is None:
+        gain = spotsolve.estimate_gain(stack, sigma=args.sigma, offset=CAMERA_OFFSET,
+                                       n_threads=args.threads)
+        print(f"  gain {gain:.3f} (estimated from the movie)")
+
     # One native call for the whole range: frames run in parallel threads.
     t0 = time.time()
-    results = spotsolve.localize_stack(stack, sigma=args.sigma,
+    results = spotsolve.localize_stack(stack, sigma=args.sigma, gain=gain,
                                        offset=CAMERA_OFFSET,
                                        p_real=args.p_real,
                                        fit_mixtures=args.mixtures,
@@ -120,6 +126,8 @@ if __name__ == "__main__":
                     help="um per px, for the derived physical columns")
     ap.add_argument("--interval", type=float, default=DEFAULT_INTERVAL,
                     help="seconds per frame")
+    ap.add_argument("--gain", type=float, default=None,
+                    help="camera gain, pixel variance per ADU of light (default: estimated from the movie)")
     ap.add_argument("--p-real", type=float, default=spotsolve.P_REAL,
                     help="least probability a reported emitter is real, not noise")
     ap.add_argument("--mixtures", action="store_true",

@@ -11,59 +11,61 @@ real, not noise, with probability at least `p_real`.
 
 Work in camera units: `d = frame - offset`. A window around a seed holds a
 constant level `c` and components of flux `A`, centre `(y, x)` and width `s`,
-each a Gaussian integrated over every pixel, and each pixel is Gaussian of
-the variance the camera gives the light on it:
+each a Gaussian integrated over every pixel:
 
 ```text
 m[i,j] = c + sum_k A_k * E(i; y_k, s_k) * E(j; x_k, s_k)
 E(i; y, s) = 0.5 * [erf((i-y+0.5)/(s*sqrt(2))) - erf((i-y-0.5)/(s*sqrt(2)))]
-v[i,j] = read + gain * m[i,j]
-I(d,m) = sum_pixels (d - m)^2 / (2 v)
 ```
 
-Fits minimize `I`. The weights follow the model: each pixel's variance is
-that of the light the current fit puts there, refreshed as components are
-added and removed, and the reported fit is settled once at its own
-weights, as iteratively reweighted least squares does. That is a
-quasi-likelihood fit, and every decision compares its deviance, in nats,
+A camera's pixel has variance `V(m) = read + gain * m`: read noise, then
+shot noise. Every window is fitted at maximum quasi-likelihood under that
+variance (Wedderburn 1974, *Biometrika* 61:439), and every decision
+compares its deviance, in nats,
 
 ```text
-Q(d,m) = sum_pixels integral from m to d of (d - t) / V(t) dt,    V(t) = read + gain * t
+Q(d,m) = sum_pixels integral from m to d of (d - t) / V(t) dt
 ```
 
-the Poisson deviance (halved) of `d + read/gain` at `m + read/gain`, over
-`gain`; Gaussian of the quietest background's variance where `V` would
-fall below it. Its likelihood ratios carry shot noise's skew, so noise
-alone gives them the null of the Euler-characteristic formula at every
-level of light. The Gaussian ratio at fixed weights does not: at the
-alternative's weights its noise maxima fall short of that null, the more
-so the darker the background; at the null's they overshoot it in the tail,
-with skew and with pixels noisier than the curve.
+With `tau = read / gain`, `Q` is the Poisson deviance (halved) of `d + tau`
+at `m + tau`, over `gain`: the Poisson likelihood for a Poisson camera.
+Where `V` would fall below the quietest background's variance it is held
+there. Fisher scoring on `Q` is least squares weighted by `1 / V(m)` at the
+current model, run to its fixed point. Its likelihood ratios carry shot
+noise's skew, so noise alone gives them the null of the
+Euler-characteristic formula at every level of light.
+
+The gain is the quasi-likelihood's dispersion: estimates depend on it only
+through `tau`, every likelihood ratio scales as `1 / gain`, and standard
+errors as `sqrt(gain)`. A faint spot's pixels have the background's
+variance, so its decision rests on the background, which is measured; the
+gain matters where a spot's own light raises its pixels' variance: the
+standard errors of bright spots, and whether a bright spot's misfit takes a
+second component.
 
 ## Noise
 
-`read + gain * light` is how a camera's pixel varies: read noise (with any
-error in the offset), then shot noise, `gain` the gain times any
-excess-noise factor. Both are measured from the movie; no calibration is
-needed, and fluxes scale with the gain while positions and decisions do not.
+- **Gain.** An input: pixel variance per ADU of light, the camera's
+  conversion gain (ADU per photoelectron) times any excess-noise factor (2
+  for an EMCCD), from the camera's calibration or from `estimate_gain`.
+- **Read variance.** Measured from the movie's background given the gain.
+  The separable fourth difference `b` (`[1, -4, 6, -4, 1]` along each axis)
+  of pixels of variance `v` has variance `70^2 v` wherever the light is
+  smooth on its 5-pixel scale, so `b^2 / 70^2` has the median of `v chi2_1`.
+  Its median over each 32-pixel tile, away from candidate spots, against
+  the tile's median level, is one point of the curve; the read variance is
+  the median over points of their variance less the gain's share of their
+  light. No pixel is taken as quieter than the quietest tile.
 
-- **Background.** The separable fourth difference `b` (`[1, -4, 6, -4, 1]`
-  along each axis) of pixels of variance `v` has variance `70^2 v` wherever
-  the light is smooth on its 5-pixel scale, so `b^2 / 70^2` has the median
-  of `v chi2_1`. Its median over each 32-pixel tile, away from candidate
-  spots, against the tile's median level, is one point of the curve.
-- **Gain.** Bright emitters span a wide range of light. Probe fits (every
-  light in their windows fitted, at a bar where noise almost never takes a
-  component) leave residuals whose squares, each corrected for its pixel's
-  leverage, over `v` are `chi2_1`; the gain sets their median to that
-  law's. A median, so a neighbour's light on a few pixels does not move it.
-  Frames are probed, spread over the movie, until their pixels fix the gain.
-- **Read variance.** The background's points, less the gain's share of their
-  light: their median.
-
-No pixel is taken as quieter than the quietest background tile. Without
-bright emitters the gain is the background's variance per unit level, exact
-without read noise and otherwise an upper bound.
+`estimate_gain` measures the gain from a movie's bright emitters, whose
+light spans a range the background does not. Probe fits (every light in
+their windows fitted, at a bar where noise almost never takes a component)
+leave residuals whose squares, each corrected for its pixel's leverage, over
+`V` are `chi2_1`; the gain sets their median to that law's. A median, so a
+neighbour's light on a few pixels does not move it. Frames are probed,
+spread over the movie, until their pixels fix the gain. Without bright
+emitters it returns the background's variance per unit level: exact without
+read noise, and otherwise an upper bound.
 
 ## Algorithm
 
@@ -80,7 +82,7 @@ without read noise and otherwise an upper bound.
 3. **Window fits.** Pixels of other mask components are left out. Components
    are fitted by bounded Levenberg-Marquardt (Coleman-Li scaling), each with
    its own width. A component is kept only if adding it gains `u^2/2` nats:
-   `2 (I_k - I_k+1) >= u^2`.
+   `2 (Q_k - Q_k+1) >= u^2`.
    - **Single fits** (default): one component starting at the seed, its
      centre held within `2 sigma` of it.
    - **Mixtures** (`fit_mixtures=True`): components are added where the
@@ -121,8 +123,8 @@ without read noise and otherwise an upper bound.
    frames; deciding on the fitted width alone would lose half.
    `width=(1, 1)` fixes every width at `sigma`.
 6. **Uncertainties.** Standard errors from the inverse Fisher information
-   `J^T diag(1/v) J` of each emitter's settled window fit, every component
-   and the level free.
+   `J^T diag(1/V(m)) J` of each emitter's window fit, every component and
+   the level free.
 
 `info["z"]` is each emitter's `sqrt(2 * cost)`, the cost being what
 removing it (the rest refitted) loses: at least `u`. `info["mixture"]`
@@ -198,23 +200,23 @@ separate tile calls, which would duplicate sources at seams.
 ## Performance
 
 On pure noise, at the default `p_real = 0.9`, `u` rises to about 5: under
-1 false emitter per 10^6 pixels in movies, 1-4 in single 128x128 frames,
-across 2-200 photons per pixel and at gain 3. On simulated movies with
+2 false emitters per 10^6 pixels in movies, across 2-200 photons per pixel,
+with and without read noise. On simulated movies with
 truth, reports in `P(real)` bins 0.90-0.95 and 0.95-0.99 are 92% and 96%
 real.
 
-`scripts/benchmark_detection.py` (sigma 1.45, background 20, 128x128;
-serial, Apple M5):
+`scripts/benchmark_detection.py` (sigma 1.45, background 20, 128x128,
+gain 1; serial, Apple M5):
 
 | Scenario | Single fits | Mixtures |
 |---|---|---|
 | Isolated, flux 100: recall, precision | 0.51, 0.81 | 0.51, 0.81 |
-| Isolated, flux 800: rms error, ms/frame | 0.125 px, 2.5 | 0.125 px, 7.6 |
-| Equal pairs at 1.5 / 2 / 3 sigma: both found | 0 / 0 / 0 | 0.65 / 1.00 / 1.00 |
+| Isolated, flux 800: rms error, ms/frame | 0.125 px, 3.2 | 0.125 px, 9.2 |
+| Equal pairs at 1.5 / 2 / 3 sigma: both found | 0 / 0 / 0 | 0.64 / 1.00 / 1.00 |
 | Fields 0.005 / px^2: recall, precision | 0.72, 0.97 | 0.95, 1.00 |
 | Fields 0.02 / px^2 | 0.32, 0.87 | 0.82, 0.99 |
-| Fields 0.04 / px^2 | 0.14, 0.82 | 0.63, 0.96 |
-| Fields 0.02 / 0.04: ms/frame | 6 / 9 | 118 / 361 |
+| Fields 0.04 / px^2 | 0.14, 0.81 | 0.63, 0.96 |
+| Fields 0.02 / 0.04: ms/frame | 8 / 12 | 131 / 395 |
 
 Each scenario frame is a movie of one, so its bar is learned from that
 frame alone.
@@ -240,7 +242,6 @@ so where every emitter is equally bright, as in the benchmark's pairs, the
 second of a close pair can fall under a bar set by the absence of moderate
 heights; with a spread of fluxes it does not. The camera's curve is one per
 movie: it takes pixels to be independent and alike, so an sCMOS camera's
-pixel-to-pixel spread of read noise and offset enters as its median.
-Fitted to Gaussian pixels, shot noise's skew is left out, so a pure-noise
-frame's false emitters per pixel exceed the null's on skewed noise, most in
-mixtures and with an excess-noise factor.
+pixel-to-pixel spread of read noise and offset enters as its median. A gain
+given too low lets a bright spot's misfit take a second component and
+understates standard errors; too high, the reverse.

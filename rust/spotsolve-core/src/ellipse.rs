@@ -5,7 +5,8 @@
 //! m = c0 + other + A N(r; mu, S),    S = R diag(a^2, b^2) R^T + I / 12
 //! ```
 //!
-//! with each pixel Gaussian of known variance, as in [`crate::fit`]. The
+//! fitted, as in [`crate::fit`], at maximum quasi-likelihood under the
+//! window's noise curve. The
 //! pixel's area enters as its variance, `1/12` per axis, which is how the
 //! pixel-integrated isotropic profile widens too. It is the nuisance against
 //! which a close pair is tested: an emitter moving within the exposure, or
@@ -19,7 +20,7 @@ use crate::linalg::Chol;
 
 pub const N: usize = 7;
 
-/// A finished fit: parameters, `I` in nats, and the variances of the
+/// A finished fit: parameters, the deviance in nats, and the variances of the
 /// estimates (the diagonal of the inverse Fisher information) when the
 /// information can be factored.
 #[derive(Clone, Debug)]
@@ -46,10 +47,7 @@ pub fn light(theta: &[f64; N], rows: usize, cols: usize, out: &mut [f64]) {
 
 fn objective(win: &Window, other: &[f64], theta: &[f64; N], buf: &mut [f64]) -> f64 {
     light(theta, win.rows, win.cols, buf);
-    (0..buf.len()).filter(|&i| win.used[i]).map(|i| {
-        let r = win.d[i] - theta[0] - other[i] - buf[i];
-        0.5 * r * r / win.v[i]
-    }).sum()
+    (0..buf.len()).filter(|&i| win.used[i]).map(|i| win.curve.deviance(win.d[i], theta[0] + other[i] + buf[i])).sum()
 }
 
 /// The model's Jacobian on the used pixels, `N x used`, by central
@@ -72,14 +70,17 @@ fn jacobian(win: &Window, theta: &[f64; N], buf: &mut [f64], up: &mut [f64]) -> 
     jac
 }
 
-/// Minimize `I` from `start` within `[lo, hi]`.
+/// Minimize the deviance from `start` within `[lo, hi]`. The angle is
+/// periodic: it is kept in `(-pi/2, pi/2]` and its bounds are not used.
 pub fn fit(win: &Window, other: &[f64], start: [f64; N], lo: [f64; N], hi: [f64; N], tol: f64) -> Fit {
     let p = win.rows * win.cols;
     let (mut buf, mut up) = (vec![0.0; p], vec![0.0; p]);
     let clamp = |t: &mut [f64; N]| {
-        for q in 0..N {
+        for q in 0..N - 1 {
             t[q] = t[q].clamp(lo[q], hi[q]);
         }
+        let pi = std::f64::consts::PI;
+        t[N - 1] -= pi * ((t[N - 1] + 0.5 * pi) / pi).ceil() - pi;
     };
     let mut theta = start;
     clamp(&mut theta);
@@ -93,8 +94,9 @@ pub fn fit(win: &Window, other: &[f64], start: [f64; N], lo: [f64; N], hi: [f64;
         let nu = used.len();
         let (mut f, mut g) = ([0.0; N * N], [0.0; N]);
         for (k, &i) in used.iter().enumerate() {
-            let w = 1.0 / win.v[i];
-            let res = theta[0] + other[i] + buf[i] - win.d[i];
+            let m = theta[0] + other[i] + buf[i];
+            let w = 1.0 / win.curve.at(m);
+            let res = m - win.d[i];
             for a in 0..N {
                 g[a] += jac[a * nu + k] * res * w;
                 for b in a..N {
@@ -166,7 +168,7 @@ mod tests {
         let mut m = vec![0.0; rows * cols];
         light(&truth, rows, cols, &mut m);
         let d: Vec<f64> = m.iter().map(|v| v + 5.0).collect();
-        let win = Window::new(rows, cols, d.clone(), vec![true; rows * cols], d);
+        let win = Window::new(rows, cols, d, vec![true; rows * cols], crate::prefilter::Curve::POISSON);
         let start = [4.0, 700.0, 10.0, 11.0, 1.5f64.ln(), 1.5f64.ln(), 0.0];
         let (lo, hi) = ([-1e3, 0.0, 0.0, 0.0, -3.0, -3.0, -10.0], [1e3, 1e5, 21.0, 23.0, 3.0, 3.0, 10.0]);
         let f = fit(&win, &vec![0.0; rows * cols], start, lo, hi, 1e-12);

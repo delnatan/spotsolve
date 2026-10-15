@@ -1,9 +1,10 @@
 //! One window's fit: a constant background and `k` pixel-integrated
-//! Gaussians, each pixel Gaussian of known variance `v`,
+//! Gaussians, at maximum quasi-likelihood under the camera's noise curve
+//! `V(m)` ([`Curve`]),
 //!
 //! ```text
 //! m[r, c] = c0 + sum_k A_k E(r; y_k, s_k) E(c; x_k, s_k)
-//! I(d, m) = sum_used (d - m)^2 / (2 v)
+//! I(d, m) = sum_used integral from m to d of (d - t) / V(t) dt
 //! ```
 //!
 //! in window-local pixels (`[0, 0]` is the window's first pixel). Pixels not
@@ -16,11 +17,15 @@
 //! scoring) with Coleman-Li affine scaling: parameters stay strictly inside
 //! their bounds, and a coordinate's step shrinks with its distance to the
 //! bound it heads for, so a flux cannot collapse onto its floor in one step
-//! while the positions have yet to adapt. `I` is the negative
-//! log-likelihood in nats, up to a constant; [`Fitter::variances`] are the
-//! diagonal of the inverse Fisher information.
+//! while the positions have yet to adapt. Its gradient is
+//! `J^T (m - d) / V(m)` and its information `J^T diag(1 / V(m)) J`, both at
+//! the current model, so the fit is iteratively reweighted least squares
+//! run to its fixed point. `I` is the quasi-likelihood deviance in nats
+//! ([`Curve::deviance`]), the Poisson deviance for a Poisson camera;
+//! [`Fitter::variances`] are the diagonal of the inverse information.
 
 use crate::linalg::Chol;
+use crate::prefilter::Curve;
 use crate::psf;
 
 /// Fraction of each bound's range kept as a margin inside it.
@@ -41,16 +46,20 @@ pub struct Window {
     pub d: Vec<f64>,
     /// Pixels in the likelihood.
     pub used: Vec<bool>,
-    /// Each pixel's variance, ADU^2.
-    pub v: Vec<f64>,
+    /// The camera's noise: a pixel's variance at the light on it.
+    pub curve: Curve,
 }
 
 impl Window {
-    pub fn new(rows: usize, cols: usize, d: Vec<f64>, used: Vec<bool>, v: Vec<f64>) -> Self {
+    pub fn new(rows: usize, cols: usize, d: Vec<f64>, used: Vec<bool>, curve: Curve) -> Self {
         assert_eq!(d.len(), rows * cols);
         assert_eq!(used.len(), rows * cols);
-        assert_eq!(v.len(), rows * cols);
-        Self { rows, cols, d, used, v }
+        Self { rows, cols, d, used, curve }
+    }
+
+    /// The deviance `I` of the used pixels at the light `m`.
+    pub fn deviance(&self, m: &[f64]) -> f64 {
+        (0..m.len()).filter(|&i| self.used[i]).map(|i| self.curve.deviance(self.d[i], m[i])).sum()
     }
 }
 
@@ -133,9 +142,10 @@ pub struct Fitter {
     m: Vec<f64>,
     /// The used pixels (row-major indices), and the Jacobian `dm / dtheta`
     /// on them parameter-major, `jt[a * used + q]`, with its rows weighted
-    /// by `1 / v` in `jw`. Rows are padded to a multiple of [`BLOCK`].
+    /// by `1 / V(m)` in `jw`. Rows are padded to a multiple of [`BLOCK`].
     pix: Vec<usize>,
-    /// On the used pixels: `1 / v` and the weighted residual `(m - d) / v`.
+    /// On the used pixels: `1 / V(m)` and the weighted residual
+    /// `(m - d) / V(m)`.
     wt: Vec<f64>,
     res: Vec<f64>,
     jt: Vec<f64>,
@@ -221,7 +231,7 @@ impl Fitter {
     }
 
     fn current_divergence(&self, w: &Window) -> f64 {
-        w.d.iter().zip(&self.m).zip(&w.v).zip(&w.used).filter(|p| *p.1).map(|(((&d, &m), &v), _)| 0.5 * (d - m) * (d - m) / v).sum()
+        w.deviance(&self.m)
     }
 
     /// The Jacobian `dm / dtheta` at the last evaluated `theta` on the used
@@ -261,7 +271,7 @@ impl Fitter {
         }
     }
 
-    /// Gradient of `I` and Fisher information `J^T diag(1/v) J` at
+    /// Gradient of `I` and Fisher information `J^T diag(1/V(m)) J` at
     /// the last evaluated `theta`, into `self.g` and `self.f`. Every entry
     /// is one sum over the used pixels in raster order; the information is
     /// summed in `BLOCK x BLOCK` tiles held in registers.
@@ -278,8 +288,9 @@ impl Fitter {
         self.wt.clear();
         self.res.clear();
         for &q in &self.pix {
-            self.wt.push(1.0 / w.v[q]);
-            self.res.push((self.m[q] - w.d[q]) / w.v[q]);
+            let v = w.curve.at(self.m[q]);
+            self.wt.push(1.0 / v);
+            self.res.push((self.m[q] - w.d[q]) / v);
         }
         for a in 0..n {
             let j = &self.jt[a * nu..(a + 1) * nu];

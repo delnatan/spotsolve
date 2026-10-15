@@ -1,8 +1,9 @@
 """Localization with the native detector, after u-track's pointSourceDetection.
 
-The bar on each emitter's likelihood ratio is set by the movie: the
-probability that an emitter of that ratio is real, not noise, is fitted to
-the candidates of every frame. An ROI restricts seeds; fitted centers may
+The camera's gain is an input (`estimate_gain` measures it from a movie);
+the read variance follows from the background. The bar on each emitter's
+likelihood ratio is set by the movie: the probability that an emitter of
+that ratio is real, not noise, is fitted to the candidates of every frame. An ROI restricts seeds; fitted centers may
 move outside it. The noise measurement uses the available ROI context, so masked
 results can differ from full-frame results.
 """
@@ -16,14 +17,14 @@ from .results import Localizations
 
 try:
     import spotsolve_rs as _rs
-    if getattr(_rs, "DETECT_OUTPUT_VERSION", 0) != 8:
+    if getattr(_rs, "DETECT_OUTPUT_VERSION", 0) != 9:
         raise ImportError("incompatible localization output; rebuild spotsolve_rs")
 except ImportError as error:          # pragma: no cover - build problem
     raise ImportError(
         "spotsolve needs its bundled Rust extension; reinstall a compatible wheel "
         "or run `maturin develop --release` from the repository root") from error
 
-__all__ = ["localize", "localize_stack", "P_REAL", "MAX_MIXTURES", "WIDTH"]
+__all__ = ["localize", "localize_stack", "estimate_gain", "P_REAL", "MAX_MIXTURES", "WIDTH"]
 
 P_REAL = float(_rs.DETECT_P_REAL)
 """Default least probability that a reported emitter is real, not noise."""
@@ -52,11 +53,18 @@ def _roi(roi, shape):
     return roi
 
 
-def _kw(sigma, offset, roi, shape, p_real, width, fit_mixtures, max_mixtures, motion_blur):
+def _sigma(sigma, shape):
     sigma = float(sigma)
     if not np.isfinite(sigma) or not 0 < sigma <= max(shape):
         raise ValueError("sigma must be positive, finite and no larger than the frame")
-    return dict(sigma=sigma, offset=float(offset), roi=_roi(roi, shape),
+    return sigma
+
+
+def _kw(sigma, gain, offset, roi, shape, p_real, width, fit_mixtures, max_mixtures, motion_blur):
+    gain = float(gain)
+    if not np.isfinite(gain) or gain <= 0:
+        raise ValueError("gain must be positive and finite")
+    return dict(sigma=_sigma(sigma, shape), gain=gain, offset=float(offset), roi=_roi(roi, shape),
                 p_real=float(p_real), width=tuple(map(float, width)),
                 fit_mixtures=bool(fit_mixtures),
                 max_mixtures=_positive_int(max_mixtures, "max_mixtures"),
@@ -80,18 +88,23 @@ def _result(out, raw, kw, images):
         model_image=model, residual=residual)
 
 
-def localize(frame, sigma, *, offset=0.0, roi=None, p_real=P_REAL,
+def localize(frame, sigma, *, gain, offset=0.0, roi=None, p_real=P_REAL,
              width=WIDTH, fit_mixtures=False, max_mixtures=MAX_MIXTURES,
              motion_blur=False, images=True):
     """Localize one frame. Returns `Localizations`.
 
     `frame`, `offset`, flux and background use camera units (ADU). `sigma`
-    is the in-focus PSF width in pixels.
+    is the in-focus PSF width in pixels. `gain` is the camera's pixel
+    variance per ADU of light above the offset: its conversion gain (ADU per
+    photoelectron) times any excess-noise factor (2 for an EMCCD), from the
+    camera's calibration or measured from a movie by `estimate_gain`.
 
     Every pixel's variance is the camera's noise curve at the light the
-    model puts on it, `info["read_variance"] + dispersion * light`, both
-    measured from the movie: the gain from the residuals of bright emitters,
-    the read variance from the background. No camera calibration is needed.
+    model puts on it, `info["read_variance"] + gain * light`, the read
+    variance measured from the background given the gain. Every window is
+    fitted at maximum quasi-likelihood under that curve (the Poisson
+    likelihood for a Poisson camera), and every decision compares its
+    deviance.
 
     The frame is screened by the score of one emitter at each pixel;
     local maxima of the Laplacian of Gaussian where that score is high
@@ -109,9 +122,7 @@ def localize(frame, sigma, *, offset=0.0, roi=None, p_real=P_REAL,
 
     An emitter is kept if it is real, not noise, with probability at least
     `p_real`. The probability comes from its likelihood ratio against the
-    level alone, `z = sqrt(2 * ratio)` in nats of the quasi-likelihood of
-    the noise curve (the Poisson likelihood for a Poisson camera):
-    candidates fitted alone above a low bar have a density of `z` that
+    level alone, `z = sqrt(2 * ratio)` in nats: candidates fitted alone above a low bar have a density of `z` that
     noise alone, by theory, would give only in part,
     and `P(real | z)` is the part noise does not explain. The emitter is
     kept where `z >= u`, the bar at which that reaches `p_real`. A single
@@ -144,17 +155,17 @@ def localize(frame, sigma, *, offset=0.0, roi=None, p_real=P_REAL,
     raw = np.ascontiguousarray(frame, dtype=float)
     if raw.ndim != 2:
         raise ValueError(f"expected a 2-D frame, got shape {raw.shape}")
-    kw = _kw(sigma, offset, roi, raw.shape, p_real, width, fit_mixtures, max_mixtures, motion_blur)
+    kw = _kw(sigma, gain, offset, roi, raw.shape, p_real, width, fit_mixtures, max_mixtures, motion_blur)
     return _result(_rs.detect_localize(raw, **kw), raw, kw, images)
 
 
-def localize_stack(stack, sigma, *, offset=0.0, roi=None, p_real=P_REAL,
+def localize_stack(stack, sigma, *, gain, offset=0.0, roi=None, p_real=P_REAL,
                    width=WIDTH, fit_mixtures=False, max_mixtures=MAX_MIXTURES,
                    motion_blur=False, n_threads=None, images=False):
     """Localize every frame of a `(T, H, W)` stack, in parallel.
 
     Returns one `Localizations` per frame, in frame order. Each frame's
-    background is its own; the camera's noise curve, the bar `u` and
+    background is its own; the read variance, the bar `u` and
     `P(real | z)` are the movie's, fitted to every frame, so a frame's
     result depends on the stack it is in. `n_threads` defaults to the machine's cores.
     `images` defaults to False here: for a long timecourse the model and
@@ -163,8 +174,33 @@ def localize_stack(stack, sigma, *, offset=0.0, roi=None, p_real=P_REAL,
     raw = np.ascontiguousarray(stack, dtype=float)
     if raw.ndim != 3:
         raise ValueError(f"expected a (T, H, W) stack, got shape {raw.shape}")
-    kw = _kw(sigma, offset, roi, raw.shape[1:], p_real, width, fit_mixtures, max_mixtures, motion_blur)
-    outs = _rs.detect_localize_stack(
-        raw, **kw, n_threads=_positive_int((os.cpu_count() or 1) if n_threads is None else n_threads,
-                                "n_threads"))
+    kw = _kw(sigma, gain, offset, roi, raw.shape[1:], p_real, width, fit_mixtures, max_mixtures, motion_blur)
+    outs = _rs.detect_localize_stack(raw, **kw, n_threads=_threads(n_threads))
     return [_result(o, raw[t], kw, images) for t, o in enumerate(outs)]
+
+
+def estimate_gain(stack, sigma, *, offset=0.0, roi=None, width=WIDTH, n_threads=None):
+    """The camera's gain, pixel variance per ADU of light, from a movie.
+
+    For `gain` in `localize` and `localize_stack`, where the camera's
+    calibration is not at hand. `stack` is one frame or a `(T, H, W)` movie
+    in ADU, `offset` the camera's. Bright emitters span a wide range of
+    light: fitted with every light in their windows, their residuals,
+    corrected for each pixel's leverage, have the variance the camera's
+    curve gives them, and the gain is the value at which their median
+    matches. Frames are probed, spread over the movie, until their pixels
+    fix the gain. Without bright emitters it is the background's variance
+    per unit level: exact without read noise, otherwise an upper bound.
+    """
+    raw = np.ascontiguousarray(stack, dtype=float)
+    if raw.ndim == 2:
+        raw = raw[None]
+    if raw.ndim != 3 or raw.shape[0] == 0:
+        raise ValueError(f"expected a frame or a (T, H, W) stack, got shape {raw.shape}")
+    return float(_rs.detect_estimate_gain(
+        raw, _sigma(sigma, raw.shape[1:]), float(offset), roi=_roi(roi, raw.shape[1:]),
+        width=tuple(map(float, width)), n_threads=_threads(n_threads)))
+
+
+def _threads(n_threads):
+    return _positive_int((os.cpu_count() or 1) if n_threads is None else n_threads, "n_threads")

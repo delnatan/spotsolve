@@ -1,12 +1,12 @@
 //! Spot detection in ADU above the camera offset, after u-track's
 //! `pointSourceDetection` (Aguet et al. 2013, *Dev. Cell* 26:279).
 //!
-//! The movie sets two things every decision rests on ([`localize_stack`]):
+//! Two things every decision rests on are set per movie ([`localize_stack`]):
 //!
 //! - The camera's noise curve, pixel variance `read + gain light`
-//!   ([`prefilter::Curve`]), measured from the movie without calibration
-//!   ([`camera`]): the gain from the residuals of bright emitters, the read
-//!   variance from the background. Every pixel's variance is the curve at
+//!   ([`prefilter::Curve`]): the gain is given ([`Settings::gain`];
+//!   [`estimate_gain`] measures it from a movie), the read variance follows
+//!   from the background given it. Every pixel's variance is the curve at
 //!   the light the model puts on it.
 //! - The bar `u`: each frame's seeds are fitted alone at
 //!   [`posterior::CANDIDATE`], and `u` is the least root likelihood ratio
@@ -20,9 +20,8 @@
 //!    ([`prefilter::screen`]).
 //! 2. Each seed's window ([`crate::fit`]), `ceil(4 sigma)` px around it, holds a
 //!    constant level and pixel-integrated Gaussian components; pixels of
-//!    other mask components are left out. Fits are least squares at each
-//!    pixel's variance, reweighted as components are added and removed: a
-//!    quasi-likelihood fit, and every decision compares its deviance
+//!    other mask components are left out. Fits maximize the quasi-likelihood
+//!    of the noise curve, and every decision compares its deviance
 //!    ([`prefilter::Curve::deviance`]). A component is kept if adding it
 //!    gains `u^2 / 2` nats.
 //!    - Alone, one component starts at the seed and its centre is held
@@ -47,9 +46,7 @@
 //!    reported, once it is [`WIDER`] standard errors wider than the bound,
 //!    and is otherwise an emitter held at the bound. Equal bounds fix the
 //!    width.
-//! 5. The reported fit is settled at the weights its own light gives, and
-//!    standard errors come from its Fisher information. A component is
-//!    reported only if it still gains `u^2 / 2` nats there.
+//! 5. Standard errors come from the reported fit's Fisher information.
 
 use crate::fit::{Fitter, Layout, Window};
 use crate::posterior::{self, Posterior};
@@ -96,7 +93,7 @@ pub fn widest(sigma: f64) -> f64 {
 pub const WIDER: f64 = 2.0;
 
 /// Root likelihood ratio of the emitters whose residuals measure the
-/// camera's gain ([`camera`]): bright enough that their own light, not the
+/// camera's gain ([`estimate_gain`]): bright enough that their own light, not the
 /// background's, sets their pixels' variance.
 pub const PROBE: f64 = 8.0;
 /// The bar on every other component of a probe's window: high enough that a
@@ -139,6 +136,10 @@ pub const EDGE: f64 = 3.0;
 pub struct Settings {
     /// In-focus PSF width, px.
     pub sigma: f64,
+    /// The camera's gain: pixel variance per ADU of light above the offset,
+    /// the conversion gain (ADU per photoelectron) times any excess-noise
+    /// factor (2 for an EMCCD). [`estimate_gain`] measures it from a movie.
+    pub gain: f64,
     /// Least probability that a reported emitter is real, not noise; sets
     /// `u`.
     pub p_real: f64,
@@ -155,8 +156,8 @@ pub struct Settings {
 }
 
 impl Settings {
-    pub fn new(sigma: f64) -> Self {
-        Self { sigma, p_real: P_REAL, width: WIDTH, fit_mixtures: false, max_mixtures: MAX_MIXTURES, motion_blur: false }
+    pub fn new(sigma: f64, gain: f64) -> Self {
+        Self { sigma, gain, p_real: P_REAL, width: WIDTH, fit_mixtures: false, max_mixtures: MAX_MIXTURES, motion_blur: false }
     }
 
     fn radius(&self) -> usize {
@@ -193,7 +194,7 @@ pub struct Output {
     pub p_real: Vec<f64>,
     /// `N`: the fitted level of each emitter's window.
     pub fitted_background: Vec<f64>,
-    /// The camera's gain: pixel variance per ADU of light ([`camera`]).
+    /// The camera's gain, as given ([`Settings::gain`]).
     pub dispersion: f64,
     /// `H*W`: the screening level (the window regression's constant); NaN
     /// outside the processed crop.
@@ -222,13 +223,14 @@ pub struct Output {
     /// out-of-focus light and returned as background.
     pub out_of_focus: usize,
     /// `(m, r^2 / (1 - h))` on the pixels of bright emitters: the model's
-    /// light and the leverage-corrected squared residual ([`camera`]).
+    /// light and the leverage-corrected squared residual ([`estimate_gain`]).
     resid: Vec<[f64; 2]>,
     /// The frame's points of its noise curve ([`prefilter::noise_points`]),
     /// and its variance per unit level ([`prefilter::dispersion`]).
     points: Vec<[f64; 3]>,
     phi: f64,
-    /// The camera's read variance, ADU^2 ([`camera`]).
+    /// The camera's read variance, ADU^2, from the background given the
+    /// gain ([`prefilter::Curve::of`]).
     pub read_variance: f64,
 }
 
@@ -256,7 +258,7 @@ struct Spot {
 /// model puts on it.
 struct Noise {
     curve: prefilter::Curve,
-    /// Fit only bright seeds, for their residuals ([`camera`]).
+    /// Fit only bright seeds, for their residuals ([`estimate_gain`]).
     probe: bool,
 }
 
@@ -279,16 +281,11 @@ struct Fate {
     components: Vec<(f64, f64)>,
 }
 
-/// The quasi-likelihood deviance of the used pixels at the light `m`
-/// ([`prefilter::Curve::deviance`]): what every decision compares.
-fn deviance(win: &Window, m: &[f64], curve: &prefilter::Curve) -> f64 {
-    (0..m.len()).filter(|&i| win.used[i]).map(|i| curve.deviance(win.d[i], m[i])).sum()
-}
-
 /// The deviance of a constant level over light `other` holds (none: a
 /// level alone), at the level's maximum quasi-likelihood: the mean, or with
 /// `other`, Fisher scoring from it.
-fn level_deviance(win: &Window, other: Option<&[f64]>, curve: &prefilter::Curve) -> f64 {
+fn level_deviance(win: &Window, other: Option<&[f64]>) -> f64 {
+    let curve = &win.curve;
     let o = |i: usize| other.map_or(0.0, |o| o[i]);
     let used: Vec<usize> = (0..win.d.len()).filter(|&i| win.used[i]).collect();
     let mut c = used.iter().map(|&i| win.d[i] - o(i)).sum::<f64>() / used.len() as f64;
@@ -357,7 +354,8 @@ fn propose(win: &Window, fitter: &mut Fitter, theta: &[f64], lay: Layout, k1: &[
     if projected {
         chol.forward_in_place(&mut lg);
     }
-    let weighted = |v: &dyn Fn(usize) -> f64| -> Vec<f64> { (0..p).map(|q| if win.used[q] { v(q) / win.v[q] } else { 0.0 }).collect() };
+    // Each pixel weighted by its variance at the current fit's light.
+    let weighted = |v: &dyn Fn(usize) -> f64| -> Vec<f64> { (0..p).map(|q| if win.used[q] { v(q) / win.curve.at(lin.m[q]) } else { 0.0 }).collect() };
     let k2: Vec<f64> = k1.iter().map(|v| v * v).collect();
     let u_map = prefilter::correlate(&weighted(&|q| win.d[q] - lin.m[q]), rows, cols, k1);
     let i_map = prefilter::correlate(&weighted(&|_| 1.0), rows, cols, &k2);
@@ -427,15 +425,9 @@ fn fit_seed(d: &[f64], h: usize, w: usize, sc: &Screen, seed: usize, at: &[bool]
         }
     }
     let level0 = sc.background[seed];
-    let mut win = Window::new(rows, cols, wd, used, vec![noise.curve.at(level0); rows * cols]);
+    let win = Window::new(rows, cols, wd, used, noise.curve);
     let dmax = win.d.iter().zip(&win.used).filter(|p| *p.1).fold(1.0f64, |m, (&v, _)| m.max(v));
     let dmin = win.d.iter().zip(&win.used).filter(|p| *p.1).fold(0.0f64, |m, (&v, _)| m.min(v));
-    // Each pixel's variance from the light the model puts there: the
-    // variance of the light being tested, not of a hypothesis about it.
-    let reweight = |win: &mut Window, fitter: &mut Fitter, theta: &[f64], lay: Layout| {
-        let m = fitter.model(win, theta, lay).to_vec();
-        win.v = m.iter().map(|&m| noise.curve.at(m)).collect();
-    };
     let (cy, cx) = ((sy - y0) as f64, (sx - x0) as f64);
     // Alone, a component is held near its seed; in a mixture anywhere in
     // the window.
@@ -464,18 +456,14 @@ fn fit_seed(d: &[f64], h: usize, w: usize, sc: &Screen, seed: usize, at: &[bool]
     };
 
     let mut theta = vec![level0.clamp(b.level.0, b.level.1)];
-    let curve = &noise.curve;
-    let dev = |fitter: &mut Fitter, win: &Window, theta: &[f64], lay: Layout| deviance(win, fitter.model(win, theta, lay), curve);
+    let dev = |fitter: &mut Fitter, win: &Window, theta: &[f64], lay: Layout| win.deviance(fitter.model(win, theta, lay));
     // The level alone: the null the first component is tested against.
-    let mut div = level_deviance(&win, None, curve);
+    let mut div = level_deviance(&win, None);
 
     // Forward: each new component where the efficient score peaks.
     let mut fit = None;
     let mut k = 0;
     while k < max_k {
-        if k > 0 {
-            reweight(&mut win, fitter, &theta, lay.with(k));
-        }
         // Alone, the component starts at its seed. In a mixture the seed
         // only centres the window: every component, the first too, starts
         // where the efficient score peaks, and ownership decides which are
@@ -534,16 +522,13 @@ fn fit_seed(d: &[f64], h: usize, w: usize, sc: &Screen, seed: usize, at: &[bool]
         let f = fitter.fit(win, &start, lay.with(k - 1), &lo, &hi, FIT_MAX_ITER, tol);
         (dev(fitter, win, &f.theta, lay.with(k - 1)) - div, f)
     };
-    // One component left costs its gain over the level alone, which every
-    // forward gain reaching the bar and every removal falling short of it
-    // keeps at least the bar.
+    // One component left costs its gain over the level alone.
     let mut cost: Vec<Option<f64>>;
     loop {
         let k = k_of(&theta);
-        reweight(&mut win, fitter, &theta, lay.with(k));
         div = dev(fitter, &win, &theta, lay.with(k));
         if k == 1 {
-            cost = vec![Some(level_deviance(&win, None, curve) - div)];
+            cost = vec![Some(level_deviance(&win, None) - div)];
             break;
         }
         cost = vec![None; k];
@@ -566,21 +551,6 @@ fn fit_seed(d: &[f64], h: usize, w: usize, sc: &Screen, seed: usize, at: &[bool]
     }
 
     let lay = lay.with(k_of(&theta));
-    // Settle: refit once at the weights the fit's own light gives, as
-    // iteratively reweighted least squares does, so that the estimate is
-    // efficient and its standard errors are its own. Fits until now held the
-    // weights of the model before them, which lacks the light they added.
-    // Only fits that may be reported or enter the posterior need it.
-    if cost.iter().flatten().any(|&c| 2.0 * c >= posterior::Z_LO * posterior::Z_LO) {
-        let (lo, hi) = b.of(lay);
-        fit = fitter.fit(&win, &theta, lay, &lo, &hi, FIT_MAX_ITER, tol);
-        theta = fit.theta.clone();
-        reweight(&mut win, fitter, &theta, lay);
-    }
-    div = dev(fitter, &win, &theta, lay);
-    if lay.k == 1 {
-        cost[0] = Some(level_deviance(&win, None, curve) - div);
-    }
     let mut common = 0;
     if !fit.converged {
         common |= FLAG_NOT_CONVERGED;
@@ -594,7 +564,7 @@ fn fit_seed(d: &[f64], h: usize, w: usize, sc: &Screen, seed: usize, at: &[bool]
     fate.components = (0..lay.k).map(|j| (theta[lay.at(j) + 1] + y0 as f64, theta[lay.at(j) + 2] + x0 as f64)).collect();
     // The brightest component this seed reports, with every light in its
     // window fitted: its residuals measure the variance of light
-    // ([`camera`]).
+    // ([`estimate_gain`]).
     let brightest = (0..lay.k).filter_map(|j| cost[j].map(|c| (c, j))).max_by(|a, b| a.0.total_cmp(&b.0));
     if let Some((_, j)) = brightest.filter(|&(c, j)| noise.probe && 2.0 * c >= PROBE * PROBE && !(lay.at(j) + 1..lay.at(j) + lay.stride()).any(|q| fit.at_bound[q])) {
         let q = lay.at(j);
@@ -650,13 +620,13 @@ fn fit_seed(d: &[f64], h: usize, w: usize, sc: &Screen, seed: usize, at: &[bool]
             let sm = 0.5 * (lay.sigma(&theta, i) + lay.sigma(&theta, j));
             let start = [theta[0], ai + aj, yc, xc, (sm * sm + 0.25 * sep * sep).sqrt().ln(), sm.ln(), (centre(i).1 - xj).atan2(centre(i).0 - yj)];
             let (wl, wr) = (w_lo.ln(), (r as f64).ln());
-            let lo = [b.level.0, 0.0, b.centre.0, b.centre.2, wl, wl, -10.0];
-            let hi = [b.level.1, 2.0 * b.flux.1, b.centre.1, b.centre.3, wr, wr, 10.0];
+            let lo = [b.level.0, 0.0, b.centre.0, b.centre.2, wl, wl, -std::f64::consts::FRAC_PI_2];
+            let hi = [b.level.1, 2.0 * b.flux.1, b.centre.1, b.centre.3, wr, wr, std::f64::consts::FRAC_PI_2];
             let ef = crate::ellipse::fit(&win, &other, start, lo, hi, tol);
             let mut le = vec![0.0; other.len()];
             crate::ellipse::light(&ef.theta, rows, cols, &mut le);
             let me: Vec<f64> = (0..le.len()).map(|q| ef.theta[0] + other[q] + le[q]).collect();
-            let dev_e = deviance(&win, &me, curve);
+            let dev_e = win.deviance(&me);
             if dev_e - div >= bar {
                 continue;
             }
@@ -670,7 +640,7 @@ fn fit_seed(d: &[f64], h: usize, w: usize, sc: &Screen, seed: usize, at: &[bool]
                 continue;
             }
             // Its cost: the level alone in its place, the rest held.
-            let cost_e = level_deviance(&win, Some(&other), curve) - dev_e;
+            let cost_e = level_deviance(&win, Some(&other)) - dev_e;
             if cost_e < bar {
                 fate.weak = true;
                 continue;
@@ -712,15 +682,14 @@ fn fit_seed(d: &[f64], h: usize, w: usize, sc: &Screen, seed: usize, at: &[bool]
             fate.unconfined |= !s.fit_mixtures;
             continue;
         }
-        // Owned when its cost was measured: a settling refit that moves it
-        // nearer another seed leaves it to that seed's fit.
+        // Reported only by the seed nearest to it, which a lone component's
+        // cost does not check.
         let Some(mut cost_j) = cost[j].filter(|_| mine(&theta, j)) else {
             fate.others += 1;
             continue;
         };
-        // Reweighting moves the costs the decisions above were made at: a
-        // component is reported only if it gains the bar at the weights of
-        // its own fit.
+        // Removals stop at one component, which must still gain the bar over
+        // the level alone.
         if cost_j < bar {
             fate.weak = true;
             continue;
@@ -894,22 +863,36 @@ pub fn localize(d: &[f64], h: usize, w: usize, roi: Option<&[bool]>, s: &Setting
     localize_raw(d, h, w, 0.0, roi, s)
 }
 
+/// A frame cut to the work its ROI needs ([`roi_crop`]): the box `[r0, r1,
+/// c0, c1]`, its pixels and its ROI.
+struct Crop {
+    bounds: [usize; 4],
+    d: Vec<f64>,
+    roi: Option<Vec<bool>>,
+}
+
+impl Crop {
+    /// `None` when the ROI selects no pixel.
+    fn of(d: &[f64], h: usize, w: usize, roi: Option<&[bool]>, s: &Settings) -> Option<Crop> {
+        assert_eq!(d.len(), h * w);
+        let [r0, r1, c0, c1] = match roi {
+            None => [0, h, 0, w],
+            Some(m) => roi_crop(m, h, w, s)?,
+        };
+        let cut = |v: &[f64]| -> Vec<f64> { (r0..r1).flat_map(|r| v[r * w + c0..r * w + c1].iter().copied()).collect() };
+        let roi = roi.map(|m| (r0..r1).flat_map(|r| m[r * w + c0..r * w + c1].iter().copied()).collect());
+        Some(Crop { bounds: [r0, r1, c0, c1], d: cut(d), roi })
+    }
+}
+
 /// One frame at the bar `u` on the camera's noise `curve`; `None` probes
-/// the frame for it instead, on the frame's own ([`camera`]).
+/// the frame for its gain instead, on the frame's own ([`estimate_gain`]).
 #[allow(clippy::too_many_arguments)]
 fn localize_with(d: &[f64], h: usize, w: usize, roi: Option<&[bool]>, s: &Settings, u: f64, fitter: &mut Fitter, curve: Option<prefilter::Curve>) -> Output {
-    assert_eq!(d.len(), h * w);
-    let [r0, r1, c0, c1] = match roi {
-        None => [0, h, 0, w],
-        Some(m) => match roi_crop(m, h, w, s) {
-            Some(b) => b,
-            None => return Output { background: vec![f64::NAN; h * w], dispersion: f64::NAN, read_variance: f64::NAN, u, ..Output::default() },
-        },
+    let Some(Crop { bounds: [r0, r1, c0, c1], d: dc, roi: rc }) = Crop::of(d, h, w, roi, s) else {
+        return Output { background: vec![f64::NAN; h * w], dispersion: f64::NAN, read_variance: f64::NAN, u, ..Output::default() };
     };
     let (ch, cw) = (r1 - r0, c1 - c0);
-    let cut = |v: &[f64]| -> Vec<f64> { (r0..r1).flat_map(|r| v[r * w + c0..r * w + c1].iter().copied()).collect() };
-    let dc = cut(d);
-    let rc: Option<Vec<bool>> = roi.map(|m| (r0..r1).flat_map(|r| m[r * w + c0..r * w + c1].iter().copied()).collect());
     let sc = prefilter::screen(&dc, ch, cw, s.sigma, posterior::CANDIDATE, rc.as_deref(), curve);
     let noise = Noise { curve: sc.curve, probe: curve.is_none() };
     let mut out = Output { dispersion: sc.curve.gain, read_variance: sc.curve.read, u, n_seeds: sc.seeds.len(), ..Output::default() };
@@ -959,8 +942,10 @@ pub fn localize_raw(raw: &[f64], h: usize, w: usize, offset: f64, roi: Option<&[
 }
 
 /// Localize every frame of a stack, `d = raw - offset` in ADU, on
-/// `n_threads` workers, in frame order. `raw` is `n*H*W`. The bar `u` is
-/// the movie's: every frame's candidates, fitted alone above
+/// `n_threads` workers, in frame order. `raw` is `n*H*W`. The camera's
+/// curve is the movie's: the given gain, and the read variance its
+/// backgrounds give with it ([`prefilter::Curve::of`]). The bar `u` is the
+/// movie's too: every frame's candidates, fitted alone above
 /// [`posterior::CANDIDATE`], set `P(real | z)` ([`Posterior`]), and each
 /// frame is then fitted at the `u` where it reaches `p_real`.
 #[allow(clippy::too_many_arguments)]
@@ -976,23 +961,17 @@ pub fn localize_stack(
 ) -> Vec<Output> {
     assert_eq!(raw.len(), n * h * w);
     let frame = |t: usize| -> Vec<f64> { raw[t * h * w..(t + 1) * h * w].iter().map(|&r| r - offset).collect() };
+    let points: Vec<[f64; 3]> = crate::frames::map(n, n_threads, || (), |t, _| {
+        Crop::of(&frame(t), h, w, roi, s).map_or_else(Vec::new, |c| {
+            let (ch, cw) = (c.bounds[1] - c.bounds[0], c.bounds[3] - c.bounds[2]);
+            prefilter::background_points(&c.d, ch, cw, s.sigma, posterior::CANDIDATE)
+        })
+    })
+    .into_iter()
+    .flatten()
+    .collect();
+    let k = prefilter::Curve::of(s.gain, &points);
     let alone = Settings { fit_mixtures: false, ..*s };
-    // Probes fit every light in their windows, so that a neighbour or an
-    // unresolved pair is not read as noise.
-    let probe = Settings { fit_mixtures: true, ..*s };
-    // The curve is the movie's: frames are probed, spread evenly over it in a
-    // fixed order, until their pixels measure the gain.
-    let order = spread(n);
-    let mut probes = Vec::new();
-    for chunk in order.chunks(PROBE_CHUNK) {
-        probes.extend(crate::frames::map(chunk.len(), n_threads, Fitter::default, |k, fitter| localize_with(&frame(chunk[k]), h, w, roi, &probe, PROBE_BAR, fitter, None)));
-        if probes.iter().map(|o: &Output| o.resid.len()).sum::<usize>() >= PROBE_ROWS {
-            break;
-        }
-    }
-    let points: Vec<[f64; 3]> = probes.iter().flat_map(|o| o.points.iter().copied()).collect();
-    let phi = probes.iter().map(|o| o.phi).sum::<f64>() / probes.len() as f64;
-    let k = camera(probes.iter().flat_map(|o| o.resid.iter()), &points, phi);
     let candidates = crate::frames::map(n, n_threads, Fitter::default, |t, fitter| {
         localize_with(&frame(t), h, w, roi, &alone, posterior::CANDIDATE, fitter, Some(k))
     });
@@ -1014,47 +993,52 @@ pub fn localize_stack(
     out
 }
 
-/// `0..n` in an order that spreads any prefix evenly over the movie: by the
-/// bit-reversed index.
-fn spread(n: usize) -> Vec<usize> {
-    if n <= 1 {
-        return (0..n).collect();
+/// The camera's gain, pixel variance per ADU of light, measured from a movie
+/// (`raw` as in [`localize_stack`]) for [`Settings::gain`].
+///
+/// It is the value at which bright emitters' residuals have the size the
+/// curve gives them: each squared residual, corrected for the leverage `h`
+/// of its pixel that the fit absorbs, over the curve at the model's light,
+/// is chi-squared with one degree of freedom, and the gain sets its median
+/// to that law's. Emitters span a wide range of light, so the gain is
+/// determined in any frame that holds bright ones; a median, so a
+/// neighbour's light on a few of their pixels does not move it. Probes fit
+/// every light in their windows ([`PROBE_BAR`]), so that a neighbour or an
+/// unresolved pair is not read as noise, and frames are probed, spread
+/// evenly over the movie in a fixed order, until their pixels measure the
+/// gain ([`PROBE_ROWS`]). With fewer than [`PROBE_PIXELS`], the gain is the
+/// background's variance per unit level ([`prefilter::dispersion`]): exact
+/// without read noise, and otherwise an upper bound.
+#[allow(clippy::too_many_arguments)]
+pub fn estimate_gain(raw: &[f64], n: usize, h: usize, w: usize, offset: f64, roi: Option<&[bool]>, sigma: f64, width: (f64, f64), n_threads: usize) -> f64 {
+    assert_eq!(raw.len(), n * h * w);
+    let frame = |t: usize| -> Vec<f64> { raw[t * h * w..(t + 1) * h * w].iter().map(|&r| r - offset).collect() };
+    // Each probe fits on its frame's own curve; the gain set here is unused.
+    let probe = Settings { width, fit_mixtures: true, ..Settings::new(sigma, 1.0) };
+    let mut probes = Vec::new();
+    for chunk in spread(n).chunks(PROBE_CHUNK) {
+        probes.extend(crate::frames::map(chunk.len(), n_threads, Fitter::default, |k, fitter| localize_with(&frame(chunk[k]), h, w, roi, &probe, PROBE_BAR, fitter, None)));
+        if probes.iter().map(|o: &Output| o.resid.len()).sum::<usize>() >= PROBE_ROWS {
+            break;
+        }
     }
-    let bits = usize::BITS - (n - 1).leading_zeros();
-    (0..1usize << bits).map(|i| i.reverse_bits() >> (usize::BITS - bits)).filter(|&i| i < n).collect()
-}
-
-/// The camera's noise curve ([`prefilter::Curve`]), measured from the movie.
-/// Its gain is the value at which bright emitters' residuals have the size
-/// the curve gives them: each squared residual, corrected for the leverage
-/// `h` of its pixel that the fit absorbs, over the curve at the model's
-/// light, is chi-squared with one degree of freedom, and the gain sets its
-/// median to that law's. Emitters span a wide range of light, so the gain
-/// is determined in any frame that holds bright ones; a median, so a
-/// neighbour's light on a few of their pixels does not move it. The read
-/// variance then follows from the background ([`prefilter::read_given`]).
-/// With fewer than [`PROBE_PIXELS`], the gain is the background's variance
-/// per unit level, `phi` ([`prefilter::dispersion`]): exact without read
-/// noise, and otherwise an upper bound, read variance being positive.
-fn camera<'a>(rows: impl Iterator<Item = &'a [f64; 2]> + Clone, points: &[[f64; 3]], phi: f64) -> prefilter::Curve {
-    let n = rows.clone().count();
-    let fallback = prefilter::fit_curve(points);
-    if n < PROBE_PIXELS {
-        let gain = phi;
-        return prefilter::Curve { read: prefilter::read_given(points, gain), gain, floor: fallback.floor };
+    let points: Vec<[f64; 3]> = probes.iter().flat_map(|o| o.points.iter().copied()).collect();
+    let rows: Vec<[f64; 2]> = probes.iter().flat_map(|o| o.resid.iter().copied()).collect();
+    if rows.len() < PROBE_PIXELS {
+        return probes.iter().map(|o| o.phi).sum::<f64>() / probes.len().max(1) as f64;
     }
-    let curve = |gain: f64| prefilter::Curve { read: prefilter::read_given(points, gain), gain, floor: fallback.floor };
     // Pixels whose ratio exceeds the median of chi-squared(1), less half: a
     // decreasing function of the gain, zero at the answer.
     let excess = |g: f64| {
-        let c = curve(g);
-        rows.clone().filter(|&&[m, r2]| r2 / c.at(m) > prefilter::CHI2_1_MEDIAN).count() as f64 - 0.5 * n as f64
+        let c = prefilter::Curve::of(g, &points);
+        rows.iter().filter(|&&[m, r2]| r2 / c.at(m) > prefilter::CHI2_1_MEDIAN).count() as f64 - 0.5 * rows.len() as f64
     };
     if excess(0.0) <= 0.0 {
-        return curve(0.0);
+        return 0.0;
     }
     // Start from the background's slope, else its variance: any positive
     // start doubles to a bracket.
+    let fallback = prefilter::fit_curve(&points);
     let start = if fallback.gain > 0.0 { fallback.gain } else { fallback.read.max(f64::MIN_POSITIVE) };
     let (mut lo, mut hi) = (0.0, start);
     while excess(hi) > 0.0 {
@@ -1064,7 +1048,17 @@ fn camera<'a>(rows: impl Iterator<Item = &'a [f64; 2]> + Clone, points: &[[f64; 
         let g = 0.5 * (lo + hi);
         if excess(g) > 0.0 { lo = g } else { hi = g }
     }
-    curve(0.5 * (lo + hi))
+    0.5 * (lo + hi)
+}
+
+/// `0..n` in an order that spreads any prefix evenly over the movie: by the
+/// bit-reversed index.
+fn spread(n: usize) -> Vec<usize> {
+    if n <= 1 {
+        return (0..n).collect();
+    }
+    let bits = usize::BITS - (n - 1).leading_zeros();
+    (0..1usize << bits).map(|i| i.reverse_bits() >> (usize::BITS - bits)).filter(|&i| i < n).collect()
 }
 
 #[cfg(test)]
@@ -1122,11 +1116,10 @@ pub(crate) mod tests {
             *v += 10.0;
             *v += v.sqrt() * z;
         }
-        let o = localize(&d, h, w, None, &Settings::new(sigma));
+        let o = localize(&d, h, w, None, &Settings::new(sigma, 1.0));
         assert_eq!(o.amp.len(), 1, "found {:?} amp {:?}", o.pos, o.amp);
         assert_eq!(o.flags[0], 0);
         assert!(o.se.iter().chain(&o.se_sig).all(|v| v.is_finite() && *v > 0.0));
-        assert!((o.dispersion - 1.0).abs() < 0.3, "dispersion {}", o.dispersion);
         assert!((o.pos[0] - 19.3).abs() < 3.0 * o.se[1], "y {}", o.pos[0]);
         assert!((o.pos[1] - 21.6).abs() < 3.0 * o.se[2], "x {}", o.pos[1]);
         assert!((o.amp[0] - 1500.0).abs() < 3.0 * o.se[0], "A {}", o.amp[0]);
@@ -1140,7 +1133,7 @@ pub(crate) mod tests {
     #[test]
     fn an_emitter_on_the_width_bound_is_reported_and_wider_light_is_not() {
         let (h, w, sigma, n) = (31, 31, 1.2, 200);
-        let s = Settings::new(sigma);
+        let s = Settings::new(sigma, 1.0);
         let movie = |flux: f64, width: f64, seed: u64| {
             let raw: Vec<f64> = (0..n as u64)
                 .flat_map(|i| {
@@ -1159,5 +1152,31 @@ pub(crate) mod tests {
         let wide = movie(3000.0, 2.0 * s.widths().1, 7);
         assert!(wide.iter().all(|o| o.amp.is_empty()), "wide light reported");
         assert!(wide.iter().map(|o| o.out_of_focus).sum::<usize>() >= n, "wide light not fitted");
+    }
+
+    /// Bright emitters on a camera of read variance 8 and gain 2.5 give the
+    /// gain; the background, its variance.
+    #[test]
+    fn the_gain_is_measured_from_bright_emitters() {
+        let (h, w, n) = (31, 31, 60);
+        let cam = prefilter::Curve { read: 8.0, gain: 2.5, floor: 0.0 };
+        let raw: Vec<f64> = (0..n as u64)
+            .flat_map(|i| {
+                let (y, x) = (12.0 + 0.07 * i as f64 % 7.0, 11.0 + 0.11 * i as f64 % 9.0);
+                let mut d = psf::model(&[10.0, 3000.0, y, x, 1.3], h, w);
+                for (v, z) in d.iter_mut().zip(normals(h * w, 500 + i)) {
+                    *v += cam.at(*v).sqrt() * z;
+                }
+                d
+            })
+            .collect();
+        let gain = estimate_gain(&raw, n, h, w, 0.0, None, 1.2, WIDTH, 4);
+        assert!((gain / 2.5 - 1.0).abs() < 0.1, "gain {gain}");
+        // The background fixes its own variance; the read variance is that
+        // less the gain's share, so it carries the gain's error times the level.
+        let o = localize_stack(&raw, n, h, w, 0.0, None, &Settings::new(1.2, gain), 4);
+        let v = o[0].read_variance + gain * 10.0;
+        assert!((v / cam.at(10.0) - 1.0).abs() < 0.05, "background variance {v}");
+        assert!(o.iter().all(|o| o.amp.len() == 1));
     }
 }

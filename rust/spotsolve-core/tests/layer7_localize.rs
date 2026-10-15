@@ -89,7 +89,7 @@ fn isolated_emitters_are_recovered_with_calibrated_errors() {
     // The median position error is sqrt(ln 2) = 0.83 SE when the SEs are
     // right.
     for (width, spread) in [((1.0, 1.0), 0.0), ((0.75, f64::INFINITY), 0.2)] {
-        let s = Settings { width, ..Settings::new(sigma) };
+        let s = Settings { width, ..Settings::new(sigma, 1.0) };
         let (mut found, mut kept, mut total, mut zs) = (0.0, 0.0, 0.0, Vec::new());
         for _ in 0..6 {
             let (d, truth) = grid(&mut rng, side, sigma, spread);
@@ -114,7 +114,7 @@ fn crowded_fields_are_recovered_with_mixtures() {
     let mut rng = Rng(2026);
     // Widths spread +-20%, so free widths admitting the narrowest.
     {
-        let s = Settings { fit_mixtures: true, width: (0.75, f64::INFINITY), ..Settings::new(sigma) };
+        let s = Settings { fit_mixtures: true, width: (0.75, f64::INFINITY), ..Settings::new(sigma, 1.0) };
         for (density, rec_min, prec_min) in [(0.005, 0.95, 0.96), (0.015, 0.85, 0.97), (0.03, 0.80, 0.97)] {
             let n = (density * (h * w) as f64).round() as usize;
             let (d, truth) = field(&mut rng, h, w, n, sigma);
@@ -133,7 +133,7 @@ fn pure_noise_is_not_reported() {
     let (h, w, sigma, frames) = (256, 256, 1.2, 16);
     let mut rng = Rng(7);
     let raw: Vec<f64> = (0..frames * h * w).map(|_| rng.poisson(20.0)).collect();
-    let out = bs::localize_stack(&raw, frames, h, w, 0.0, None, &Settings::new(sigma), 4);
+    let out = bs::localize_stack(&raw, frames, h, w, 0.0, None, &Settings::new(sigma, 1.0), 4);
     let n: usize = out.iter().map(|o| o.amp.len()).sum();
     println!("noise: {n} reported, u = {:.2}", out[0].u);
     assert!(n <= 2, "{n} reported at u = {}", out[0].u);

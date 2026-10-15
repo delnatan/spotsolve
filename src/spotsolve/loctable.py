@@ -45,8 +45,8 @@ FRAME_SCHEMA = {
     "median_flux": pl.Float64,
     "median_se_pos": pl.Float64,
     "background": pl.Float64,         # median of the background surface
-    "dispersion": pl.Float64,         # measured camera gain, variance per ADU of light
-    "read_variance": pl.Float64,      # measured read variance, ADU^2
+    "dispersion": pl.Float64,         # camera gain as given, variance per ADU of light
+    "read_variance": pl.Float64,      # read variance from the background, ADU^2
     "seconds": pl.Float64,            # wall clock for this frame's search
 }
 
