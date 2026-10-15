@@ -22,6 +22,17 @@ LINK_COLUMNS = ("frame", "y", "x", "se_y", "se_x")
 """Columns the linker reads."""
 
 
+def _frame_numbers(column):
+    """The `frame` column as int64, refused unless every row holds a whole
+    number within 64 bits."""
+    frame = column.to_numpy() if column.dtype.is_numeric() and not column.null_count() else None
+    whole = frame is not None and (np.issubdtype(frame.dtype, np.integer)
+                                   or bool(np.all(np.isfinite(frame) & (frame == np.round(frame)))))
+    if not whole or (frame.size and not -2**63 <= frame.min() <= frame.max() < 2**63):
+        raise ValueError("`frame` must hold a whole number, within 64 bits, on every row")
+    return np.ascontiguousarray(frame, dtype=np.int64)
+
+
 def link(locs, max_step):
     """Link a localization table into trajectories. -> the table + `track_id`.
 
@@ -30,7 +41,8 @@ def link(locs, max_step):
     frames: about three times the rms step of the fastest particles of
     interest. A larger value costs slow particles little, because each
     track is held to its own step size. `se_y` and `se_x` are each
-    detection's localization errors in the same units.
+    detection's localization errors in the same units, and `frame` a whole
+    number on every row.
 
     The result is the input with one `UInt32` column added, in the input's
     row order; a `track_id` column already present is replaced. Every row
@@ -48,7 +60,7 @@ def link(locs, max_step):
         max_step = float(max_step)
     except (TypeError, ValueError) as error:
         raise ValueError("max_step must be positive and finite") from error
-    frame = np.ascontiguousarray(locs["frame"].to_numpy(), dtype=np.int64)
+    frame = _frame_numbers(locs["frame"])
     pos = np.ascontiguousarray(
         np.stack([locs["y"].to_numpy(), locs["x"].to_numpy()], axis=1), dtype=float)
     err = np.ascontiguousarray(

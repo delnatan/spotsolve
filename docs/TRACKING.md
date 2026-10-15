@@ -55,7 +55,8 @@ whose own particle went unseen in `f + 1` takes a detection nearby.
 - `r0 = g / 2`. A detection within `r0` in another frame is at the same
   spot, because anything else had to be at least `g - r0` away. `r0` is
   never below three standard deviations of an immobile particle's step, so a
-  table without a gap still finds immobile spots.
+  table without a gap still finds immobile spots, and never above
+  `max_step`.
 - `q`, the detections within `max_step` in the next frame, less that
   frame's own count of other detections around a detection, per detection.
   What is left is each detection's own continuation, however far it moved,

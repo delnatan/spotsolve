@@ -1,6 +1,8 @@
 # Changelog
 
-## Unreleased
+## 0.5.2 (2026-10-15)
+
+Linking fixes. Track ids change on most movies; the API does not.
 
 - The linker's continuation `q`, which prices a track end, counted only
   detections that stayed within half the detector gap, so it measured how
@@ -13,6 +15,16 @@
 - A link must now beat its alternative by `c = 2.5` nats, the price of an
   identity switch against a break. Before, this margin came from the biased
   `q` and varied with the movie's mobility.
+- `r0`, within which a detection in another frame is at the same spot, no
+  longer exceeds `max_step`. With localization errors large against
+  `max_step` it could, and the occupancy prior then missed detections.
+- The detector-gap histogram stores only its occupied bins, so localization
+  errors far finer than `max_step` no longer cost memory in proportion to
+  `max_step / se`.
+- `link` refuses a `frame` column with missing, fractional, non-numeric or
+  out-of-range values; they were cast silently. Frame numbers at the ends of
+  the 64-bit range no longer overflow.
+
 ## 0.5.1 (2026-10-14)
 
 The detection bar is now Bayesian and set per movie. Breaking API change.

@@ -36,7 +36,7 @@
 //! - `r0 = g / 2`: a detection within `r0` in another frame is at the same
 //!   spot, because anything else had to be at least `g - r0` away. `r0` is
 //!   never below three standard deviations of an immobile particle's step, so
-//!   a table without a gap still finds immobile spots.
+//!   a table without a gap still finds immobile spots, and never above `R`.
 //! - `q`: the detections within `R` in the next frame, less the count of
 //!   others around a detection in that frame, per detection. What is left is
 //!   each detection's own continuation, however far it moved. Averaged with
@@ -180,12 +180,13 @@ fn log_step(d2: f64, v: f64) -> f64 {
 }
 
 /// The detector gap, from same-frame pair distances binned at `bin`. -> `g`.
+/// Only occupied bins are stored, so the cost follows the pairs, not `r / bin`.
 fn gap(frames: &[Frame], pos: &[f64], r: f64, bin: f64, n: usize) -> f64 {
     let nb = (r / bin).floor() as usize;
     if nb < 2 {
         return r;
     }
-    let mut count = vec![0.0f64; nb];
+    let mut count: std::collections::BTreeMap<usize, f64> = std::collections::BTreeMap::new();
     for fr in frames {
         for (k, &a) in fr.rows.iter().enumerate() {
             fr.cells.near([pos[2 * a], pos[2 * a + 1]], |k2| {
@@ -193,26 +194,44 @@ fn gap(frames: &[Frame], pos: &[f64], r: f64, bin: f64, n: usize) -> f64 {
                     let d = d2(pos, a, fr.rows[k2]).sqrt();
                     let i = (d / bin) as usize;
                     if i < nb {
-                        count[i] += 2.0;
+                        *count.entry(i).or_insert(0.0) += 2.0;
                     }
                 }
             });
         }
     }
-    let area = |i: usize| std::f64::consts::PI * bin * bin * ((i + 1).pow(2) - i.pow(2)) as f64;
-    let dens: Vec<f64> = (0..nb).map(|i| count[i] / (n as f64 * area(i))).collect();
+    // Annulus `i` has area pi bin^2 (2 i + 1); annuli `i0..nb` together
+    // pi bin^2 (nb^2 - i0^2).
+    let pib2 = std::f64::consts::PI * bin * bin;
+    let dens = |i: usize| count.get(&i).map_or(0.0, |c| c / (n as f64 * pib2 * (2 * i + 1) as f64));
     let mid = |i: usize| (i as f64 + 0.5) * bin;
-    let far: Vec<usize> = (0..nb).filter(|&i| mid(i) >= r / 2.0).collect();
-    let plateau = far.iter().map(|&i| count[i]).sum::<f64>() / (n as f64 * far.iter().map(|&i| area(i)).sum::<f64>());
+    let mut i0 = (r / (2.0 * bin) - 0.5).ceil().max(0.0) as usize;
+    while i0 > 0 && mid(i0 - 1) >= r / 2.0 {
+        i0 -= 1;
+    }
+    while mid(i0) < r / 2.0 {
+        i0 += 1;
+    }
+    let far_count: f64 = count.range(i0..).map(|(_, c)| c).sum();
+    let far_area = pib2 * ((nb as f64).powi(2) - (i0 as f64).powi(2));
+    let plateau = far_count / (n as f64 * far_area);
     if plateau.is_nan() || plateau <= 0.0 {
         return r;
     }
     let smooth = |i: usize| {
-        let at = |j: isize| if j < 0 || j as usize >= nb { 0.0 } else { dens[j as usize] };
-        (at(i as isize - 1) + at(i as isize) + at(i as isize + 1)) / 3.0
+        let lo = if i == 0 { 0.0 } else { dens(i - 1) };
+        let hi = if i + 1 < nb { dens(i + 1) } else { 0.0 };
+        (lo + dens(i) + hi) / 3.0
     };
     let half = plateau / 2.0;
-    match (0..nb).find(|&i| smooth(i) >= half) {
+    // Smoothing is zero away from occupied bins, so only their neighbours can
+    // first reach `half`.
+    let first = count
+        .keys()
+        .flat_map(|&j| [j.wrapping_sub(1), j, j + 1])
+        .filter(|&i| i < nb)
+        .find(|&i| smooth(i) >= half);
+    match first {
         None => r,
         Some(0) => mid(0),
         Some(i) => {
@@ -238,7 +257,8 @@ fn pairs_within(fr: &Frame, other: &Frame, pos: &[f64], r: f64) -> f64 {
 fn movie_stats(frames: &[Frame], pos: &[f64], r: f64, se2_med: f64, n: usize) -> Stats {
     // Positions are not known finer than their error: the histogram bin.
     let bin = se2_med.sqrt();
-    let r0 = (gap(frames, pos, r, bin, n) / 2.0).max(3.0 * (2.0 * se2_med).sqrt());
+    // Nothing farther than R is looked at, here as everywhere.
+    let r0 = (gap(frames, pos, r, bin, n) / 2.0).max(3.0 * (2.0 * se2_med).sqrt()).min(r);
     // Each frame's mean count of other same-frame detections within R.
     let others: Vec<f64> =
         frames.iter().map(|fr| pairs_within(fr, fr, pos, r) / fr.rows.len() as f64 - 1.0).collect();
@@ -274,10 +294,9 @@ fn occupancy(frames: &[Frame], pos: &[f64], r0: f64, n: usize) -> (Vec<u32>, Vec
     let (mut seen, mut occupied) = (vec![0u32; n], vec![0u32; n]);
     for fr in frames {
         for tau in -WINDOW..=WINDOW {
-            let t = fr.t + tau;
-            if tau == 0 || t < t_lo || t > t_hi {
+            let Some(t) = fr.t.checked_add(tau).filter(|t| tau != 0 && (t_lo..=t_hi).contains(t)) else {
                 continue;
-            }
+            };
             let bit = 1u32 << (tau + WINDOW);
             let other = frame_at(frames, t);
             for &a in &fr.rows {
@@ -712,6 +731,22 @@ mod tests {
         assert_ne!(l.track[1], l.track[2]);
         let l = link(&[0, 2], &[0.0, 0.0, 0.0, 0.1], &se[..4], 1.0).unwrap();
         assert_eq!(l.n_tracks, 2);
+    }
+
+    #[test]
+    fn extreme_errors_and_frame_numbers_still_link() {
+        // Errors far finer than the search radius: the gap histogram follows
+        // the pairs, not `R / se`.
+        let mut rng = Rng(0x0dd_ba11_cafe_babe);
+        let (fr, pos, _, _) = movie(&mut rng, &vec![0.0; 100], 10, 100.0, 0.9, 0.1, 2.0);
+        assert!(link(&fr, &pos, &vec![1e-12; pos.len()], 10.0).unwrap().n_tracks > 0);
+        // Errors too large for the search radius: `r0` stays within it.
+        let (_, s) = model_for(&fr, &pos, 2.0, 3.0);
+        assert!(s.r0 <= 3.0, "r0 {}", s.r0);
+        // Frame numbers at the ends of their range.
+        let l = link(&[i64::MAX - 1, i64::MAX, i64::MIN], &[0.0; 6], &[0.1; 6], 1.0).unwrap();
+        assert_eq!(l.track[0], l.track[1]);
+        assert_ne!(l.track[0], l.track[2]);
     }
 
     #[test]

@@ -199,6 +199,13 @@ def test_missing_columns_and_bad_inputs_are_refused():
             .otherwise(pl.col(column)).alias(column))
         with pytest.raises(ValueError, match=message):
             spotsolve.link(bad, 13.6)
+    frame = pl.col("frame").cast(pl.Float64)
+    for bad in (pl.when(pl.col("loc_id") == 3).then(None).otherwise(pl.col("frame")),
+                frame + 0.5, frame.cast(pl.String), pl.lit(2.0**63)):
+        with pytest.raises(ValueError, match="whole number"):
+            spotsolve.link(locs.with_columns(bad.alias("frame")), 13.6)
+    whole = spotsolve.link(locs.with_columns(frame.alias("frame")), 13.6)["track_id"]
+    assert whole.equals(spotsolve.link(locs, 13.6)["track_id"])
 
 
 def test_no_link_is_longer_than_max_step_and_a_missed_frame_ends_a_track():
