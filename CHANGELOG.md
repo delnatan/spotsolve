@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.5.4 (2026-10-15)
+
+One column renamed; results are unchanged.
+
+- `z` is renamed `detect_z`, in localization tables and in
+  `result.info`. Beside `y` and `x` it read as an axial coordinate; it is
+  each emitter's detection strength, `sqrt(2 * likelihood ratio)` in
+  standard-normal units. Tables written before keep the column `z`.
+
 ## 0.5.3 (2026-10-15)
 
 Detection fixes. Movies are unchanged; single small frames and small ROIs

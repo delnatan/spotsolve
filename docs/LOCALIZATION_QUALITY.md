@@ -19,7 +19,7 @@ usable = locs.filter(pl.col("flags") == 0)
 ```
 
 Tables preserve coordinates, total flux, fitted width, their marginal SEs,
-model peak, fitted level, flags and `z`. `bg` is the level fitted in the
+model peak, fitted level, flags and `detect_z`. `bg` is the level fitted in the
 emitter's window. The full-frame `result.background` is the screening level
 (NaN outside the processed crop) and the rendered residual is diagnostic:
 windows fit separate levels, so there is no single shared background
@@ -65,12 +65,12 @@ mismatch can invalidate coverage. An `ELONGATED` emitter's SEs are those of
 its ellipse's centre and flux; its width's SE is that of the geometric mean
 of the axes.
 
-`z` (table column; `result.info["z"]`) is each emitter's
+`detect_z` (table column; `result.info["detect_z"]`) is each emitter's
 `sqrt(2 * likelihood ratio)`: what removing it, the rest of its window
-refitted, costs, in standard-normal units. Every reported emitter has `z`
+refitted, costs, in standard-normal units. Every reported emitter has `detect_z`
 at least the movie's bar `result.info["u"]`; it ranks evidence, not
 precision. `p_real` (`result.info["p_real"]`) is the probability, from its
-`z` and the movie's heights, that the emitter is real rather than noise;
+`detect_z` and the movie's heights, that the emitter is real rather than noise;
 `1 - p_real` summed over a table is its expected number of noise reports.
 
 ## Apply analysis-specific cuts afterwards

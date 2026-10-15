@@ -126,7 +126,7 @@ read noise, and otherwise an upper bound.
    `J^T diag(1/V(m)) J` of each emitter's window fit, every component and
    the level free.
 
-`info["z"]` is each emitter's `sqrt(2 * cost)`, the cost being what
+`info["detect_z"]` is each emitter's `sqrt(2 * cost)`, the cost being what
 removing it (the rest refitted) loses: at least `u`. `info["mixture"]`
 numbers the windows that held several components; `info["seed"]` is the
 seed each emitter was reported from; `info["duplicates"]` counts components
@@ -136,9 +136,9 @@ left to, or merged into, another seed's report.
 
 Each movie (`localize_stack`; a single frame is a movie of one) is first
 fitted alone at the candidate bar 2: one window fit per seed, each with its
-root likelihood ratio `z`. Candidate heights from 3 up have density
-`f0(z) + f1(z)` per pixel: `f0` from noise alone, `f1` from emitters. An
-emitter of height `z` is real with probability
+root likelihood ratio `z` (reported as `detect_z`). Candidate heights from
+3 up have density `f0(z) + f1(z)` per pixel: `f0` from noise alone, `f1`
+from emitters. An emitter of height `z` is real with probability
 
 ```text
 P(real | z) = f1(z) / (f0(z) + f1(z))

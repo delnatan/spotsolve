@@ -190,8 +190,8 @@ pub struct Output {
     /// `N`: the root of each emitter's likelihood ratio, the cost of
     /// removing it with the rest of its window refitted, `sqrt(2 (Q_without
     /// - Q))`, `Q` the quasi-likelihood deviance in nats; at least `u`.
-    pub z: Vec<f64>,
-    /// `N`: the probability each emitter is real, not noise, from its `z`
+    pub detect_z: Vec<f64>,
+    /// `N`: the probability each emitter is real, not noise, from its `detect_z`
     /// ([`Posterior`]); at least `p_real`.
     pub p_real: Vec<f64>,
     /// `N`: the fitted level of each emitter's window.
@@ -201,7 +201,7 @@ pub struct Output {
     /// `H*W`: the screening level (the window regression's constant); NaN
     /// outside the processed crop.
     pub background: Vec<f64>,
-    /// The movie's bar on `z`, where `P(real | z)` reaches `p_real`.
+    /// The movie's bar on `detect_z`, where `P(real | detect_z)` reaches `p_real`.
     pub u: f64,
     pub n_seeds: usize,
     /// Seeds whose emitter fell short of `u`, or left its confinement.
@@ -246,7 +246,7 @@ struct Spot {
     se: [f64; 3],
     se_s: f64,
     c: f64,
-    z: f64,
+    detect_z: f64,
     flags: u8,
     seed: usize,
     /// Index of its window's fit in the frame's [`Fate`]s.
@@ -665,7 +665,7 @@ fn fit_seed(d: &[f64], h: usize, w: usize, sc: &Screen, seed: usize, at: &[bool]
                 se,
                 se_s,
                 c: ef.theta[0],
-                z: (2.0 * cost_e).sqrt(),
+                detect_z: (2.0 * cost_e).sqrt(),
                 flags,
                 seed,
                 window: 0,
@@ -747,7 +747,7 @@ fn fit_seed(d: &[f64], h: usize, w: usize, sc: &Screen, seed: usize, at: &[bool]
             se,
             se_s,
             c: theta[0],
-            z: (2.0 * cost_j).sqrt(),
+            detect_z: (2.0 * cost_j).sqrt(),
             flags,
             seed,
             window: 0,
@@ -818,13 +818,13 @@ fn merge(spots: &mut Vec<Spot>, fates: &[Fate], w: usize, reach: f64) -> usize {
 impl Output {
     /// Keep the emitters at or above `u`; those below are weak seeds.
     fn above(mut self, u: f64) -> Self {
-        let keep: Vec<bool> = self.z.iter().map(|&z| z >= u).collect();
+        let keep: Vec<bool> = self.detect_z.iter().map(|&z| z >= u).collect();
         fn take<T: Copy>(v: &[T], keep: &[bool], k: usize) -> Vec<T> {
             v.chunks(k).zip(keep).filter(|p| *p.1).flat_map(|p| p.0.iter().copied()).collect()
         }
         self.weak += keep.iter().filter(|&&k| !k).count();
         (self.pos, self.seed, self.se) = (take(&self.pos, &keep, 2), take(&self.seed, &keep, 2), take(&self.se, &keep, 3));
-        (self.amp, self.sig, self.se_sig, self.z) = (take(&self.amp, &keep, 1), take(&self.sig, &keep, 1), take(&self.se_sig, &keep, 1), take(&self.z, &keep, 1));
+        (self.amp, self.sig, self.se_sig, self.detect_z) = (take(&self.amp, &keep, 1), take(&self.sig, &keep, 1), take(&self.se_sig, &keep, 1), take(&self.detect_z, &keep, 1));
         (self.flags, self.fitted_background, self.mixture) = (take(&self.flags, &keep, 1), take(&self.fitted_background, &keep, 1), take(&self.mixture, &keep, 1));
         self.u = u;
         self
@@ -926,7 +926,7 @@ fn localize_with(d: &[f64], h: usize, w: usize, roi: Option<&[bool]>, s: &Settin
         out.se.extend(p.se);
         out.se_sig.push(p.se_s);
         out.flags.push(p.flags | if border < EDGE * p.s { FLAG_EDGE } else { 0 });
-        out.z.push(p.z);
+        out.detect_z.push(p.detect_z);
         out.fitted_background.push(p.c);
         out.mixture.push(p.mixture);
         out.seed.extend([(p.seed / cw + r0) as f64, (p.seed % cw + c0) as f64]);
@@ -978,7 +978,7 @@ impl Progress {
 /// curve is the movie's: the given gain, and the read variance its
 /// backgrounds give with it ([`prefilter::Curve::of`]). The bar `u` is the
 /// movie's too: every frame's candidates, fitted alone above
-/// [`posterior::CANDIDATE`], set `P(real | z)` ([`Posterior`]), and each
+/// [`posterior::CANDIDATE`], set `P(real | detect_z)` ([`Posterior`]), and each
 /// frame is then fitted at the `u` where it reaches `p_real`.
 #[allow(clippy::too_many_arguments)]
 pub fn localize_stack(
@@ -1038,7 +1038,7 @@ pub fn localize_stack_observed(
     }
     let area = n as f64 * roi.map_or((h * w) as f64, |m| m.iter().filter(|&&v| v).count() as f64);
     let (w_lo, w_hi) = s.widths();
-    let heights: Vec<f64> = candidates.iter().flat_map(|o| o.z.iter().copied()).collect();
+    let heights: Vec<f64> = candidates.iter().flat_map(|o| o.detect_z.iter().copied()).collect();
     let post = Posterior::fit(&heights, area, w_lo, w_hi);
     let u = post.cut(s.p_real);
     // Fitted alone, the frames' emitters are their candidates above `u`;
@@ -1052,7 +1052,7 @@ pub fn localize_stack_observed(
         return None;
     }
     for o in &mut out {
-        o.p_real = o.z.iter().map(|&z| post.p_real(z)).collect();
+        o.p_real = o.detect_z.iter().map(|&z| post.p_real(z)).collect();
     }
     Some(out)
 }
@@ -1154,7 +1154,7 @@ pub(crate) mod tests {
     fn copies_merge_and_resolved_pairs_stay() {
         let w = 40;
         let spot = |y: f64, x: f64, seed: usize, window: usize| Spot {
-            y, x, a: 1.0, s: 1.0, se: [0.0; 3], se_s: 0.0, c: 0.0, z: 5.0, flags: 0, seed, window, mixture: 0,
+            y, x, a: 1.0, s: 1.0, se: [0.0; 3], se_s: 0.0, c: 0.0, detect_z: 5.0, flags: 0, seed, window, mixture: 0,
         };
         let fate = |c: Vec<(f64, f64)>| Fate { components: c, ..Fate::default() };
         // One emitter near (10, 10.3), seeds at (10, 7) and (10, 14).
@@ -1188,7 +1188,7 @@ pub(crate) mod tests {
         assert!((o.pos[1] - 21.6).abs() < 3.0 * o.se[2], "x {}", o.pos[1]);
         assert!((o.amp[0] - 1500.0).abs() < 3.0 * o.se[0], "A {}", o.amp[0]);
         assert!((o.sig[0] - 1.3).abs() < 3.0 * o.se_sig[0], "sigma {}", o.sig[0]);
-        assert!(o.z[0] >= o.u);
+        assert!(o.detect_z[0] >= o.u);
     }
 
     /// An emitter on the upper reported width is reported in all but about
@@ -1263,7 +1263,7 @@ pub(crate) mod tests {
         let seen = localize_stack_observed(&raw, n, h, w, 0.0, None, &s, 2, &p).expect("not cancelled");
         let plain = localize_stack(&raw, n, h, w, 0.0, None, &s, 2);
         assert_eq!((p.done(), p.total()), (2 * n, 2 * n));
-        assert!(seen.iter().zip(&plain).all(|(a, b)| a.pos == b.pos && a.z == b.z));
+        assert!(seen.iter().zip(&plain).all(|(a, b)| a.pos == b.pos && a.detect_z == b.detect_z));
         let stop = Progress::default();
         stop.cancel();
         assert!(localize_stack_observed(&raw, n, h, w, 0.0, None, &s, 2, &stop).is_none());

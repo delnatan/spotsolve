@@ -35,7 +35,7 @@ def test_crowded_fields_hold_their_recall_and_precision(seed, density, spread,
     m = match(sim.positions, res.positions, radius=1.0)
     assert m.recall >= recall - 0.05
     assert m.precision >= precision - 0.05
-    assert np.all(res.info["z"] >= res.info["u"])
+    assert np.all(res.info["detect_z"] >= res.info["u"])
     assert np.all(np.isfinite(res.se)) and np.all(res.se > 0)
     assert np.all(np.isfinite(res.sigma_se)) and np.all(res.sigma_se > 0)
 
@@ -48,7 +48,7 @@ def test_separated_emitters_are_recovered(width):
     m = match(sim.positions, res.positions, radius=1.0)
     assert m.recall == 1.0 and m.precision == 1.0
     assert np.all(np.isfinite(res.se)) and np.all(res.se > 0)
-    assert np.all(res.info["z"] >= res.info["u"])
+    assert np.all(res.info["detect_z"] >= res.info["u"])
     if width[0] < width[1]:
         assert np.all(np.isfinite(res.sigma_se)) and np.all(res.sigma_se > 0)
     else:
@@ -107,7 +107,7 @@ def test_the_answer_does_not_depend_on_the_camera_gain():
         assert len(res) == len(ref)
         assert np.all(np.abs(res.positions - ref.positions) < 0.01 * ref.se[:, 1:])
         assert np.all(np.abs(res.amplitudes - g * ref.amplitudes) < 0.01 * g * ref.se[:, 0])
-        np.testing.assert_allclose(res.info["z"], ref.info["z"], rtol=1e-4)
+        np.testing.assert_allclose(res.info["detect_z"], ref.info["detect_z"], rtol=1e-4)
     # Widths spread 0.4 scatter one small frame's gain; where the PSF is the
     # model's, it is the camera's.
     assert 0.9 <= L.estimate_gain(_sim(17, 0.015, 0.0, background=20.0).image, SIGMA) <= 1.2
@@ -148,9 +148,9 @@ def test_stack_shares_one_bar_and_is_thread_count_free():
     for a, b in zip(one, many):
         for key in ("positions", "amplitudes", "se", "flags"):
             np.testing.assert_array_equal(getattr(a, key), getattr(b, key))
-        np.testing.assert_array_equal(a.info["z"], b.info["z"])
+        np.testing.assert_array_equal(a.info["detect_z"], b.info["detect_z"])
         assert a.info["u"] == one[0].info["u"]
-        assert np.all(a.info["z"] >= a.info["u"])
+        assert np.all(a.info["detect_z"] >= a.info["u"])
         assert np.all(a.info["p_real"] >= L.P_REAL)
         assert a.model_image is None and a.residual is None
     # A frame alone is a movie of one.
@@ -189,7 +189,7 @@ def test_an_empty_roi_asks_for_nothing():
     assert len(res) == 0
     assert res.background.shape == img.shape
     assert res.info["seeds"] == 0
-    assert res.info["z"].shape == (0,)
+    assert res.info["detect_z"].shape == (0,)
     assert res.flags.shape == (0,)
 
 
@@ -197,8 +197,8 @@ def test_diagnostics_follow_all_returned_rows():
     image = _sim(17, density=0.015, spread=0.4).image
     raw = rs.detect_localize(image, sigma=SIGMA, gain=GAIN)
     result = L.localize(image, sigma=SIGMA, gain=GAIN, images=False)
-    assert raw[-1]["z"].shape == (len(raw[0]),)
-    np.testing.assert_array_equal(result.info["z"], raw[-1]["z"])
+    assert raw[-1]["detect_z"].shape == (len(raw[0]),)
+    np.testing.assert_array_equal(result.info["detect_z"], raw[-1]["detect_z"])
     np.testing.assert_array_equal(result.positions, raw[0])
     np.testing.assert_array_equal(result.flags, raw[5])
     assert len(result) == len(raw[0])
@@ -263,7 +263,7 @@ def test_a_watched_stack_gives_what_it_gives_unwatched():
     assert seen == sorted(seen)
     for a, b in zip(plain, watched):
         np.testing.assert_array_equal(a.positions, b.positions)
-        np.testing.assert_array_equal(a.info["z"], b.info["z"])
+        np.testing.assert_array_equal(a.info["detect_z"], b.info["detect_z"])
     cancelled = L.Progress()
     cancelled.cancel()
     with pytest.raises(L.Cancelled):

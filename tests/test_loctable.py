@@ -45,7 +45,7 @@ def test_peak_carries_width_where_flux_does_not():
 
 def test_tables_preserve_measurements_flags_and_uncertainties():
     result = _result([100., 10000.], [0.75, 3.0], info={
-        "z": np.array([4.5, 60.0]),
+        "detect_z": np.array([4.5, 60.0]),
         "fitted_background": [21., 22.],
     })
     result.flags[:] = [0, int(FitFlag.EDGE | FitFlag.AT_BOUND)]
@@ -55,7 +55,7 @@ def test_tables_preserve_measurements_flags_and_uncertainties():
     assert locs.schema["flags"] == pl.UInt8
     np.testing.assert_array_equal(locs["flags"], result.flags)
     np.testing.assert_array_equal(locs["sigma_se"], result.sigma_se)
-    np.testing.assert_array_equal(locs["z"], [4.5, 60.0])
+    np.testing.assert_array_equal(locs["detect_z"], [4.5, 60.0])
     np.testing.assert_array_equal(locs["bg"], [21., 22.])
     np.testing.assert_array_equal(locs["peak"], result.peak)
     np.testing.assert_array_equal(locs["loc_id"], [12, 13])
@@ -68,7 +68,7 @@ def test_empty_tables_keep_schema_and_missing_diagnostics_are_nan():
     assert empty.schema == loctable.LOCALIZATION_SCHEMA
     assert summary["n_locs"][0] == summary["n_flagged"][0] == 0
     locs, _ = loctable.frame_tables(_result([100.], [1.]), 0)
-    assert np.isnan(locs["z"][0])
+    assert np.isnan(locs["detect_z"][0])
 
 
 def test_quality_filter_excludes_invalid_coordinates_and_preserves_rows():

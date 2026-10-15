@@ -7,7 +7,7 @@ linking.
 |---|---|
 | [Building and distribution](BUILDING.md) | Platform wheels, CI checks, source builds and releases |
 | [Detection](DETECTION.md) | The model, the algorithm, the threshold, performance and limits |
-| [Localization quality](LOCALIZATION_QUALITY.md) | Flags, uncertainties, `z`, and how to choose cuts |
+| [Localization quality](LOCALIZATION_QUALITY.md) | Flags, uncertainties, `detect_z`, and how to choose cuts |
 | [Tracking](TRACKING.md) | Motion model, assignment, parameters, benchmarks and limits |
 
 ## Implementation

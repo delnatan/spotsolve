@@ -67,7 +67,7 @@ fn give<'py>(py: Python<'py>, o: detect::Output, h: usize, w: usize) -> PyResult
     let n = o.amp.len();
     let info = PyDict::new(py);
     info.set_item("fitted_background", o.fitted_background.into_pyarray(py))?;
-    info.set_item("z", o.z.into_pyarray(py))?;
+    info.set_item("detect_z", o.detect_z.into_pyarray(py))?;
     info.set_item("p_real", o.p_real.into_pyarray(py))?;
     info.set_item("dispersion", o.dispersion)?;
     info.set_item("read_variance", o.read_variance)?;
@@ -164,7 +164,7 @@ impl Progress {
 }
 
 /// Localize every frame of a raw `(T, H, W)` stack on `n_threads` workers,
-/// at the movie's bar: `P(real | z)` is fitted to every frame's candidates.
+/// at the movie's bar: `P(real | detect_z)` is fitted to every frame's candidates.
 /// Returns one tuple per frame, in frame order; `None` if `progress` was
 /// cancelled.
 #[pyfunction]

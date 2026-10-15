@@ -132,10 +132,10 @@ def localize(frame, sigma, *, gain, offset=0.0, roi=None, p_real=P_REAL,
 
     An emitter is kept if it is real, not noise, with probability at least
     `p_real`. The probability comes from its likelihood ratio against the
-    level alone, `z = sqrt(2 * ratio)` in nats: candidates fitted alone above a low bar have a density of `z` that
+    level alone, `detect_z = sqrt(2 * ratio)` in nats: candidates fitted alone above a low bar have a density of `detect_z` that
     noise alone, by theory, would give only in part,
-    and `P(real | z)` is the part noise does not explain. The emitter is
-    kept where `z >= u`, the bar at which that reaches `p_real`. A single
+    and `P(real | detect_z)` is the part noise does not explain. The emitter is
+    kept where `detect_z >= u`, the bar at which that reaches `p_real`. A single
     frame is a movie of one; `localize_stack` pools every frame.
 
     With `fit_mixtures`, after u-track's FitMixtures, a window takes more
@@ -157,7 +157,7 @@ def localize(frame, sigma, *, gain, offset=0.0, roi=None, p_real=P_REAL,
     leave it off where the exposure is short enough that emitters stay
     round.
 
-    `info["z"]` is each emitter's `sqrt(2 * likelihood ratio)`, at least
+    `info["detect_z"]` is each emitter's `sqrt(2 * likelihood ratio)`, at least
     `info["u"]`; `info["p_real"]` its probability of being real, at least
     `p_real`. Every emitter is returned with `FitFlag` diagnostics.
     `images=False` skips `model_image` and `residual`.
@@ -176,7 +176,7 @@ def localize_stack(stack, sigma, *, gain, offset=0.0, roi=None, p_real=P_REAL,
 
     Returns one `Localizations` per frame, in frame order. Each frame's
     background is its own; the read variance, the bar `u` and
-    `P(real | z)` are the movie's, fitted to every frame, so a frame's
+    `P(real | detect_z)` are the movie's, fitted to every frame, so a frame's
     result depends on the stack it is in. `n_threads` defaults to the machine's cores.
     `images` defaults to False here: for a long timecourse the model and
     residual are two more copies of the movie.
@@ -184,7 +184,7 @@ def localize_stack(stack, sigma, *, gain, offset=0.0, roi=None, p_real=P_REAL,
     To follow a long run, pass a `Progress` and read it from another thread;
     its `cancel()` stops the run, which then raises `Cancelled`. Split into
     several calls instead, each would be a movie of its own, with its own
-    read variance, bar `u` and `P(real | z)`.
+    read variance, bar `u` and `P(real | detect_z)`.
     """
     raw = np.ascontiguousarray(stack, dtype=float)
     if raw.ndim != 3:
