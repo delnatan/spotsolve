@@ -19,7 +19,10 @@ type Arr2 = Py<PyArray2<f64>>;
 type Frame<'py> = (Arr2, Arr1, Arr1, Arr2, Arr1, Py<PyArray1<u8>>, Arr2, Bound<'py, PyDict>);
 
 #[allow(clippy::too_many_arguments)]
-fn settings(sigma: f64, gain: f64, p_real: f64, width: (f64, f64), fit_mixtures: bool, max_mixtures: usize, motion_blur: bool) -> PyResult<detect::Settings> {
+fn settings(sigma: f64, gain: f64, p_real: f64, width: (f64, f64), fit_mixtures: bool, max_mixtures: usize, motion_blur: bool, model_error: f64) -> PyResult<detect::Settings> {
+    if !(model_error.is_finite() && model_error >= 0.0) {
+        return Err(PyValueError::new_err("`model_error` must be finite and non-negative"));
+    }
     if !(width.0 > 0.0 && width.0.is_finite() && width.0 <= width.1) {
         return Err(PyValueError::new_err("`width` must be 0 < lo <= hi"));
     }
@@ -35,7 +38,7 @@ fn settings(sigma: f64, gain: f64, p_real: f64, width: (f64, f64), fit_mixtures:
     if !(p_real > 0.0 && p_real < 1.0) {
         return Err(PyValueError::new_err("`p_real` must lie strictly between 0 and 1"));
     }
-    Ok(detect::Settings { sigma, gain, p_real, width, fit_mixtures, max_mixtures, motion_blur })
+    Ok(detect::Settings { sigma, gain, p_real, width, fit_mixtures, max_mixtures, motion_blur, model_error })
 }
 
 fn check_offset(offset: f64) -> PyResult<()> {
@@ -99,7 +102,7 @@ fn give<'py>(py: Python<'py>, o: detect::Output, h: usize, w: usize) -> PyResult
 /// the camera's pixel variance per ADU of light, and the background is
 /// measured from the frame.
 #[pyfunction]
-#[pyo3(signature = (raw, sigma, offset=0.0, *, gain, roi=None, p_real=detect::P_REAL, width=detect::WIDTH, fit_mixtures=false, max_mixtures=detect::MAX_MIXTURES, motion_blur=false))]
+#[pyo3(signature = (raw, sigma, offset=0.0, *, gain, roi=None, p_real=detect::P_REAL, width=detect::WIDTH, fit_mixtures=false, max_mixtures=detect::MAX_MIXTURES, motion_blur=false, model_error=0.0))]
 #[allow(clippy::too_many_arguments)]
 fn detect_localize<'py>(
     py: Python<'py>,
@@ -113,6 +116,7 @@ fn detect_localize<'py>(
     fit_mixtures: bool,
     max_mixtures: usize,
     motion_blur: bool,
+    model_error: f64,
 ) -> PyResult<Frame<'py>> {
     let (h, w) = (raw.shape()[0], raw.shape()[1]);
     let r = raw
@@ -124,7 +128,7 @@ fn detect_localize<'py>(
     }
     check_offset(offset)?;
     let roi = roi_slice(&roi, h, w)?.map(|m| m.to_vec());
-    let s = settings(sigma, gain, p_real, width, fit_mixtures, max_mixtures, motion_blur)?;
+    let s = settings(sigma, gain, p_real, width, fit_mixtures, max_mixtures, motion_blur, model_error)?;
     let o = py.detach(|| detect::localize_raw(&r, h, w, offset, roi.as_deref(), &s));
     give(py, o, h, w)
 }
@@ -168,7 +172,7 @@ impl Progress {
 /// Returns one tuple per frame, in frame order; `None` if `progress` was
 /// cancelled.
 #[pyfunction]
-#[pyo3(signature = (raw, sigma, offset=0.0, *, gain, roi=None, p_real=detect::P_REAL, width=detect::WIDTH, fit_mixtures=false, max_mixtures=detect::MAX_MIXTURES, motion_blur=false, n_threads=1, progress=None))]
+#[pyo3(signature = (raw, sigma, offset=0.0, *, gain, roi=None, p_real=detect::P_REAL, width=detect::WIDTH, fit_mixtures=false, max_mixtures=detect::MAX_MIXTURES, motion_blur=false, model_error=0.0, n_threads=1, progress=None))]
 #[allow(clippy::too_many_arguments)]
 fn detect_localize_stack<'py>(
     py: Python<'py>,
@@ -182,6 +186,7 @@ fn detect_localize_stack<'py>(
     fit_mixtures: bool,
     max_mixtures: usize,
     motion_blur: bool,
+    model_error: f64,
     n_threads: usize,
     progress: Option<Bound<'py, Progress>>,
 ) -> PyResult<Option<Vec<Frame<'py>>>> {
@@ -195,7 +200,7 @@ fn detect_localize_stack<'py>(
     }
     check_offset(offset)?;
     let roi = roi_slice(&roi, h, w)?.map(|m| m.to_vec());
-    let s = settings(sigma, gain, p_real, width, fit_mixtures, max_mixtures, motion_blur)?;
+    let s = settings(sigma, gain, p_real, width, fit_mixtures, max_mixtures, motion_blur, model_error)?;
     let r = r.to_vec();
     let watch = progress.map_or_else(|| Arc::new(detect::Progress::default()), |p| p.get().inner.clone());
     let outs = py.detach(|| {
@@ -226,10 +231,40 @@ fn detect_estimate_gain(
         return Err(PyValueError::new_err("`raw` must be finite and non-empty"));
     }
     check_offset(offset)?;
-    settings(sigma, 1.0, detect::P_REAL, width, true, detect::MAX_MIXTURES, false)?;
+    settings(sigma, 1.0, detect::P_REAL, width, true, detect::MAX_MIXTURES, false, 0.0)?;
     let roi = roi_slice(&roi, h, w)?.map(|m| m.to_vec());
     let r = r.to_vec();
     Ok(py.detach(|| detect::estimate_gain(&r, n, h, w, offset, roi.as_deref(), sigma, width, n_threads.max(1))))
+}
+
+/// The PSF model's relative error, measured from the bright emitters of a raw
+/// `(T, H, W)` stack given the camera's `gain` (`detect::estimate_model_error`).
+#[pyfunction]
+#[pyo3(signature = (raw, sigma, offset=0.0, *, gain, roi=None, width=detect::WIDTH, n_threads=1))]
+#[allow(clippy::too_many_arguments)]
+fn detect_estimate_model_error(
+    py: Python<'_>,
+    raw: PyReadonlyArray3<'_, f64>,
+    sigma: f64,
+    offset: f64,
+    gain: f64,
+    roi: Option<PyReadonlyArray2<'_, bool>>,
+    width: (f64, f64),
+    n_threads: usize,
+) -> PyResult<f64> {
+    let sh = raw.shape();
+    let (n, h, w) = (sh[0], sh[1], sh[2]);
+    let r = raw
+        .as_slice()
+        .map_err(|_| PyValueError::new_err("`raw` must be a C-contiguous float64 array"))?;
+    if n == 0 || h == 0 || w == 0 || r.iter().any(|v| !v.is_finite()) {
+        return Err(PyValueError::new_err("`raw` must be finite and non-empty"));
+    }
+    check_offset(offset)?;
+    settings(sigma, gain, detect::P_REAL, width, true, detect::MAX_MIXTURES, false, 0.0)?;
+    let roi = roi_slice(&roi, h, w)?.map(|m| m.to_vec());
+    let r = r.to_vec();
+    Ok(py.detach(|| detect::estimate_model_error(&r, n, h, w, offset, roi.as_deref(), sigma, width, gain, n_threads.max(1))))
 }
 
 /// `background` plus every emitter at its own width, truncated at
@@ -264,6 +299,7 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(detect_localize, m)?)?;
     m.add_function(wrap_pyfunction!(detect_localize_stack, m)?)?;
     m.add_function(wrap_pyfunction!(detect_estimate_gain, m)?)?;
+    m.add_function(wrap_pyfunction!(detect_estimate_model_error, m)?)?;
     m.add_class::<Progress>()?;
     m.add_function(wrap_pyfunction!(detect_render, m)?)?;
     // The detector's defaults, read by `spotsolve.native` so Python states

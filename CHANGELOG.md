@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- `model_error` (`localize`, `localize_stack`) adds the PSF model's own
+  error to each pixel's variance, `(model_error (light - level))^2`, and
+  `estimate_model_error` measures it from a movie given the gain. Default
+  0: results are unchanged.
+
 ## 0.5.4 (2026-10-15)
 
 One column renamed; results are unchanged.

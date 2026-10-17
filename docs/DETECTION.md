@@ -67,6 +67,16 @@ spread over the movie, until their pixels fix the gain. Without bright
 emitters it returns the background's variance per unit level: exact without
 read noise, and otherwise an upper bound.
 
+**Model error.** The Gaussian PSF is a model: a bead's size, PSF wings and
+rings, and defocus leave a misfit that grows with the light. With
+`model_error = e`, each window's pixels have variance `V(m) + e^2 (m -
+level)^2`, `level` the window's background, so a bright emitter's misfit is
+not read as a second component on its halo and its standard errors include
+it. `estimate_model_error` measures `e` from the probes `estimate_gain` uses,
+given the gain: the `e` at which their residuals have the median of
+chi-squared(1). The deviance is then integrated numerically (Gauss-Legendre).
+Default 0: the camera alone.
+
 ## Algorithm
 
 1. **Screen.** At every pixel, regress the `ceil(4 sigma)` window (cut at

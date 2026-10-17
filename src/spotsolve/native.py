@@ -70,7 +70,7 @@ def _sigma(sigma, shape):
     return sigma
 
 
-def _kw(sigma, gain, offset, roi, shape, p_real, width, fit_mixtures, max_mixtures, motion_blur):
+def _kw(sigma, gain, offset, roi, shape, p_real, width, fit_mixtures, max_mixtures, motion_blur, model_error=0.0):
     gain = float(gain)
     if not np.isfinite(gain) or gain <= 0:
         raise ValueError("gain must be positive and finite")
@@ -78,7 +78,14 @@ def _kw(sigma, gain, offset, roi, shape, p_real, width, fit_mixtures, max_mixtur
                 p_real=float(p_real), width=tuple(map(float, width)),
                 fit_mixtures=bool(fit_mixtures),
                 max_mixtures=_positive_int(max_mixtures, "max_mixtures"),
-                motion_blur=bool(motion_blur))
+                motion_blur=bool(motion_blur), model_error=_model_error(model_error))
+
+
+def _model_error(e):
+    e = float(e)
+    if not np.isfinite(e) or e < 0:
+        raise ValueError("model_error must be finite and non-negative")
+    return e
 
 
 def _result(out, raw, kw, images):
@@ -100,7 +107,7 @@ def _result(out, raw, kw, images):
 
 def localize(frame, sigma, *, gain, offset=0.0, roi=None, p_real=P_REAL,
              width=WIDTH, fit_mixtures=False, max_mixtures=MAX_MIXTURES,
-             motion_blur=False, images=True):
+             motion_blur=False, model_error=0.0, images=True):
     """Localize one frame. Returns `Localizations`.
 
     `frame`, `offset`, flux and background use camera units (ADU). `sigma`
@@ -160,18 +167,25 @@ def localize(frame, sigma, *, gain, offset=0.0, roi=None, p_real=P_REAL,
     `info["detect_z"]` is each emitter's `sqrt(2 * likelihood ratio)`, at least
     `info["u"]`; `info["p_real"]` its probability of being real, at least
     `p_real`. Every emitter is returned with `FitFlag` diagnostics.
+    `model_error` is the PSF model's relative error: every pixel's variance
+    gains `(model_error * (light - level))^2`, `level` its window's
+    background, so that light the Gaussians do not describe exactly (PSF
+    wings and rings, a bead's size, defocus) is not read as another emitter,
+    and a bright emitter's standard errors include its misfit.
+    `estimate_model_error` measures it from a movie; 0 is the camera alone.
+
     `images=False` skips `model_image` and `residual`.
     """
     raw = np.ascontiguousarray(frame, dtype=float)
     if raw.ndim != 2:
         raise ValueError(f"expected a 2-D frame, got shape {raw.shape}")
-    kw = _kw(sigma, gain, offset, roi, raw.shape, p_real, width, fit_mixtures, max_mixtures, motion_blur)
+    kw = _kw(sigma, gain, offset, roi, raw.shape, p_real, width, fit_mixtures, max_mixtures, motion_blur, model_error)
     return _result(_rs.detect_localize(raw, **kw), raw, kw, images)
 
 
 def localize_stack(stack, sigma, *, gain, offset=0.0, roi=None, p_real=P_REAL,
                    width=WIDTH, fit_mixtures=False, max_mixtures=MAX_MIXTURES,
-                   motion_blur=False, n_threads=None, images=False, progress=None):
+                   motion_blur=False, model_error=0.0, n_threads=None, images=False, progress=None):
     """Localize every frame of a `(T, H, W)` stack, in parallel.
 
     Returns one `Localizations` per frame, in frame order. Each frame's
@@ -189,7 +203,7 @@ def localize_stack(stack, sigma, *, gain, offset=0.0, roi=None, p_real=P_REAL,
     raw = np.ascontiguousarray(stack, dtype=float)
     if raw.ndim != 3:
         raise ValueError(f"expected a (T, H, W) stack, got shape {raw.shape}")
-    kw = _kw(sigma, gain, offset, roi, raw.shape[1:], p_real, width, fit_mixtures, max_mixtures, motion_blur)
+    kw = _kw(sigma, gain, offset, roi, raw.shape[1:], p_real, width, fit_mixtures, max_mixtures, motion_blur, model_error)
     outs = _rs.detect_localize_stack(raw, **kw, n_threads=_threads(n_threads), progress=progress)
     if outs is None:
         raise Cancelled("localize_stack was cancelled")
@@ -216,6 +230,26 @@ def estimate_gain(stack, sigma, *, offset=0.0, roi=None, width=WIDTH, n_threads=
         raise ValueError(f"expected a frame or a (T, H, W) stack, got shape {raw.shape}")
     return float(_rs.detect_estimate_gain(
         raw, _sigma(sigma, raw.shape[1:]), float(offset), roi=_roi(roi, raw.shape[1:]),
+        width=tuple(map(float, width)), n_threads=_threads(n_threads)))
+
+
+def estimate_model_error(stack, sigma, *, gain, offset=0.0, roi=None, width=WIDTH, n_threads=None):
+    """The PSF model's relative error, for `model_error`, from a movie.
+
+    Measured as `estimate_gain` measures the gain, on the same bright
+    emitters fitted with every light in their windows, given the camera's
+    `gain`: the error `e` at which their leverage-corrected squared
+    residuals, over the camera's curve plus `(e * (light - level))^2`, have
+    the median of chi-squared(1). 0 when the camera's curve alone already
+    explains them; NaN without enough bright emitters.
+    """
+    raw = np.ascontiguousarray(stack, dtype=float)
+    if raw.ndim == 2:
+        raw = raw[None]
+    if raw.ndim != 3 or raw.shape[0] == 0:
+        raise ValueError(f"expected a frame or a (T, H, W) stack, got shape {raw.shape}")
+    return float(_rs.detect_estimate_model_error(
+        raw, _sigma(sigma, raw.shape[1:]), float(offset), gain=float(gain), roi=_roi(roi, raw.shape[1:]),
         width=tuple(map(float, width)), n_threads=_threads(n_threads)))
 
 

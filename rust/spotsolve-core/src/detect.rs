@@ -155,11 +155,16 @@ pub struct Settings {
     /// With mixtures, test each close pair against one elongated spot, as an
     /// emitter moving within the exposure is.
     pub motion_blur: bool,
+    /// The PSF model's relative error: a pixel's variance gains
+    /// `(model_error (light - level))^2` over the camera's
+    /// ([`prefilter::Curve`]). [`estimate_model_error`] measures it from a
+    /// movie; 0 is the camera alone.
+    pub model_error: f64,
 }
 
 impl Settings {
     pub fn new(sigma: f64, gain: f64) -> Self {
-        Self { sigma, gain, p_real: P_REAL, width: WIDTH, fit_mixtures: false, max_mixtures: MAX_MIXTURES, motion_blur: false }
+        Self { sigma, gain, p_real: P_REAL, width: WIDTH, fit_mixtures: false, max_mixtures: MAX_MIXTURES, motion_blur: false, model_error: 0.0 }
     }
 
     fn radius(&self) -> usize {
@@ -226,7 +231,7 @@ pub struct Output {
     pub out_of_focus: usize,
     /// `(m, r^2 / (1 - h))` on the pixels of bright emitters: the model's
     /// light and the leverage-corrected squared residual ([`estimate_gain`]).
-    resid: Vec<[f64; 2]>,
+    resid: Vec<[f64; 3]>,
     /// The frame's points of its noise curve ([`prefilter::noise_points`]),
     /// and its variance per unit level ([`prefilter::dispersion`]).
     points: Vec<[f64; 3]>,
@@ -268,7 +273,7 @@ struct Noise {
 #[derive(Default)]
 struct Fate {
     /// See [`Output`]'s `resid`.
-    resid: Vec<[f64; 2]>,
+    resid: Vec<[f64; 3]>,
     spots: Vec<Spot>,
     weak: bool,
     unconfined: bool,
@@ -427,7 +432,7 @@ fn fit_seed(d: &[f64], h: usize, w: usize, sc: &Screen, seed: usize, at: &[bool]
         }
     }
     let level0 = sc.background[seed];
-    let win = Window::new(rows, cols, wd, used, noise.curve);
+    let win = Window::new(rows, cols, wd, used, noise.curve.with_error(noise.curve.err2, level0));
     let dmax = win.d.iter().zip(&win.used).filter(|p| *p.1).fold(1.0f64, |m, (&v, _)| m.max(v));
     let dmin = win.d.iter().zip(&win.used).filter(|p| *p.1).fold(0.0f64, |m, (&v, _)| m.min(v));
     let (cy, cx) = ((sy - y0) as f64, (sx - x0) as f64);
@@ -577,7 +582,7 @@ fn fit_seed(d: &[f64], h: usize, w: usize, sc: &Screen, seed: usize, at: &[bool]
                 for c in 0..cols {
                     let i = r * cols + c;
                     if win.used[i] && lev[i] < 0.9 && (r as f64 - ey).powi(2) + (c as f64 - ex).powi(2) <= 4.0 * sg * sg {
-                        fate.resid.push([m[i], (win.d[i] - m[i]).powi(2) / (1.0 - lev[i])]);
+                        fate.resid.push([m[i], (win.d[i] - m[i]).powi(2) / (1.0 - lev[i]), theta[0]]);
                     }
                 }
             }
@@ -1030,7 +1035,7 @@ pub fn localize_stack_observed(
     .into_iter()
     .flatten()
     .collect();
-    let k = prefilter::Curve::of(s.gain, &points);
+    let k = prefilter::Curve::of(s.gain, &points).with_error(s.model_error * s.model_error, 0.0);
     let alone = Settings { fit_mixtures: false, ..*s };
     let candidates = crate::frames::map(n, n_threads, Fitter::default, |t, fitter| fitted(t, fitter, &alone, posterior::CANDIDATE, k));
     if progress.cancelled() {
@@ -1087,7 +1092,7 @@ pub fn estimate_gain(raw: &[f64], n: usize, h: usize, w: usize, offset: f64, roi
         }
     }
     let points: Vec<[f64; 3]> = probes.iter().flat_map(|o| o.points.iter().copied()).collect();
-    let rows: Vec<[f64; 2]> = probes.iter().flat_map(|o| o.resid.iter().copied()).collect();
+    let rows: Vec<[f64; 3]> = probes.iter().flat_map(|o| o.resid.iter().copied()).collect();
     if rows.len() < PROBE_PIXELS {
         return probes.iter().map(|o| o.phi).sum::<f64>() / probes.len().max(1) as f64;
     }
@@ -1095,7 +1100,7 @@ pub fn estimate_gain(raw: &[f64], n: usize, h: usize, w: usize, offset: f64, roi
     // decreasing function of the gain, zero at the answer.
     let excess = |g: f64| {
         let c = prefilter::Curve::of(g, &points);
-        rows.iter().filter(|&&[m, r2]| r2 / c.at(m) > prefilter::CHI2_1_MEDIAN).count() as f64 - 0.5 * rows.len() as f64
+        rows.iter().filter(|&&[m, r2, _]| r2 / c.at(m) > prefilter::CHI2_1_MEDIAN).count() as f64 - 0.5 * rows.len() as f64
     };
     if excess(0.0) <= 0.0 {
         return 0.0;
@@ -1111,6 +1116,49 @@ pub fn estimate_gain(raw: &[f64], n: usize, h: usize, w: usize, offset: f64, roi
     while hi - lo > 1e-12 * hi {
         let g = 0.5 * (lo + hi);
         if excess(g) > 0.0 { lo = g } else { hi = g }
+    }
+    0.5 * (lo + hi)
+}
+
+/// The PSF model's relative error for [`Settings::model_error`], measured
+/// from a movie given the camera's `gain`, as [`estimate_gain`] measures the
+/// gain: on the same probes' bright emitters, the `e` at which the
+/// leverage-corrected squared residuals over the curve with
+/// `e^2 (light - level)^2` added have the median of chi-squared(1). 0 when
+/// the camera's curve alone already gives them that median (a Gaussian PSF
+/// that fits), and NaN without enough probe pixels.
+#[allow(clippy::too_many_arguments)]
+pub fn estimate_model_error(raw: &[f64], n: usize, h: usize, w: usize, offset: f64, roi: Option<&[bool]>, sigma: f64, width: (f64, f64), gain: f64, n_threads: usize) -> f64 {
+    assert_eq!(raw.len(), n * h * w);
+    let frame = |t: usize| -> Vec<f64> { raw[t * h * w..(t + 1) * h * w].iter().map(|&r| r - offset).collect() };
+    let probe = Settings { width, fit_mixtures: true, ..Settings::new(sigma, 1.0) };
+    let mut probes = Vec::new();
+    for chunk in spread(n).chunks(PROBE_CHUNK) {
+        probes.extend(crate::frames::map(chunk.len(), n_threads, Fitter::default, |k, fitter| localize_with(&frame(chunk[k]), h, w, roi, &probe, PROBE_BAR, fitter, None)));
+        if probes.iter().map(|o: &Output| o.resid.len()).sum::<usize>() >= PROBE_ROWS {
+            break;
+        }
+    }
+    let points: Vec<[f64; 3]> = probes.iter().flat_map(|o| o.points.iter().copied()).collect();
+    let rows: Vec<[f64; 3]> = probes.iter().flat_map(|o| o.resid.iter().copied()).collect();
+    if rows.len() < PROBE_PIXELS {
+        return f64::NAN;
+    }
+    let camera = prefilter::Curve::of(gain, &points);
+    let excess = |e: f64| {
+        rows.iter().filter(|&&[m, r2, level]| r2 / camera.with_error(e * e, level).at(m) > prefilter::CHI2_1_MEDIAN).count() as f64
+            - 0.5 * rows.len() as f64
+    };
+    if excess(0.0) <= 0.0 {
+        return 0.0;
+    }
+    let (mut lo, mut hi) = (0.0, 0.05);
+    while excess(hi) > 0.0 && hi < 10.0 {
+        hi *= 2.0;
+    }
+    while hi - lo > 1e-6 {
+        let e = 0.5 * (lo + hi);
+        if excess(e) > 0.0 { lo = e } else { hi = e }
     }
     0.5 * (lo + hi)
 }
@@ -1223,7 +1271,7 @@ pub(crate) mod tests {
     #[test]
     fn the_gain_is_measured_from_bright_emitters() {
         let (h, w, n) = (31, 31, 60);
-        let cam = prefilter::Curve { read: 8.0, gain: 2.5, floor: 0.0 };
+        let cam = prefilter::Curve { read: 8.0, gain: 2.5, floor: 0.0, err2: 0.0, base: 0.0 };
         let raw: Vec<f64> = (0..n as u64)
             .flat_map(|i| {
                 let (y, x) = (12.0 + 0.07 * i as f64 % 7.0, 11.0 + 0.11 * i as f64 % 9.0);

@@ -286,26 +286,41 @@ pub fn dispersion(d: &[f64], h: usize, w: usize) -> f64 {
 /// offset), `gain` the variance per ADU of light (the gain times any
 /// excess-noise factor), and no less than `floor`, the quietest background
 /// measured: a model's light near or below zero is not a quieter pixel.
+///
+/// `err2` adds the model's own error: light the fitted Gaussians do not
+/// describe exactly (PSF wings, rings, a bead's size, residual streaks) has
+/// a misfit that grows with the light, as `err2 (light - base)^2`, `base`
+/// the window's level. Without it a bright emitter's misfit reads as signal,
+/// a second component on its halo, and its standard errors are too small.
+/// `err2 = 0` is the camera alone.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Curve {
     pub read: f64,
     pub gain: f64,
     pub floor: f64,
+    pub err2: f64,
+    pub base: f64,
 }
 
 impl Curve {
     /// A camera counting photons without read noise, in photons.
-    pub const POISSON: Curve = Curve { read: 0.0, gain: 1.0, floor: 1e-3 };
+    pub const POISSON: Curve = Curve { read: 0.0, gain: 1.0, floor: 1e-3, err2: 0.0, base: 0.0 };
 
     /// The curve of a camera of `gain` over the background `points`
     /// ([`noise_points`]): the read variance from them given the gain
     /// ([`read_given`]), no pixel quieter than the quietest of them.
     pub fn of(gain: f64, points: &[[f64; 3]]) -> Self {
-        Curve { read: read_given(points, gain), gain, floor: quietest(points) }
+        Curve { read: read_given(points, gain), gain, floor: quietest(points), err2: 0.0, base: 0.0 }
     }
 
     pub fn at(&self, light: f64) -> f64 {
-        (self.read + self.gain * light).max(self.floor).max(f64::MIN_POSITIVE)
+        let over = (light - self.base).max(0.0);
+        (self.read + self.gain * light + self.err2 * over * over).max(self.floor).max(f64::MIN_POSITIVE)
+    }
+
+    /// The camera's curve with the model error `err2` above `base`.
+    pub fn with_error(&self, err2: f64, base: f64) -> Self {
+        Curve { err2, base, ..*self }
     }
 
     /// The quasi-likelihood deviance of `d` at mean `mu`, in nats,
@@ -320,6 +335,9 @@ impl Curve {
     /// shot noise's skew is in it, so its ratios have the null of
     /// [`false_rate`] at every level of light.
     pub fn deviance(&self, d: f64, mu: f64) -> f64 {
+        if self.err2 > 0.0 {
+            return self.deviance_numeric(d, mu);
+        }
         // Below `kink` the variance is the floor; without shot noise it is
         // flat throughout.
         let (floor, kink) = if self.gain > 0.0 {
@@ -345,7 +363,55 @@ impl Curve {
         };
         if (mu < kink) == (d < kink) { piece(mu, d) } else { piece(mu, kink) + piece(kink, d) }
     }
+
+    /// [`Curve::deviance`] with the model error: `integral from mu to d of
+    /// (d - t) / V(t) dt` by Gauss-Legendre on panels between the points
+    /// where `V` changes form (the floor's kink, `base`), each split so that
+    /// `V` varies by at most a factor `e^0.25` across a panel.
+    fn deviance_numeric(&self, d: f64, mu: f64) -> f64 {
+        if d == mu {
+            return 0.0;
+        }
+        let (lo, hi) = if mu < d { (mu, d) } else { (d, mu) };
+        let mut cuts = vec![lo, hi];
+        if self.gain > 0.0 {
+            let kink = (self.floor - self.read) / self.gain;
+            if kink > lo && kink < hi {
+                cuts.push(kink);
+            }
+        }
+        if self.base > lo && self.base < hi {
+            cuts.push(self.base);
+        }
+        cuts.sort_by(f64::total_cmp);
+        let f = |t: f64| (d - t) / self.at(t);
+        let mut total = 0.0;
+        for w in cuts.windows(2) {
+            let (a, b) = (w[0], w[1]);
+            let ratio = (self.at(a).max(self.at(b)) / self.at(a).min(self.at(b))).ln();
+            let n = ((ratio / 0.25).ceil() as usize).clamp(1, 64);
+            let h = (b - a) / n as f64;
+            for k in 0..n {
+                let (c, r) = (a + (k as f64 + 0.5) * h, 0.5 * h);
+                total += r * GL8.iter().map(|&(x, wgt)| wgt * (f(c - r * x) + f(c + r * x))).sum::<f64>();
+            }
+        }
+        // `total` is the integral from lo to hi; the deviance runs from mu to d.
+        if mu < d { total } else { -total }
+    }
 }
+
+/// 16-point Gauss-Legendre on [-1, 1], as its 8 positive nodes and weights.
+const GL8: [(f64, f64); 8] = [
+    (0.0950125098376374, 0.1894506104550685),
+    (0.2816035507792589, 0.1826034150449236),
+    (0.4580167776572274, 0.1691565193950025),
+    (0.6178762444026438, 0.1495959888165767),
+    (0.7554044083550030, 0.1246289712555339),
+    (0.8656312023878318, 0.0951585116824928),
+    (0.9445750230732326, 0.0622535239386479),
+    (0.9894009349916499, 0.0271524594117541),
+];
 
 /// `(1 + r) ln(1 + r) - r`, accurate for small `r`, where it is `r^2 / 2`.
 fn excess_entropy(r: f64) -> f64 {
@@ -401,7 +467,7 @@ pub fn fit_curve(points: &[[f64; 3]]) -> Curve {
     let (mut read, mut gain) = (mean.max(f64::MIN_POSITIVE), 0.0);
     for _ in 0..3 {
         let (s0, s1, s2, t0, t1) = points.iter().fold((0.0, 0.0, 0.0, 0.0, 0.0), |(s0, s1, s2, t0, t1), p| {
-            let q = p[2] / (Curve { read, gain, floor: 0.0 }.at(p[0])).powi(2);
+            let q = p[2] / (Curve { read, gain, floor: 0.0, err2: 0.0, base: 0.0 }.at(p[0])).powi(2);
             (s0 + q, s1 + q * p[0], s2 + q * p[0] * p[0], t0 + q * p[1], t1 + q * p[0] * p[1])
         });
         if s0.is_nan() || s0 <= 0.0 {
@@ -415,7 +481,7 @@ pub fn fit_curve(points: &[[f64; 3]]) -> Curve {
             (read, gain) = (0.0, if s2 > 0.0 { t1 / s2 } else { 0.0 });
         }
     }
-    Curve { read: read.max(0.0), gain, floor: quietest(points) }
+    Curve { read: read.max(0.0), gain, floor: quietest(points), err2: 0.0, base: 0.0 }
 }
 
 /// The read variance on `points` given the `gain`: the median of each
@@ -506,14 +572,14 @@ mod tests {
     /// Gaussian one where it is flat, and continuous across the floor.
     #[test]
     fn the_deviance_has_its_limits() {
-        let poisson = Curve { read: 0.0, gain: 1.0, floor: 1e-12 };
+        let poisson = Curve { read: 0.0, gain: 1.0, floor: 1e-12, err2: 0.0, base: 0.0 };
         for (d, mu) in [(7.0, 3.0), (3.0, 7.0), (20.0, 20.5)] {
             let exact = d * (d / mu as f64).ln() - (d - mu);
             assert!((poisson.deviance(d, mu) - exact).abs() < 1e-9, "{d} {mu}");
         }
-        let flat = Curve { read: 9.0, gain: 0.0, floor: 4.0 };
+        let flat = Curve { read: 9.0, gain: 0.0, floor: 4.0, err2: 0.0, base: 0.0 };
         assert!((flat.deviance(5.0, -1.0) - 36.0 / 18.0).abs() < 1e-12);
-        let cam = Curve { read: 7.8, gain: 2.7, floor: 10.0 };
+        let cam = Curve { read: 7.8, gain: 2.7, floor: 10.0, err2: 0.0, base: 0.0 };
         let kink = (10.0 - 7.8) / 2.7;
         let (below, above) = (cam.deviance(3.0, kink - 1e-9), cam.deviance(3.0, kink + 1e-9));
         assert!((below - above).abs() < 1e-8 && cam.deviance(3.0, 3.0) == 0.0);
@@ -536,7 +602,7 @@ mod tests {
             if (mu < kink) == (d < kink) { rule(mu, d) } else { rule(mu, kink) + rule(kink, d) }
         };
         for gain in [2.5, 1e-3, 1e-6, 1e-9] {
-            let cam = Curve { read: 100.0, gain, floor: 100.0 + 5.0 * gain };
+            let cam = Curve { read: 100.0, gain, floor: 100.0 + 5.0 * gain, err2: 0.0, base: 0.0 };
             for (d, mu) in [(120.0, 95.0), (80.0, 101.0), (2.0, 9.0), (9.0, 2.0), (100.3, 100.0)] {
                 let (got, want) = (cam.deviance(d, mu), simpson(&cam, d, mu));
                 assert!((got - want).abs() < 1e-9 * want, "gain {gain}, d {d}, mu {mu}: {got} vs {want}");
@@ -547,11 +613,32 @@ mod tests {
     /// On a background rising across the frame, with read noise and gain,
     /// the frame's curve: within 5% wherever tiles measured it.
     #[test]
+    fn the_numeric_deviance_matches_the_exact_one_without_model_error() {
+        // A vanishing model error takes the quadrature path; it must agree with the closed form.
+        let cam = Curve { read: 7.8, gain: 2.7, floor: 10.0, err2: 0.0, base: 0.0 };
+        let near = cam.with_error(1e-14, 20.0);
+        for &(d, mu) in &[(30.0, 25.0), (500.0, 80.0), (60.0, 900.0), (1.0, 4.0), (0.5, 300.0), (-3.0, 12.0)] {
+            let (a, b) = (cam.deviance(d, mu), near.deviance(d, mu));
+            assert!((a - b).abs() <= 1e-6 * a.abs().max(1e-3), "d {d} mu {mu}: {a} vs {b}");
+        }
+    }
+
+    #[test]
+    fn model_error_lowers_the_deviance_of_bright_misfit_only() {
+        let cam = Curve { read: 7.8, gain: 2.7, floor: 10.0, err2: 0.0, base: 0.0 };
+        let err = cam.with_error(0.1 * 0.1, 20.0);
+        // At or below the level nothing changes; at a bright pixel the same misfit costs less.
+        assert!((cam.deviance(14.0, 20.0) - err.deviance(14.0, 20.0)).abs() < 1e-9 * cam.deviance(14.0, 20.0));
+        assert!(err.deviance(700.0, 600.0) < 0.5 * cam.deviance(700.0, 600.0));
+        assert!((err.at(620.0) - (cam.at(620.0) + 0.01 * 600.0 * 600.0)).abs() < 1e-9);
+    }
+
+    #[test]
     fn the_noise_curve_follows_the_background() {
         let (h, w) = (200, 260);
         let z = crate::detect::tests::normals(h * w, 9);
         let level: Vec<f64> = (0..h * w).map(|i| 1.0 + 30.0 * (i % w) as f64 / (w - 1) as f64).collect();
-        let truth = Curve { read: 8.0, gain: 2.5, floor: 0.0 };
+        let truth = Curve { read: 8.0, gain: 2.5, floor: 0.0, err2: 0.0, base: 0.0 };
         let d: Vec<f64> = (0..h * w).map(|i| level[i] + truth.at(level[i]).sqrt() * z[i]).collect();
         let points = noise_points(&d, h, w, &level, &vec![true; h * w]);
         let c = fit_curve(&points);

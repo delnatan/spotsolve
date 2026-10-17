@@ -26,6 +26,7 @@ from .native import (  # noqa: F401
     Cancelled,
     Progress,
     estimate_gain,
+    estimate_model_error,
     localize,
     localize_stack,
 )
@@ -38,6 +39,7 @@ __all__ = [
     "localize",
     "localize_stack",
     "estimate_gain",
+    "estimate_model_error",
     "Progress",
     "Cancelled",
     "Localizations",
