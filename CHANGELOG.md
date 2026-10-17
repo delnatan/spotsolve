@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+- `link` reads the continuation per detection-strength class when the table
+  has `detect_z` (`strength=`; `None` for the old behaviour), and starts new
+  tracks from the movie's measured population over D. On simulated beads
+  diffusing in and out of focus, D's bias goes from -7% to -1% and bright
+  particles' tracks are no longer cut at their longer steps.
+
 ## 0.5.4 (2026-10-15)
 
 One column renamed; results are unchanged.

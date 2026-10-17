@@ -33,7 +33,7 @@ def _frame_numbers(column):
     return np.ascontiguousarray(frame, dtype=np.int64)
 
 
-def link(locs, max_step):
+def link(locs, max_step, strength="detect_z"):
     """Link a localization table into trajectories. -> the table + `track_id`.
 
     `max_step` is the largest distance, in the table's position units
@@ -43,6 +43,15 @@ def link(locs, max_step):
     track is held to its own step size. `se_y` and `se_x` are each
     detection's localization errors in the same units, and `frame` a whole
     number on every row.
+
+    `strength` names a column of each detection's strength, the detector's
+    `detect_z` by default. When the table has it, the chance that a
+    detection is seen again in the next frame is read from the movie per
+    strength class rather than once for the whole movie, and a track's end
+    is priced by its own detection's class and the new detection's: a
+    bright in-focus particle is seen again almost surely, a dim one near the
+    detection bar often is not. `None`, or a table without the column, reads
+    one continuation for the movie.
 
     The result is the input with one `UInt32` column added, in the input's
     row order; a `track_id` column already present is replaced. Every row
@@ -65,6 +74,9 @@ def link(locs, max_step):
         np.stack([locs["y"].to_numpy(), locs["x"].to_numpy()], axis=1), dtype=float)
     err = np.ascontiguousarray(
         np.stack([locs["se_y"].to_numpy(), locs["se_x"].to_numpy()], axis=1), dtype=float)
-    ids = _rs.track_link(frame, pos, err, max_step)
+    z = None
+    if strength is not None and strength in locs.columns:
+        z = np.ascontiguousarray(locs[strength].cast(pl.Float64).to_numpy(), dtype=float)
+    ids = _rs.track_link(frame, pos, err, max_step, z)
     return locs.drop([c for c in ("track_id",) if c in locs.columns]).with_columns(
         pl.Series("track_id", ids, dtype=pl.UInt32))

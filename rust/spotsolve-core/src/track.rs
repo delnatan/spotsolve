@@ -23,7 +23,17 @@
 //! `lambda = (1 - q)^2 rho / q` prices a track end: `rho` is the density of
 //! other detections around a detection and `q` the chance that a detection
 //! continues into the next frame, so `(1 - q) rho` is the density of new
-//! detections and `(1 - q) / q` the odds that a track goes unseen. Without
+//! detections and `(1 - q) / q` the odds that a track goes unseen.
+//!
+//! Given each detection's strength (the detector's `detect_z`), `q` and
+//! `rho` are read per strength class instead, the classes equal shares of
+//! the movie's detections, and a link `a -> b` is priced by
+//! `lambda_ab = (1 - q_a) / q_a * (1 - q_b) rho_b`: the odds that `a`'s own
+//! class goes unseen, times the density of new detections of `b`'s class.
+//! A bright in-focus particle is seen again almost surely; a dim one near
+//! the detection bar often is not. One `q` for both prices a bright
+//! particle's longer steps as if it were flickering, and cuts them.
+//! Without
 //! `SWITCH_COST` each link would be the most probable call; a wrong link
 //! switches two identities, which costs more than the break a missed link
 //! makes.
@@ -149,6 +159,31 @@ struct Stats {
     r0: f64,
     rho: f64,
     log_lambda: f64,
+    /// Per strength class `c` ([`classes`]): `ln((1 - q_c) / q_c)`, the odds
+    /// that a detection of the class goes unseen, and `ln((1 - q_c) rho_c)`,
+    /// the density of new detections of the class. Empty without strengths:
+    /// `log_lambda` prices every link.
+    log_unseen: Vec<f64>,
+    log_new: Vec<f64>,
+}
+
+/// Most strength classes; fewer when the movie has fewer than
+/// [`CLASS_ROWS`] detections per class.
+const N_CLASSES: usize = 6;
+const CLASS_ROWS: usize = 500;
+
+/// Each detection's strength class: equal shares of the detections, by
+/// rank of `strength`. -> (class per row, number of classes).
+fn classes(strength: &[f64]) -> (Vec<usize>, usize) {
+    let n = strength.len();
+    let k = (n / CLASS_ROWS).clamp(1, N_CLASSES);
+    let mut order: Vec<usize> = (0..n).collect();
+    order.sort_by(|&a, &b| strength[a].total_cmp(&strength[b]));
+    let mut class = vec![0; n];
+    for (rank, &i) in order.iter().enumerate() {
+        class[i] = rank * k / n.max(1);
+    }
+    (class, k)
 }
 
 fn d2(pos: &[f64], a: usize, b: usize) -> f64 {
@@ -254,7 +289,7 @@ fn pairs_within(fr: &Frame, other: &Frame, pos: &[f64], r: f64) -> f64 {
     count
 }
 
-fn movie_stats(frames: &[Frame], pos: &[f64], r: f64, se2_med: f64, n: usize) -> Stats {
+fn movie_stats(frames: &[Frame], pos: &[f64], r: f64, se2_med: f64, n: usize, class: Option<(&[usize], usize)>) -> Stats {
     // Positions are not known finer than their error: the histogram bin.
     let bin = se2_med.sqrt();
     // Nothing farther than R is looked at, here as everywhere.
@@ -283,7 +318,55 @@ fn movie_stats(frames: &[Frame], pos: &[f64], r: f64, se2_med: f64, n: usize) ->
     }
     // The rule of succession, on a count that noise can take outside [0, tried].
     let q = (cont.clamp(0.0, tried) + 1.0) / (tried + 2.0);
-    Stats { r0, rho, log_lambda: 2.0 * (1.0 - q).ln() + rho.ln() - q.ln() }
+    let (log_unseen, log_new) = match class {
+        Some((class, k)) => class_stats(frames, pos, r, rho, class, k),
+        None => (Vec::new(), Vec::new()),
+    };
+    Stats { r0, rho, log_lambda: 2.0 * (1.0 - q).ln() + rho.ln() - q.ln(), log_unseen, log_new }
+}
+
+/// Per strength class: each detection's continuation, the detections within
+/// `R` of it in the next (and previous) frame less the others within `R` of
+/// it in its own frame. Its own neighbours, not the frame's mean: a bright
+/// particle's neighbourhood (a halo the detector splits, a neighbour it
+/// crowds) is in both counts and cancels. -> (`ln((1 - q) / q)`,
+/// `ln((1 - q) rho_c)`) per class, `rho_c` the class's share of `rho`.
+fn class_stats(frames: &[Frame], pos: &[f64], r: f64, rho: f64, class: &[usize], k: usize) -> (Vec<f64>, Vec<f64>) {
+    let within = |a: usize, other: &Frame| -> f64 {
+        let mut c = 0.0;
+        other.cells.near([pos[2 * a], pos[2 * a + 1]], |j| {
+            if d2(pos, a, other.rows[j]) < r * r {
+                c += 1.0;
+            }
+        });
+        c
+    };
+    let (t_lo, t_hi) = (frames[0].t, frames[frames.len() - 1].t);
+    let (mut cont, mut tried, mut count) = (vec![0.0; k], vec![0.0; k], vec![0.0; k]);
+    for fr in frames {
+        for &a in &fr.rows {
+            let c = class[a];
+            count[c] += 1.0;
+            let own = within(a, fr) - 1.0;
+            for step in [1, -1] {
+                if (step == 1 && fr.t == t_hi) || (step == -1 && fr.t == t_lo) {
+                    continue;
+                }
+                tried[c] += 1.0;
+                if let Ok(i) = frames.binary_search_by_key(&(fr.t + step), |f| f.t) {
+                    cont[c] += within(a, &frames[i]) - own;
+                }
+            }
+        }
+    }
+    let total: f64 = count.iter().sum();
+    (0..k)
+        .map(|c| {
+            let q = (cont[c].clamp(0.0, tried[c]) + 1.0) / (tried[c] + 2.0);
+            let rho_c = rho * count[c] / total;
+            (((1.0 - q) / q).ln(), (1.0 - q).ln() + rho_c.ln())
+        })
+        .unzip()
 }
 
 /// Which frames around each detection hold a detection within `r0`: bit
@@ -322,9 +405,24 @@ struct Model<'a> {
     stats: Stats,
     seen: Vec<u32>,
     occupied: Vec<u32>,
+    /// Each detection's strength class, empty without strengths.
+    class: Vec<usize>,
+    /// The movie's population over `D_k` (log weights): where a new track's
+    /// posterior starts, before its occupancy, and where forgetting returns
+    /// it. Uniform until a pilot pass measures it ([`population`]).
+    base: [f64; N_D],
 }
 
 impl Model<'_> {
+    /// `ln lambda` for a link `a -> b`.
+    fn log_lambda(&self, a: usize, b: usize) -> f64 {
+        if self.class.is_empty() {
+            self.stats.log_lambda
+        } else {
+            self.stats.log_unseen[self.class[a]] + self.stats.log_new[self.class[b]]
+        }
+    }
+
     /// log of the step density track state `w` predicts for `a -> b`.
     fn log_pred(&self, w: &[f64; N_D], a: usize, b: usize, dd: f64) -> f64 {
         let s2 = self.se2[a] + self.se2[b];
@@ -337,8 +435,8 @@ impl Model<'_> {
         let s2 = self.se2[a] + self.se2[b];
         let mut t: [f64; N_D] = std::array::from_fn(|k| w[k] + log_step(dd, 2.0 * self.dk[k] + s2));
         let z = log_sum_exp(&t);
-        for x in &mut t {
-            *x = ((1.0 - FORGET) * (*x - z).exp() + FORGET / N_D as f64).ln();
+        for (x, b) in t.iter_mut().zip(self.base) {
+            *x = ((1.0 - FORGET) * (*x - z).exp() + FORGET * b.exp()).ln();
         }
         t
     }
@@ -365,7 +463,7 @@ impl Model<'_> {
                     *acc += if self.occupied[a] & bit != 0 { pi.ln() } else { (1.0 - pi).ln() };
                 }
             }
-            *out = log_sum_exp(&per_p);
+            *out = log_sum_exp(&per_p) + self.base[k];
         }
         let z = log_sum_exp(&lp);
         lp.map(|x| x - z)
@@ -373,10 +471,12 @@ impl Model<'_> {
 
     /// One causal pass over `frames` in the order given; `dir` is +1 forward
     /// in time, -1 backward. -> each detection's partner in the pass's next
-    /// frame, or `NONE`.
-    fn pass(&self, frames: &[Frame], order: &[usize], dir: i64) -> Vec<usize> {
+    /// frame, or `NONE`, and each track's posterior where it ends with the
+    /// number of steps behind it.
+    fn pass(&self, frames: &[Frame], order: &[usize], dir: i64) -> (Vec<usize>, Vec<([f64; N_D], usize)>) {
         let n = self.se2.len();
         let mut next = vec![NONE; n];
+        let mut steps = vec![0usize; n];
         let mut w = vec![[0.0f64; N_D]; n];
         let mut matched = vec![false; n];
         let r2 = self.r * self.r;
@@ -392,7 +492,7 @@ impl Model<'_> {
                         let b = cur.rows[k];
                         let dd = d2(self.pos, a, b);
                         if dd < r2 {
-                            let g = self.log_pred(&w[a], a, b, dd) - self.stats.log_lambda - SWITCH_COST;
+                            let g = self.log_pred(&w[a], a, b, dd) - self.log_lambda(a, b) - SWITCH_COST;
                             if g > 0.0 {
                                 edges.push((k, g));
                             }
@@ -409,6 +509,7 @@ impl Model<'_> {
                     if let Some(k) = m {
                         let b = cur.rows[k];
                         next[a] = b;
+                        steps[b] = steps[a] + 1;
                         w[b] = self.update(&w[a], a, b, d2(self.pos, a, b));
                         matched[b] = true;
                     }
@@ -421,8 +522,28 @@ impl Model<'_> {
             }
             prev = Some(cur);
         }
-        next
+        let ends = (0..n).filter(|&a| next[a] == NONE && steps[a] > 0).map(|a| (w[a], steps[a])).collect();
+        (next, ends)
     }
+}
+
+/// The movie's population over `D_k` from a pass's track ends: each track's
+/// posterior weighted by its steps, the tracks of one step left out (one
+/// step barely tells `D_k` apart), with `FORGET` of it uniform so no `D_k` is
+/// ruled out. -> log weights.
+fn population(ends: &[([f64; N_D], usize)]) -> [f64; N_D] {
+    let mut acc = [0.0; N_D];
+    for (w, steps) in ends.iter().filter(|e| e.1 >= 2) {
+        let z = log_sum_exp(w);
+        for k in 0..N_D {
+            acc[k] += *steps as f64 * (w[k] - z).exp();
+        }
+    }
+    let total: f64 = acc.iter().sum();
+    if !(total > 0.0) {
+        return [-(N_D as f64).ln(); N_D];
+    }
+    acc.map(|a| ((1.0 - FORGET) * a / total + FORGET / N_D as f64).ln())
 }
 
 /// Links `(y, x)` positions (`pos` is `(N, 2)` row-major) by frame index,
@@ -430,7 +551,22 @@ impl Model<'_> {
 /// Only consecutive frames are linked; `max_step` is the largest step
 /// considered.
 pub fn link(frame: &[i64], pos: &[f64], se: &[f64], max_step: f64) -> Result<Linking, String> {
+    link_with(frame, pos, se, None, max_step)
+}
+
+/// [`link`], with each detection's `strength` (the detector's `detect_z`):
+/// the continuation that prices a track end is then read and applied per
+/// strength class ([`classes`]).
+pub fn link_with(frame: &[i64], pos: &[f64], se: &[f64], strength: Option<&[f64]>, max_step: f64) -> Result<Linking, String> {
     let n = frame.len();
+    if let Some(z) = strength {
+        if z.len() != n {
+            return Err(format!("frame has {n} rows but strengths have {}", z.len()));
+        }
+        if let Some(i) = (0..n).find(|&i| !z[i].is_finite()) {
+            return Err(format!("row {i} has a strength that is not finite"));
+        }
+    }
     if pos.len() != 2 * n {
         return Err(format!("frame has {n} rows but positions have {}", pos.len() / 2));
     }
@@ -468,14 +604,22 @@ pub fn link(frame: &[i64], pos: &[f64], se: &[f64], max_step: f64) -> Result<Lin
     let d_lo = se2_med / 8.0;
     let d_hi = (r * r / 36.0 - se2_med).max(2.0 * d_lo);
     let dk: [f64; N_D] = std::array::from_fn(|k| d_lo * (d_hi / d_lo).powf(k as f64 / (N_D - 1) as f64));
-    let stats = movie_stats(&frames, pos, r, se2_med, n);
+    let (class, k) = strength.map_or((Vec::new(), 0), classes);
+    let stats = movie_stats(&frames, pos, r, se2_med, n, (!class.is_empty()).then_some((&class[..], k)));
     let (seen, occupied) = occupancy(&frames, pos, stats.r0, n);
-    let model = Model { pos, se2, se2_med, dk, r, stats, seen, occupied };
+    let mut model = Model { pos, se2, se2_med, dk, r, stats, seen, occupied, class, base: [-(N_D as f64).ln(); N_D] };
 
     let forward: Vec<usize> = (0..frames.len()).collect();
     let backward: Vec<usize> = forward.iter().rev().copied().collect();
-    let fwd = model.pass(&frames, &forward, 1);
-    let bwd = model.pass(&frames, &backward, -1);
+    if strength.is_some() {
+        // A pilot pass measures the movie's population over `D_k`; new tracks
+        // start from it rather than from every `D_k` alike, so a track's first
+        // steps are priced as the movie's particles move, not as the fastest
+        // the search radius allows.
+        model.base = population(&model.pass(&frames, &forward, 1).1);
+    }
+    let fwd = model.pass(&frames, &forward, 1).0;
+    let bwd = model.pass(&frames, &backward, -1).0;
 
     let mut track = vec![u32::MAX; n];
     let mut n_tracks = 0u32;
@@ -607,7 +751,7 @@ mod tests {
             frames.push(Frame { t, rows, cells });
             start = end;
         }
-        let stats = movie_stats(&frames, pos, r, se * se, n);
+        let stats = movie_stats(&frames, pos, r, se * se, n, None);
         (frames, stats)
     }
 
@@ -661,8 +805,8 @@ mod tests {
         let dk: [f64; N_D] = std::array::from_fn(|k| 0.01 * 2f64.powi(k as i32 * 2));
         let model = Model {
             pos: &[], se2: vec![0.01; 2], se2_med: 0.01, dk, r: 10.0,
-            stats: Stats { r0: 1.0, rho: 0.01, log_lambda: -10.0 },
-            seen: vec![0; 2], occupied: vec![0; 2],
+            stats: Stats { r0: 1.0, rho: 0.01, log_lambda: -10.0, log_unseen: Vec::new(), log_new: Vec::new() },
+            seen: vec![0; 2], occupied: vec![0; 2], class: Vec::new(), base: [-(N_D as f64).ln(); N_D],
         };
         for truth in [0, 3, 6] {
             let mut w = [-(N_D as f64).ln(); N_D];
@@ -747,6 +891,43 @@ mod tests {
         let l = link(&[i64::MAX - 1, i64::MAX, i64::MIN], &[0.0; 6], &[0.1; 6], 1.0).unwrap();
         assert_eq!(l.track[0], l.track[1]);
         assert_ne!(l.track[0], l.track[2]);
+    }
+
+    #[test]
+    fn strength_keeps_bright_particles_linked_among_flickering_detections() {
+        // Bright particles seen 98% of the time, among detections that never
+        // continue (dim flicker): one movie-wide continuation, dragged down by
+        // the flicker, cuts the bright particles' longer steps.
+        let mut rng = Rng(0x5eed_1e55_c0de_d00d);
+        let (n_frames, field) = (30i64, 200.0);
+        let (mut fr, mut pos, mut se, who) = movie(&mut rng, &vec![0.25; 300], n_frames, field, 0.98, 0.1, 0.0);
+        let bright = fr.len();
+        for t in 0..n_frames {
+            for _ in 0..200 {
+                fr.push(t);
+                pos.extend_from_slice(&[rng.uniform() * field, rng.uniform() * field]);
+                se.extend_from_slice(&[0.3, 0.3]);
+            }
+        }
+        let strength: Vec<f64> = (0..fr.len()).map(|i| if i < bright { 20.0 } else { 5.0 + rng.uniform() }).collect();
+        // Consecutive detections of one bright particle, and how many of them a linking joins.
+        let mut at = std::collections::HashMap::new();
+        for i in 0..bright {
+            at.insert((fr[i], who[i][0]), i);
+        }
+        let pairs: Vec<(usize, usize)> = (0..bright).filter_map(|i| at.get(&(fr[i] + 1, who[i][0])).map(|&j| (i, j))).collect();
+        let score = |l: &Linking| {
+            let kept = pairs.iter().filter(|&&(i, j)| l.track[i] == l.track[j]).count() as f64 / pairs.len() as f64;
+            let linked = links(&fr, &l.track);
+            let wrong = linked.iter().filter(|&&(a, b)| a >= bright || b >= bright || who[a][0] != who[b][0]).count() as f64;
+            (kept, wrong / linked.len() as f64)
+        };
+        let (one_q, one_wrong) = score(&link(&fr, &pos, &se, 6.0).unwrap());
+        let (by_z, z_wrong) = score(&link_with(&fr, &pos, &se, Some(&strength), 6.0).unwrap());
+        // Seed as written: 0.97 kept and 1.4% wrong with strengths, 0.68 and 6.9% without.
+        assert!(by_z > 0.95, "with strengths, {by_z} of the bright particles' links kept");
+        assert!(by_z > one_q + 0.1, "with strengths {by_z}, one continuation {one_q}");
+        assert!(z_wrong < one_wrong, "wrong links: with strengths {z_wrong}, one continuation {one_wrong}");
     }
 
     #[test]

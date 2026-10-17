@@ -47,6 +47,39 @@ corrupts both tracks; a missed one only breaks a track. `c = 2.5` prices a
 switch at `e^2.5`, about 12 missed links. Most switches are orphans: a track
 whose own particle went unseen in `f + 1` takes a detection nearby.
 
+### Continuation by detection strength
+
+`link(locs, max_step)` uses the table's `detect_z` column when it has one
+(`strength=` names another, `None` turns it off). One continuation `q` for a
+whole movie mixes bright in-focus particles, seen again almost surely, with
+dim detections near the bar, which often are not. Priced at the mixture, a
+bright particle's longer steps cost more than a break, so its tracks are cut
+and its large steps lost: on a movie of beads diffusing in and out of focus
+(simulated to the real movie's continuation of 0.76), one `q` read D 7%
+low; per strength class, 1% low.
+
+With strengths, detections fall into up to six equal-count classes by
+`detect_z`, and for each the linker reads `q_c` (each detection's own
+next-frame neighbours less its own same-frame neighbours, so a bright
+particle's halo or a crowding neighbour cancels) and `rho_c`, its share of
+the density. A link `a -> b` is then priced by
+
+```text
+lambda_ab = (1 - q_a) / q_a * (1 - q_b) rho_b
+```
+
+the odds that `a`'s class goes unseen times the density of new detections of
+`b`'s class. A pilot forward pass also measures the movie's population over
+`D_k` (each track's final posterior, weighted by its steps); new tracks start
+from it, not from every `D_k` alike, and forgetting returns there, so a new
+track's first steps are priced as the movie's particles move, not as the
+fastest the search radius allows. Without strengths the linker is unchanged.
+
+Detections the detector could not fit as one in-focus emitter (`AT_BOUND`,
+`ELONGATED`: haze, defocused blobs) carry `detect_z` too; leave them out of
+linking for diffraction-limited tracking, as a loose price lets them take
+a bright particle's step.
+
 ### Read from the movie, without links
 
 - `g`, the detector's gap: same-frame detections closer than about `g` are
