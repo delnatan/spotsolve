@@ -1,12 +1,17 @@
 # Changelog
 
-## Unreleased
+## 0.6.0 (2026-10-17)
+
+The linker's links change wherever the table has `detect_z`.
 
 - `link` reads the continuation per detection-strength class when the table
   has `detect_z` (`strength=`; `None` for the old behaviour), and starts new
   tracks from the movie's measured population over D. On simulated beads
   diffusing in and out of focus, D's bias goes from -7% to -1% and bright
   particles' tracks are no longer cut at their longer steps.
+- The population is measured in both directions of time, and equal
+  strengths share a class, so row order and reversing the frames still give
+  the same links.
 
 ## 0.5.4 (2026-10-15)
 

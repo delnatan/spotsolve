@@ -172,17 +172,17 @@ struct Stats {
 const N_CLASSES: usize = 6;
 const CLASS_ROWS: usize = 500;
 
-/// Each detection's strength class: equal shares of the detections, by
-/// rank of `strength`. -> (class per row, number of classes).
+/// Each detection's strength class: equal shares of the detections, cut
+/// at the strengths of those ranks, so equal strengths share a class and the
+/// classes do not depend on row order. -> (class per row, number of classes).
 fn classes(strength: &[f64]) -> (Vec<usize>, usize) {
     let n = strength.len();
     let k = (n / CLASS_ROWS).clamp(1, N_CLASSES);
-    let mut order: Vec<usize> = (0..n).collect();
-    order.sort_by(|&a, &b| strength[a].total_cmp(&strength[b]));
-    let mut class = vec![0; n];
-    for (rank, &i) in order.iter().enumerate() {
-        class[i] = rank * k / n.max(1);
-    }
+    let mut sorted = strength.to_vec();
+    sorted.sort_by(f64::total_cmp);
+    // The lowest strength of each class above the first.
+    let cuts: Vec<f64> = (1..k).map(|c| sorted[c * n / k]).collect();
+    let class = strength.iter().map(|z| cuts.partition_point(|cut| cut.total_cmp(z).is_le())).collect();
     (class, k)
 }
 
@@ -435,8 +435,8 @@ impl Model<'_> {
         let s2 = self.se2[a] + self.se2[b];
         let mut t: [f64; N_D] = std::array::from_fn(|k| w[k] + log_step(dd, 2.0 * self.dk[k] + s2));
         let z = log_sum_exp(&t);
-        for (x, b) in t.iter_mut().zip(self.base) {
-            *x = ((1.0 - FORGET) * (*x - z).exp() + FORGET * b.exp()).ln();
+        for (x, base) in t.iter_mut().zip(self.base) {
+            *x = ((1.0 - FORGET) * (*x - z).exp() + FORGET * base.exp()).ln();
         }
         t
     }
@@ -612,11 +612,14 @@ pub fn link_with(frame: &[i64], pos: &[f64], se: &[f64], strength: Option<&[f64]
     let forward: Vec<usize> = (0..frames.len()).collect();
     let backward: Vec<usize> = forward.iter().rev().copied().collect();
     if strength.is_some() {
-        // A pilot pass measures the movie's population over `D_k`; new tracks
+        // Pilot passes measure the movie's population over `D_k`; new tracks
         // start from it rather than from every `D_k` alike, so a track's first
         // steps are priced as the movie's particles move, not as the fastest
-        // the search radius allows.
-        model.base = population(&model.pass(&frames, &forward, 1).1);
+        // the search radius allows. Both directions, so that reversing the
+        // movie's frames still gives the same links.
+        let mut ends = model.pass(&frames, &forward, 1).1;
+        ends.extend(model.pass(&frames, &backward, -1).1);
+        model.base = population(&ends);
     }
     let fwd = model.pass(&frames, &forward, 1).0;
     let bwd = model.pass(&frames, &backward, -1).0;
@@ -827,9 +830,15 @@ mod tests {
         let (fr, pos, se, _) = movie(&mut rng, &d, 25, 120.0, 0.9, 0.25, 2.5);
         let base = links(&fr, &link(&fr, &pos, &se, 8.0).unwrap().track);
         assert!(!base.is_empty());
+        // With strengths, ties among them included: the classes, the pilot
+        // passes and the links must not depend on row order or time's direction.
+        let z: Vec<f64> = (0..fr.len()).map(|i| (i % 7) as f64).collect();
+        let base_z = links(&fr, &link_with(&fr, &pos, &se, Some(&z), 8.0).unwrap().track);
+        assert!(!base_z.is_empty());
 
         let rev: Vec<i64> = fr.iter().map(|&t| -t).collect();
         assert_eq!(links(&rev, &link(&rev, &pos, &se, 8.0).unwrap().track), base);
+        assert_eq!(links(&rev, &link_with(&rev, &pos, &se, Some(&z), 8.0).unwrap().track), base_z);
 
         let n = fr.len();
         let perm: Vec<usize> = (0..n).map(|i| (i * 7919) % n).collect();
@@ -837,12 +846,15 @@ mod tests {
         let fr2: Vec<i64> = perm.iter().map(|&i| fr[i]).collect();
         let pos2: Vec<f64> = perm.iter().flat_map(|&i| [pos[2 * i], pos[2 * i + 1]]).collect();
         let se2: Vec<f64> = perm.iter().flat_map(|&i| [se[2 * i], se[2 * i + 1]]).collect();
-        let mut back: Vec<(usize, usize)> = links(&fr2, &link(&fr2, &pos2, &se2, 8.0).unwrap().track)
-            .into_iter()
-            .map(|(a, b)| (perm[a].min(perm[b]), perm[a].max(perm[b])))
-            .collect();
-        back.sort_unstable();
-        assert_eq!(back, base);
+        let unperm = |l: Linking| {
+            let mut v: Vec<(usize, usize)> =
+                links(&fr2, &l.track).into_iter().map(|(a, b)| (perm[a].min(perm[b]), perm[a].max(perm[b]))).collect();
+            v.sort_unstable();
+            v
+        };
+        assert_eq!(unperm(link(&fr2, &pos2, &se2, 8.0).unwrap()), base);
+        let z2: Vec<f64> = perm.iter().map(|&i| z[i]).collect();
+        assert_eq!(unperm(link_with(&fr2, &pos2, &se2, Some(&z2), 8.0).unwrap()), base_z);
     }
 
     #[test]
