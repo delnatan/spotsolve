@@ -15,7 +15,8 @@ Positions are (y, x) pixels, amplitudes are flux above the offset, and `se`
 columns are (flux, y, x). See docs/DETECTION.md.
 
 `loctable` converts results to tables; `link` joins their rows into tracks
-frame to frame, by least squared displacement within a search radius.
+frame to frame, by least squared displacement within a search radius
+(`search_radius` reads it from the movie).
 `FitFlag` describes numerical and geometric fit issues.
 """
 
@@ -30,7 +31,7 @@ from .native import (  # noqa: F401
     localize_stack,
 )
 from .results import FitFlag, Localizations  # noqa: F401
-from .tracking import link  # noqa: F401
+from .tracking import link, search_radius  # noqa: F401
 
 __version__ = "0.6.0"
 
@@ -43,6 +44,7 @@ __all__ = [
     "Localizations",
     "FitFlag",
     "link",
+    "search_radius",
     "P_REAL",
     "MAX_MIXTURES",
     "WIDTH",

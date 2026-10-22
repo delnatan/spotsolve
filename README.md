@@ -80,15 +80,15 @@ for t, result in enumerate(movie):
     next_id += len(rows)
 locs = loctable.filter_quality(loctable.concat(parts))
 
-tracks = spotsolve.link(locs, max_step=6.5)    # pixels
+tracks = spotsolve.link(locs)    # search radius read from the movie
 ```
 
 Each track predicts its next step from its own diffusion coefficient,
 inferred from its steps so far, so immobile, slow and fast particles in one
-movie are each linked on their own scale. `max_step` is the one setting: the
-largest step considered, about three times the rms step of the fastest
-particles of interest. The linker reads each detection's `se_y` and `se_x`
-and measures everything else from the movie. A missed detection ends a
+movie are each linked on their own scale. The search radius is read from
+the movie, from pair distances between frames, unless `search_radius=` is
+given. The linker reads each detection's `se_y` and `se_x` and measures
+everything else from the movie. Each link gets `link_p`, its probability. A missed detection ends a
 track. See [tracking](docs/TRACKING.md) for the model.
 
 ## More

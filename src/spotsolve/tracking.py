@@ -2,8 +2,9 @@
 
 Each track predicts its next step from its own diffusion coefficient,
 inferred from its steps so far, so immobile, slow and fast particles in one
-movie are linked on their own scales. No step longer than `max_step` is
-linked; a missed frame ends a track. See docs/TRACKING.md for the model and
+movie are linked on their own scales. No step longer than the search
+radius is linked, and the radius is read from the movie unless given; a
+missed frame ends a track. See docs/TRACKING.md for the model and
 its validation.
 """
 
@@ -16,7 +17,7 @@ except ImportError as error:          # pragma: no cover - build problem
         "spotsolve needs its bundled Rust extension; reinstall a compatible wheel "
         "or run `maturin develop --release` from the repository root") from error
 
-__all__ = ["link", "LINK_COLUMNS"]
+__all__ = ["link", "search_radius", "LINK_COLUMNS"]
 
 LINK_COLUMNS = ("frame", "y", "x", "se_y", "se_x")
 """Columns the linker reads."""
@@ -33,17 +34,52 @@ def _frame_numbers(column):
     return np.ascontiguousarray(frame, dtype=np.int64)
 
 
-def link(locs, max_step, strength="detect_z", link_p=True):
+def _rows(locs):
+    missing = [c for c in LINK_COLUMNS if c not in locs.columns]
+    if missing:
+        raise ValueError(f"the localization table is missing {missing}; "
+                         f"linking needs {list(LINK_COLUMNS)}")
+    frame = _frame_numbers(locs["frame"])
+    pos = np.ascontiguousarray(
+        np.stack([locs["y"].to_numpy(), locs["x"].to_numpy()], axis=1), dtype=float)
+    err = np.ascontiguousarray(
+        np.stack([locs["se_y"].to_numpy(), locs["se_x"].to_numpy()], axis=1), dtype=float)
+    return frame, pos, err
+
+
+def search_radius(locs):
+    """The search radius `link` reads from a localization table when none is
+    given, without linking: next-frame against own-frame pair distances give
+    the fastest diffusion coefficient the movie holds, and the radius is
+    1.5 times three of its rms 2-D steps (docs/TRACKING.md)."""
+    return _rs.track_search_radius(*_rows(locs))
+
+
+def _radius(value, name):
+    if isinstance(value, (bool, np.bool_)):
+        raise ValueError(f"{name} must be positive and finite")
+    try:
+        value = float(value)
+    except (TypeError, ValueError) as error:
+        raise ValueError(f"{name} must be positive and finite") from error
+    if not (np.isfinite(value) and value > 0):
+        raise ValueError(f"{name} must be positive and finite")
+    return value
+
+
+def link(locs, search_radius=None, strength="detect_z", link_p=True, *, max_step=None):
     """Link a localization table into trajectories. -> the table + `track_id`
     (and `link_p`).
 
-    `max_step` is the largest distance, in the table's position units
-    (pixels for `loctable` output), a particle may move between consecutive
-    frames: about three times the rms step of the fastest particles of
-    interest. A larger value costs slow particles little, because each
-    track is held to its own step size. `se_y` and `se_x` are each
-    detection's localization errors in the same units, and `frame` a whole
-    number on every row.
+    `search_radius` is how far, in the table's position units (pixels for
+    `loctable` output), the linker looks for a particle's next detection.
+    It is soft: within it, each track's own step size and the price of a
+    wrong link decide what is linked, and a larger radius changes the links
+    little. `None` (the default) reads it from the movie without links
+    (`search_radius(locs)`); give a value to override, about three times the
+    rms step of the fastest particles of interest or more. `max_step` is its
+    old name. `se_y` and `se_x` are each detection's localization errors in
+    the same units, and `frame` a whole number on every row.
 
     `strength` names a column of each detection's strength, the detector's
     `detect_z` by default. When the table has it, the chance that a
@@ -68,25 +104,18 @@ def link(locs, max_step, strength="detect_z", link_p=True):
     """
     import polars as pl
 
-    missing = [c for c in LINK_COLUMNS if c not in locs.columns]
-    if missing:
-        raise ValueError(f"the localization table is missing {missing}; "
-                         f"linking needs {list(LINK_COLUMNS)}")
-    if isinstance(max_step, (bool, np.bool_)):
-        raise ValueError("max_step must be positive and finite")
-    try:
-        max_step = float(max_step)
-    except (TypeError, ValueError) as error:
-        raise ValueError("max_step must be positive and finite") from error
-    frame = _frame_numbers(locs["frame"])
-    pos = np.ascontiguousarray(
-        np.stack([locs["y"].to_numpy(), locs["x"].to_numpy()], axis=1), dtype=float)
-    err = np.ascontiguousarray(
-        np.stack([locs["se_y"].to_numpy(), locs["se_x"].to_numpy()], axis=1), dtype=float)
+    if max_step is not None:
+        if search_radius is not None:
+            raise ValueError("give search_radius or max_step (its old name), not both")
+        search_radius, name = max_step, "max_step"
+    else:
+        name = "search_radius"
+    frame, pos, err = _rows(locs)
+    radius = None if search_radius is None else _radius(search_radius, name)
     z = None
     if strength is not None and strength in locs.columns:
         z = np.ascontiguousarray(locs[strength].cast(pl.Float64).to_numpy(), dtype=float)
-    ids, p = _rs.track_link(frame, pos, err, max_step, z, link_p=True)
+    ids, p = _rs.track_link(frame, pos, err, radius, z, link_p=True)
     cols = [pl.Series("track_id", ids, dtype=pl.UInt32)]
     if link_p:
         cols.append(pl.Series("link_p", p, dtype=pl.Float64, nan_to_null=True))

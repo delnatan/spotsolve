@@ -216,8 +216,13 @@ def test_missing_columns_and_bad_inputs_are_refused():
         with pytest.raises(ValueError, match="missing"):
             spotsolve.link(locs.drop(column), 13.6)
     for bad in (0.0, -1.0, float("nan"), float("inf"), True, "far"):
-        with pytest.raises(ValueError, match="max_step"):
+        with pytest.raises(ValueError, match="search_radius"):
             spotsolve.link(locs, bad)
+        with pytest.raises(ValueError, match="max_step"):
+            spotsolve.link(locs, max_step=bad)
+    with pytest.raises(ValueError, match="not both"):
+        spotsolve.link(locs, 13.6, max_step=13.6)
+    assert spotsolve.link(locs, max_step=13.6).equals(spotsolve.link(locs, 13.6))
     for column, value, message in (("x", float("nan"), "non-finite"),
                                    ("se_y", 0.0, "localization error")):
         bad = locs.with_columns(
@@ -241,6 +246,26 @@ def test_no_link_is_longer_than_max_step_and_a_missed_frame_ends_a_track():
     step = np.hypot(np.diff(tracks["y"].to_numpy()), np.diff(tracks["x"].to_numpy()))
     assert np.all(step[same] < 13.6)
     assert np.all(np.diff(tracks["frame"].to_numpy().astype(int))[same] == 1)
+
+
+@pytest.mark.parametrize("density,d_fast_um,mix",
+                         [(GEM_LIKE, 2.5, MIXED), (DENSE, 1.0, MIXED), (GEM_LIKE, 2.5, MOBILE)])
+def test_the_radius_read_from_the_movie_links_as_the_rule_does(density, d_fast_um, mix):
+    """Read without links, the radius covers three rms steps of the fastest
+    class without running away, and per class the links are as good as
+    those at that rule's radius: recall no more than 2 points lower,
+    switches no more than 1 per 100 higher."""
+    rule = rstep(d_fast_um * UM2S)
+    for seed in (320, 321):
+        locs, cls, members = movie(seed, density, d_fast_um, mix=mix)
+        r = spotsolve.search_radius(locs)
+        assert 0.9 * rule < r < 3.5 * rule, f"radius {r:.1f} against the rule's {rule:.1f}"
+        auto = score(locs, spotsolve.link(locs)["track_id"].to_numpy(), cls, members)
+        ruled = score(locs, spotsolve.link(locs, rule)["track_id"].to_numpy(), cls, members)
+        for k, share in zip(CLASSES, mix):
+            if share > 0:
+                assert auto[k][0] > ruled[k][0] - 0.02, f"{k} recall {auto[k][0]:.3f} vs {ruled[k][0]:.3f}"
+                assert auto[k][1] - ruled[k][1] < 1.0, f"{k} switches {auto[k][1]:.2f} vs {ruled[k][1]:.2f}"
 
 
 RADII = (1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5, 5.0, 6.0, 7.0, 8.5, 10.0, 12.0, 14.0)
