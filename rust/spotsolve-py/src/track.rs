@@ -33,11 +33,12 @@ fn rows(
 /// Link `(y, x)` positions frame to frame, with `(se_y, se_x)` errors,
 /// within a search `radius` in pixels (`None`: read from the movie, as
 /// `track_search_radius` does), and optionally each row's detection
-/// `strength`, by which the linker reads its continuation per class.
+/// `strength`, by which the linker reads its continuation per class, and
+/// the `switch_cost`, the log odds a link must reach.
 /// Returns a track id per row, in input order, and with `link_p` also the
 /// probability of the link into each row (`NaN` where a track starts).
 #[pyfunction]
-#[pyo3(signature = (frame, positions, errors, radius=None, strength=None, link_p=false))]
+#[pyo3(signature = (frame, positions, errors, radius=None, strength=None, link_p=false, switch_cost=track::SWITCH_COST))]
 fn track_link(
     py: Python<'_>,
     frame: PyReadonlyArray1<'_, i64>,
@@ -46,6 +47,7 @@ fn track_link(
     radius: Option<f64>,
     strength: Option<PyReadonlyArray1<'_, f64>>,
     link_p: bool,
+    switch_cost: f64,
 ) -> PyResult<Py<PyAny>> {
     let (f, p, e) = rows(&frame, &positions, &errors)?;
     let z = strength
@@ -58,7 +60,7 @@ fn track_link(
                 Some(r) => r,
                 None => track::search_radius(&f, &p, &e)?,
             };
-            track::link_with(&f, &p, &e, z.as_deref(), r)
+            track::link_with(&f, &p, &e, z.as_deref(), r, switch_cost)
         })
         .map_err(PyValueError::new_err)?;
     let track = l.track.into_pyarray(py);

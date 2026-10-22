@@ -218,11 +218,9 @@ def test_missing_columns_and_bad_inputs_are_refused():
     for bad in (0.0, -1.0, float("nan"), float("inf"), True, "far"):
         with pytest.raises(ValueError, match="search_radius"):
             spotsolve.link(locs, bad)
-        with pytest.raises(ValueError, match="max_step"):
-            spotsolve.link(locs, max_step=bad)
-    with pytest.raises(ValueError, match="not both"):
-        spotsolve.link(locs, 13.6, max_step=13.6)
-    assert spotsolve.link(locs, max_step=13.6).equals(spotsolve.link(locs, 13.6))
+    for bad in (-0.5, float("nan"), float("inf"), True, "high"):
+        with pytest.raises(ValueError, match="switch_cost"):
+            spotsolve.link(locs, 13.6, switch_cost=bad)
     for column, value, message in (("x", float("nan"), "non-finite"),
                                    ("se_y", 0.0, "localization error")):
         bad = locs.with_columns(
@@ -239,7 +237,7 @@ def test_missing_columns_and_bad_inputs_are_refused():
     assert whole.equals(spotsolve.link(locs, 13.6)["track_id"])
 
 
-def test_no_link_is_longer_than_max_step_and_a_missed_frame_ends_a_track():
+def test_no_link_is_longer_than_the_search_radius_and_a_missed_frame_ends_a_track():
     locs, _, _ = movie(5, GEM_LIKE, 2.5, n_frames=30)
     tracks = spotsolve.link(locs, 13.6).sort("track_id", "frame")
     same = np.diff(tracks["track_id"].to_numpy()) == 0
@@ -277,13 +275,13 @@ def test_no_class_switches_more_than_crocker_grier_at_its_best_radius(density, d
     """Per seed, the linker's switches at its own recall minus the
     reference's least at that recall, for each class present; the mean over
     seeds may not be positive. One movie holds no immobile particles."""
-    max_step = rstep(d_fast_um * UM2S)
+    radius = rstep(d_fast_um * UM2S)
     present = [k for k, share in zip(CLASSES, mix) if share > 0]
     excess = {k: [] for k in present}
     for seed in range(300, 309):
         locs, cls, members = movie(seed, density, d_fast_um, mix=mix)
-        ref = [score(locs, crocker_grier(locs, r), cls, members) for r in RADII if r <= max_step]
-        ours = score(locs, spotsolve.link(locs, max_step)["track_id"].to_numpy(), cls, members)
+        ref = [score(locs, crocker_grier(locs, r), cls, members) for r in RADII if r <= radius]
+        ours = score(locs, spotsolve.link(locs, radius)["track_id"].to_numpy(), cls, members)
         for k in present:
             f = frontier([s[k] for s in ref])
             excess[k].append(ours[k][1] - f(ours[k][0]))
@@ -295,12 +293,12 @@ def test_a_class_links_alike_whatever_shares_its_movie():
     """Slow and fast particles reach the same recall whether or not a third
     of the movie is immobile: what the linker reads from the movie must not
     depend on how far its particles move."""
-    max_step = rstep(2.5 * UM2S)
+    radius = rstep(2.5 * UM2S)
     recall = {mix: {k: [] for k in ("slow", "fast")} for mix in (MIXED, MOBILE)}
     for mix in (MIXED, MOBILE):
         for seed in range(300, 304):
             locs, cls, members = movie(seed, GEM_LIKE, 2.5, mix=mix)
-            ours = score(locs, spotsolve.link(locs, max_step)["track_id"].to_numpy(), cls, members)
+            ours = score(locs, spotsolve.link(locs, radius)["track_id"].to_numpy(), cls, members)
             for k in ("slow", "fast"):
                 recall[mix][k].append(ours[k][0])
     for k in ("slow", "fast"):

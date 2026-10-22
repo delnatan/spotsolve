@@ -67,7 +67,7 @@ def _radius(value, name):
     return value
 
 
-def link(locs, search_radius=None, strength="detect_z", link_p=True, *, max_step=None):
+def link(locs, search_radius=None, strength="detect_z", link_p=True, switch_cost=2.5):
     """Link a localization table into trajectories. -> the table + `track_id`
     (and `link_p`).
 
@@ -77,9 +77,18 @@ def link(locs, search_radius=None, strength="detect_z", link_p=True, *, max_step
     wrong link decide what is linked, and a larger radius changes the links
     little. `None` (the default) reads it from the movie without links
     (`search_radius(locs)`); give a value to override, about three times the
-    rms step of the fastest particles of interest or more. `max_step` is its
-    old name. `se_y` and `se_x` are each detection's localization errors in
-    the same units, and `frame` a whole number on every row.
+    rms step of the fastest particles of interest or more. `se_y` and `se_x`
+    are each detection's localization errors in the same units, and `frame`
+    a whole number on every row.
+
+    `switch_cost` is the log odds a link must reach against breaking the
+    track there: a wrong link, which swaps two particles' identities, is
+    priced at `exp(switch_cost)` missed links. Lower it to keep more links,
+    with more swaps; raise it for fewer swaps and fewer links. The default,
+    2.5, keeps wrong links to a few percent in crowded simulated movies;
+    docs/TRACKING.md shows each value's recall, wrong links and D bias.
+    `link_p` filters links afterwards but cannot add any: only a lower
+    `switch_cost` makes links the default refuses.
 
     `strength` names a column of each detection's strength, the detector's
     `detect_z` by default. When the table has it, the chance that a
@@ -104,18 +113,15 @@ def link(locs, search_radius=None, strength="detect_z", link_p=True, *, max_step
     """
     import polars as pl
 
-    if max_step is not None:
-        if search_radius is not None:
-            raise ValueError("give search_radius or max_step (its old name), not both")
-        search_radius, name = max_step, "max_step"
-    else:
-        name = "search_radius"
     frame, pos, err = _rows(locs)
-    radius = None if search_radius is None else _radius(search_radius, name)
+    radius = None if search_radius is None else _radius(search_radius, "search_radius")
+    if isinstance(switch_cost, (bool, np.bool_)) or not isinstance(switch_cost, (int, float, np.number)) \
+            or not (np.isfinite(switch_cost) and switch_cost >= 0):
+        raise ValueError("switch_cost must be a finite number, not negative")
     z = None
     if strength is not None and strength in locs.columns:
         z = np.ascontiguousarray(locs[strength].cast(pl.Float64).to_numpy(), dtype=float)
-    ids, p = _rs.track_link(frame, pos, err, radius, z, link_p=True)
+    ids, p = _rs.track_link(frame, pos, err, radius, z, link_p=True, switch_cost=float(switch_cost))
     cols = [pl.Series("track_id", ids, dtype=pl.UInt32)]
     if link_p:
         cols.append(pl.Series("link_p", p, dtype=pl.Float64, nan_to_null=True))

@@ -188,8 +188,43 @@ the tests, fast recall was up to 4 points higher.
 
 `search_radius=` overrides it, in the table's units. A value of about three
 times the rms 2-D step of the fastest particles of interest,
-`sqrt(4 D dt + 4 se^2)`, or more, links the same. `max_step=` is its old
-name.
+`sqrt(4 D dt + 4 se^2)`, or more, links the same.
+
+## The price of a wrong link
+
+`switch_cost` (2.5 by default) is the log odds a link must reach against
+breaking the track there. A wrong link, which swaps two particles'
+identities, is priced at `exp(switch_cost)` missed links. This is a choice
+about the analysis, not something the movie can measure. Lower it to keep
+more links, with more swaps; raise it for fewer of both. `link_p` can
+filter links afterwards, but only a lower `switch_cost` makes links the
+default refuses.
+
+What it does on simulated movies (`search_radius` read from the movie; D
+bias of the fastest population, from its one-frame steps):
+
+| Movie | `switch_cost` | Recall | Wrong | Mean length | Fastest D bias |
+|---|---|---|---|---|---|
+| 2-D mixed, fast D 2 px²/frame, ~230/frame | 0 | 0.974 | 4.5% | 6.1 | +20% |
+| | 1 | 0.976 | 3.0% | 6.0 | +2% |
+| | 2.5 | 0.972 | 1.9% | 5.8 | -9% |
+| | 4 | 0.950 | 1.3% | 5.6 | -20% |
+| | 6 | 0.834 | 0.9% | 4.9 | -37% |
+| same, ~860/frame | 0 | 0.918 | 9.2% | 5.7 | -13% |
+| | 1 | 0.917 | 7.5% | 5.5 | -23% |
+| | 2.5 | 0.892 | 5.3% | 5.0 | -41% |
+| | 4 | 0.807 | 3.7% | 4.4 | -62% |
+| | 6 | 0.553 | 1.9% | 3.6 | -90% |
+| 3-D beads in a slab, ~870/frame | 0 | 0.938 | 13.1% | 5.4 | +22% |
+| | 1 | 0.938 | 9.6% | 5.4 | +5% |
+| | 2.5 | 0.917 | 5.7% | 5.3 | -8% |
+| | 4 | 0.844 | 3.6% | 4.9 | -19% |
+| | 6 | 0.568 | 2.0% | 3.4 | -49% |
+
+Wrong links push a D estimate up, and the long steps a cautious linker
+leaves out push it down. In these movies the two cancel near
+`switch_cost` 1, but where they cancel depends on the movie, so do not
+rely on it. Missed frames, not the price, mostly set track length.
 
 ## Validation
 
