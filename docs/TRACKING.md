@@ -1,6 +1,6 @@
 # Linking detections
 
-`spotsolve.link(locs, max_step)` reads a localization table (`frame`, `y`,
+`spotsolve.link(locs)` reads a localization table (`frame`, `y`,
 `x`, `se_y`, `se_x`) and adds `track_id` and `link_p`, preserving row order
 and every other column. Every detection belongs to a track, including
 single-frame ones. `link_p` is the probability that the link into a row,
@@ -8,7 +8,8 @@ from the previous row of its track, joins one particle's detections; it is
 null where a track starts (`link_p=False` leaves the column out).
 
 ```python
-tracks = spotsolve.link(locs, max_step=20.0)   # pixels
+tracks = spotsolve.link(locs)                  # radius read from the movie
+tracks = spotsolve.link(locs, search_radius=20.0)   # or given, in pixels
 ```
 
 ## Model
@@ -33,7 +34,7 @@ With one diffusion coefficient for every particle this is Crocker &
 Grier's least squared displacement (1996). A single scale fails when
 mobilities mix. Under least squares, a fast particle passing a slow one is
 swapped with it whenever the slow one lies inside the circle whose diameter
-is the fast step. A large `max_step` for the fast particles then also lets a
+is the fast step. A large search radius for the fast particles then also lets a
 slow particle whose detection was missed take any detection in reach. With
 a scale per track, an immobile track does not take a fast step and a fast
 one keeps its own.
@@ -51,7 +52,7 @@ whose own particle went unseen in `f + 1` takes a detection nearby.
 
 ### Continuation by detection strength
 
-`link(locs, max_step)` uses the table's `detect_z` column when it has one
+`link(locs)` uses the table's `detect_z` column when it has one
 (`strength=` names another, `None` turns it off). One continuation `q` for a
 whole movie mixes bright in-focus particles, seen again almost surely, with
 dim detections near the bar, which often are not. Priced at the mixture, a
@@ -86,18 +87,18 @@ a bright particle's step.
 
 - `g`, the detector's gap: same-frame detections closer than about `g` are
   reported as one. It is the radius at which the same-frame pair density
-  first reaches half its mean over `[max_step / 2, max_step]`.
+  first reaches half its mean over `[R/2, R]`, `R` the search radius.
 - `r0 = g / 2`. A detection within `r0` in another frame is at the same
   spot, because anything else had to be at least `g - r0` away. `r0` is
   never below three standard deviations of an immobile particle's step, so a
   table without a gap still finds immobile spots, and never above
-  `max_step`.
-- `q`, the detections within `max_step` in the next frame, less that
+  `R`.
+- `q`, the detections within `R` in the next frame, less that
   frame's own count of other detections around a detection, per detection.
   What is left is each detection's own continuation, however far it moved,
   so `q` does not depend on how the movie's particles move. It is averaged
   with the previous frame.
-- `rho`, the same-frame pair density within `max_step`.
+- `rho`, the same-frame pair density within `R`.
 
 ### A new track
 
@@ -149,14 +150,81 @@ Each direction's marginal alone, their mean or their minimum ran 1 to 3
 points overconfident on the first four movies. Use `link_p` to weight or
 filter steps downstream.
 
-## Choosing `max_step`
+## The search radius
 
-`max_step` is the largest step considered: the search radius, and three
-times the rms 2-D step at the top of the `D` grid. Set it to about three
-times the rms step of the fastest particles of interest. For a 2-D Brownian
-step, that rms step is `sqrt(4 D dt + 4 se^2)`. A larger value costs slow
-particles little, because each track is held to its own scale. Nothing else
-is set by hand.
+The search radius `R` is the farthest step considered, and three times the
+rms 2-D step at the top of the `D` grid. It is soft. Within it, each track's
+own step size and the price of a wrong link decide what is linked, so a
+larger `R` changes the links little. Only a radius too small for the fastest
+particles costs links. On simulated mixtures, recall and wrong links move by
+about a point or less between one and three times the rule below, and half
+the rule costs 15-25 points of fast recall.
+
+By default `R` is read from the movie, without links
+(`spotsolve.search_radius(locs)`).
+
+1. **Pair counts.** For each detection, the detections within `r` in the next
+   frame are its own continuation plus everyone else. Those within `r` in its
+   own frame are everyone else. The own-frame count is taken as the
+   background beyond twice the detector's gap, and scaled as `r^2` below it.
+2. **Fit.** The excess over that background is the continuation times the
+   step distribution. It is fitted as a non-negative mixture of 2-D Gaussian
+   steps over a log grid of `D`.
+3. **Window.** Pairs are counted out to four mean nearest-neighbour spacings.
+   The grid stops at the `D` whose three rms steps fill that window: a faster
+   step is lost among the neighbours for any linker.
+4. **Radius.** The fastest `D` that holds at least 3% of the fit sets
+   `R = 1.5 × 6 sqrt(D + se^2)`. That is 1.5 times the radius whose grid tops
+   out at that `D`. The margin covers the pair count reading the fastest `D`
+   up to a quarter low.
+
+Out of sample, on 19 movies (2-D mixtures with fast `D` 1-8 px²/frame and
+single populations from immobile to fast, at 230-860 detections per frame,
+and 3-D beads in a slab at 1x and 3x), the radius read from the movie came
+out at 1.4-3x the rule, and up to 33x for immobile-only movies, where the
+rule's radius is tiny. Its links matched the rule's: recall within 1.5
+points, and wrong links within 0.6 points. On the confined-disc movies of
+the tests, fast recall was up to 4 points higher.
+
+`search_radius=` overrides it, in the table's units. A value of about three
+times the rms 2-D step of the fastest particles of interest,
+`sqrt(4 D dt + 4 se^2)`, or more, links the same.
+
+## The price of a wrong link
+
+`switch_cost` (2.5 by default) is the log odds a link must reach against
+breaking the track there. A wrong link, which swaps two particles'
+identities, is priced at `exp(switch_cost)` missed links. This is a choice
+about the analysis, not something the movie can measure. Lower it to keep
+more links, with more swaps; raise it for fewer of both. `link_p` can
+filter links afterwards, but only a lower `switch_cost` makes links the
+default refuses.
+
+What it does on simulated movies (`search_radius` read from the movie; D
+bias of the fastest population, from its one-frame steps):
+
+| Movie | `switch_cost` | Recall | Wrong | Mean length | Fastest D bias |
+|---|---|---|---|---|---|
+| 2-D mixed, fast D 2 px²/frame, ~230/frame | 0 | 0.974 | 4.5% | 6.1 | +20% |
+| | 1 | 0.976 | 3.0% | 6.0 | +2% |
+| | 2.5 | 0.972 | 1.9% | 5.8 | -9% |
+| | 4 | 0.950 | 1.3% | 5.6 | -20% |
+| | 6 | 0.834 | 0.9% | 4.9 | -37% |
+| same, ~860/frame | 0 | 0.918 | 9.2% | 5.7 | -13% |
+| | 1 | 0.917 | 7.5% | 5.5 | -23% |
+| | 2.5 | 0.892 | 5.3% | 5.0 | -41% |
+| | 4 | 0.807 | 3.7% | 4.4 | -62% |
+| | 6 | 0.553 | 1.9% | 3.6 | -90% |
+| 3-D beads in a slab, ~870/frame | 0 | 0.938 | 13.1% | 5.4 | +22% |
+| | 1 | 0.938 | 9.6% | 5.4 | +5% |
+| | 2.5 | 0.917 | 5.7% | 5.3 | -8% |
+| | 4 | 0.844 | 3.6% | 4.9 | -19% |
+| | 6 | 0.568 | 2.0% | 3.4 | -49% |
+
+Wrong links push a D estimate up, and the long steps a cautious linker
+leaves out push it down. In these movies the two cancel near
+`switch_cost` 1, but where they cancel depends on the movie, so do not
+rely on it. Missed frames, not the price, mostly set track length.
 
 ## Validation
 
@@ -171,6 +239,9 @@ matching. `track.rs` checks these properties:
 - That row order and the direction of time do not change the links.
 - That a fast particle passing an immobile one, which least squares swaps,
   keeps both identities.
+- That the search radius read from the movie covers three rms steps of
+  the fastest particles without running away, and that a table with no
+  or one row still gives one.
 - That link marginals are exact where the candidate links form a tree, that
   every link has a probability and every track start none, that their mean
   matches the share of right links, and that a link's probability is the
@@ -185,7 +256,7 @@ recall the linker reaches, its identity switches do not exceed Crocker &
 Grier's at the radius best for that class, and that slow and fast particles
 reach the same recall with or without the immobile ones.
 
-Nine seeds, `max_step` three times the fast rms step. Each cell gives
+Nine seeds, a search radius of three times the fast rms step. Each cell gives
 recall, switches per 100 links, and the least switches per 100 links
 Crocker & Grier reaches at that recall over all radii:
 

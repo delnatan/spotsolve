@@ -10,6 +10,8 @@
 //!     log p_a(d) - log lambda - SWITCH_COST
 //! ```
 //!
+//! (`SWITCH_COST`, 2.5 by default, is the caller's to set: see below.)
+//!
 //! `p_a` is the step density `a`'s track predicts: 2-D Gaussians of per-axis
 //! variance `2 D_k + se_a^2 + se_b^2` over a log grid of diffusion
 //! coefficients `D_k`, weighted by the track's posterior over `D_k` from its
@@ -105,9 +107,10 @@ const N_D: usize = 8;
 /// that particle's history.
 const FORGET: f64 = 0.05;
 
-/// Log odds a link must reach: a wrong link, which switches two identities,
-/// costs `exp(SWITCH_COST)` times a missed one, which only breaks a track.
-const SWITCH_COST: f64 = 2.5;
+/// The default log odds a link must reach: a wrong link, which switches two
+/// identities, costs `exp(SWITCH_COST)` times a missed one, which only
+/// breaks a track. [`link_with`] takes another.
+pub const SWITCH_COST: f64 = 2.5;
 
 /// Frames on each side of a new track's first detection read for its
 /// occupancy prior.
@@ -479,6 +482,8 @@ struct Model<'a> {
     /// posterior starts, before its occupancy, and where forgetting returns
     /// it. Uniform until a pilot pass measures it ([`population`]).
     base: [f64; N_D],
+    /// Log odds a link must reach ([`SWITCH_COST`] by default).
+    switch_cost: f64,
 }
 
 impl Model<'_> {
@@ -568,8 +573,8 @@ impl Model<'_> {
                             if marginals {
                                 odds.push((i, k, lo));
                             }
-                            if lo - SWITCH_COST > 0.0 {
-                                edges.push((k, lo - SWITCH_COST));
+                            if lo - self.switch_cost > 0.0 {
+                                edges.push((k, lo - self.switch_cost));
                             }
                         }
                     });
@@ -637,18 +642,225 @@ fn population(ends: &[([f64; N_D], usize)]) -> [f64; N_D] {
     acc.map(|a| ((1.0 - FORGET) * a / total + FORGET / N_D as f64).ln())
 }
 
+fn check_rows(frame: &[i64], pos: &[f64], se: &[f64]) -> Result<(), String> {
+    let n = frame.len();
+    if pos.len() != 2 * n {
+        return Err(format!("frame has {n} rows but positions have {}", pos.len() / 2));
+    }
+    if se.len() != 2 * n {
+        return Err(format!("frame has {n} rows but errors have {}", se.len() / 2));
+    }
+    if let Some(i) = (0..2 * n).find(|&i| !pos[i].is_finite()) {
+        return Err(format!("row {} has a non-finite position", i / 2));
+    }
+    if let Some(i) = (0..2 * n).find(|&i| !(se[i].is_finite() && se[i] > 0.0)) {
+        return Err(format!("row {} has a localization error that is not positive and finite", i / 2));
+    }
+    Ok(())
+}
+
+/// The movie's frames in time order, each bucketed into cells of side `side`.
+fn frames_of(frame: &[i64], pos: &[f64], side: f64) -> Vec<Frame> {
+    let n = frame.len();
+    let mut order: Vec<usize> = (0..n).collect();
+    order.sort_by_key(|&i| frame[i]);
+    let mut frames: Vec<Frame> = Vec::new();
+    let mut start = 0;
+    while start < n {
+        let t = frame[order[start]];
+        let end = start + order[start..].partition_point(|&i| frame[i] == t);
+        let rows = order[start..end].to_vec();
+        let cells = Cells::new(&rows, pos, side);
+        frames.push(Frame { t, rows, cells });
+        start = end;
+    }
+    frames
+}
+
+/// Each row's per-axis localization variance.
+fn per_axis_se2(se: &[f64]) -> Vec<f64> {
+    (0..se.len() / 2).map(|i| 0.5 * (se[2 * i].powi(2) + se[2 * i + 1].powi(2))).collect()
+}
+
+/// Radii at which pair counts are read for [`search_radius`].
+const PAIR_RADII: usize = 60;
+/// Diffusion coefficients the pair-count mixture is fitted over.
+const PAIR_D: usize = 24;
+/// Least share of the fitted continuation a coefficient must hold to count
+/// as the movie's fastest.
+const PAIR_TOP: f64 = 0.03;
+/// Margin on the radius the fastest coefficient implies: the pair count
+/// reads the fastest `D` up to about a quarter low, and the links do not
+/// change once the radius is past what the fastest particles need.
+const PAIR_MARGIN: f64 = 1.5;
+
+/// A search radius read from the movie, without links. -> the radius to
+/// pass to [`link_with`].
+///
+/// For each detection, the detections within `r` in the next frame are its
+/// own continuation, `q F(r)`, plus everyone else; those within `r` in its
+/// own frame are everyone else, less what the detector's gap removes at
+/// small `r`. So the own-frame count is the background beyond twice the gap
+/// (`r^2`-scaled below it), and what the next frame holds above it is `q
+/// F(r)`. That excess is fitted as a mixture of 2-D Gaussian steps over a
+/// log grid of `D`, without negative weights. The fastest `D` holding at
+/// least [`PAIR_TOP`] of it gives the radius: [`PAIR_MARGIN`] times six
+/// times `sqrt(D + se^2)`, the radius whose `D` grid tops out at that `D`
+/// (three rms 2-D steps).
+///
+/// Pairs are counted out to four mean nearest-neighbour spacings, and the
+/// grid stops at the `D` whose three rms 2-D steps fill that window: a step
+/// longer than that is lost among the neighbours for any linker, and a
+/// faster component would only fit the background's noise. So the radius
+/// is never above about six neighbour spacings.
+pub fn search_radius(frame: &[i64], pos: &[f64], se: &[f64]) -> Result<f64, String> {
+    check_rows(frame, pos, se)?;
+    let n = frame.len();
+    if n == 0 {
+        return Ok(1.0); // nothing to link: any radius
+    }
+    let se2_med = median(per_axis_se2(se)).max(f64::MIN_POSITIVE);
+    let floor = PAIR_MARGIN * 6.0 * (se2_med / 8.0 + se2_med).sqrt();
+    if n < 2 {
+        return Ok(floor);
+    }
+    let (mut lo, mut hi) = ([f64::INFINITY; 2], [f64::NEG_INFINITY; 2]);
+    for i in 0..n {
+        for a in 0..2 {
+            lo[a] = lo[a].min(pos[2 * i + a]);
+            hi[a] = hi[a].max(pos[2 * i + a]);
+        }
+    }
+    let probe = frames_of(frame, pos, 1.0);
+    let area = ((hi[0] - lo[0]) * (hi[1] - lo[1])).max(f64::MIN_POSITIVE);
+    let per_frame = n as f64 / probe.len() as f64;
+    // Four mean nearest-neighbour spacings, 0.5 / sqrt(density) each.
+    let w = 2.0 / (per_frame / area).sqrt();
+    if !(w.is_finite() && w > 0.0) {
+        return Ok(floor);
+    }
+    let frames = frames_of(frame, pos, w);
+    let bin = w / PAIR_RADII as f64;
+    let (mut next, mut own) = (vec![0.0f64; PAIR_RADII], vec![0.0f64; PAIR_RADII]);
+    let mut counted = 0.0;
+    let add = |hist: &mut [f64], dd: f64| {
+        let i = (dd.sqrt() / bin) as usize;
+        if i < PAIR_RADII {
+            hist[i] += 1.0;
+        }
+    };
+    for (fi, fr) in frames.iter().enumerate() {
+        let Some(nf) = frames.get(fi + 1).filter(|nf| fr.t.checked_add(1) == Some(nf.t)) else {
+            continue;
+        };
+        for &a in &fr.rows {
+            let q = [pos[2 * a], pos[2 * a + 1]];
+            counted += 1.0;
+            nf.cells.near(q, |k| add(&mut next, d2(pos, a, nf.rows[k])));
+            fr.cells.near(q, |k| {
+                if fr.rows[k] != a {
+                    add(&mut own, d2(pos, a, fr.rows[k]));
+                }
+            });
+        }
+    }
+    if counted == 0.0 {
+        return Ok(floor);
+    }
+    // Counts within each bin's outer radius, per detection.
+    let cum = |h: &[f64]| -> Vec<f64> {
+        h.iter().scan(0.0, |acc, &c| {
+            *acc += c / counted;
+            Some(*acc)
+        }).collect()
+    };
+    let (next, own) = (cum(&next), cum(&own));
+    let rs: Vec<f64> = (1..=PAIR_RADII).map(|i| i as f64 * bin).collect();
+    // The detector's gap: where the own-frame pair density first reaches
+    // half its mean over the window's outer half.
+    let dens: Vec<f64> = (0..PAIR_RADII)
+        .map(|i| {
+            let (c0, r0) = if i == 0 { (0.0, 0.0) } else { (own[i - 1], rs[i - 1]) };
+            (own[i] - c0) / (rs[i] * rs[i] - r0 * r0)
+        })
+        .collect();
+    let far = dens[PAIR_RADII / 2..].iter().sum::<f64>() / (PAIR_RADII - PAIR_RADII / 2) as f64;
+    let g = (0..PAIR_RADII).find(|&i| dens[i] > far / 2.0).map_or(0.0, |i| rs[i]);
+    let k0 = rs.partition_point(|&r| r < 2.0 * g).min(PAIR_RADII - 1);
+    let y: Vec<f64> = (0..PAIR_RADII)
+        .map(|i| next[i] - if i < k0 { own[k0] * (rs[i] / rs[k0]).powi(2) } else { own[i] })
+        .collect();
+    let d_lo = se2_med / 8.0;
+    // Three rms 2-D steps of the fastest fill the window: anything faster
+    // would only fit the background's noise.
+    let d_hi = (w * w / 36.0).max(2.0 * d_lo);
+    let dk: Vec<f64> = (0..PAIR_D).map(|k| d_lo * (d_hi / d_lo).powf(k as f64 / (PAIR_D - 1) as f64)).collect();
+    let a: Vec<Vec<f64>> = rs
+        .iter()
+        .map(|&r| dk.iter().map(|&d| 1.0 - (-r * r / (2.0 * (2.0 * d + 2.0 * se2_med))).exp()).collect())
+        .collect();
+    let wts = nnls(&a, &y);
+    let total: f64 = wts.iter().sum();
+    let Some(top) = (0..PAIR_D).rev().find(|&k| total > 0.0 && wts[k] >= PAIR_TOP * total) else {
+        return Ok(floor);
+    };
+    Ok((PAIR_MARGIN * 6.0 * (dk[top] + se2_med).sqrt()).max(floor))
+}
+
+/// Least squares `a w ~ y` with `w >= 0`, by cyclic coordinate descent on
+/// the normal equations (a few columns; converges for any `a`).
+fn nnls(a: &[Vec<f64>], y: &[f64]) -> Vec<f64> {
+    let k = a.first().map_or(0, |r| r.len());
+    let mut g = vec![vec![0.0; k]; k];
+    let mut b = vec![0.0; k];
+    for (row, &yi) in a.iter().zip(y) {
+        for i in 0..k {
+            b[i] += row[i] * yi;
+            for j in 0..k {
+                g[i][j] += row[i] * row[j];
+            }
+        }
+    }
+    let mut w = vec![0.0; k];
+    for _ in 0..20_000 {
+        let mut change = 0.0f64;
+        for i in 0..k {
+            if g[i][i] <= 0.0 {
+                continue;
+            }
+            let grad: f64 = (0..k).map(|j| g[i][j] * w[j]).sum::<f64>() - b[i];
+            let new = (w[i] - grad / g[i][i]).max(0.0);
+            change = change.max((new - w[i]).abs());
+            w[i] = new;
+        }
+        if change < 1e-12 {
+            break;
+        }
+    }
+    w
+}
+
 /// Links `(y, x)` positions (`pos` is `(N, 2)` row-major) by frame index,
 /// with per-detection localization errors `se` (`(N, 2)`, `(se_y, se_x)`).
 /// Only consecutive frames are linked; `max_step` is the largest step
 /// considered.
 pub fn link(frame: &[i64], pos: &[f64], se: &[f64], max_step: f64) -> Result<Linking, String> {
-    link_with(frame, pos, se, None, max_step)
+    link_with(frame, pos, se, None, max_step, SWITCH_COST)
 }
 
 /// [`link`], with each detection's `strength` (the detector's `detect_z`):
 /// the continuation that prices a track end is then read and applied per
-/// strength class ([`classes`]).
-pub fn link_with(frame: &[i64], pos: &[f64], se: &[f64], strength: Option<&[f64]>, max_step: f64) -> Result<Linking, String> {
+/// strength class ([`classes`]); and the `switch_cost`, the log odds a link
+/// must reach ([`SWITCH_COST`] in [`link`]). A lower one makes more links
+/// and longer tracks, with more identity switches; a higher one fewer.
+pub fn link_with(
+    frame: &[i64],
+    pos: &[f64],
+    se: &[f64],
+    strength: Option<&[f64]>,
+    max_step: f64,
+    switch_cost: f64,
+) -> Result<Linking, String> {
     let n = frame.len();
     if let Some(z) = strength {
         if z.len() != n {
@@ -658,39 +870,20 @@ pub fn link_with(frame: &[i64], pos: &[f64], se: &[f64], strength: Option<&[f64]
             return Err(format!("row {i} has a strength that is not finite"));
         }
     }
-    if pos.len() != 2 * n {
-        return Err(format!("frame has {n} rows but positions have {}", pos.len() / 2));
-    }
-    if se.len() != 2 * n {
-        return Err(format!("frame has {n} rows but errors have {}", se.len() / 2));
-    }
+    check_rows(frame, pos, se)?;
     if !(max_step.is_finite() && max_step > 0.0) {
         return Err(format!("max_step must be positive and finite, got {max_step}"));
     }
-    if let Some(i) = (0..2 * n).find(|&i| !pos[i].is_finite()) {
-        return Err(format!("row {} has a non-finite position", i / 2));
-    }
-    if let Some(i) = (0..2 * n).find(|&i| !(se[i].is_finite() && se[i] > 0.0)) {
-        return Err(format!("row {} has a localization error that is not positive and finite", i / 2));
+    if !(switch_cost.is_finite() && switch_cost >= 0.0) {
+        return Err(format!("switch_cost must be finite and not negative, got {switch_cost}"));
     }
     if n == 0 {
         return Ok(Linking { track: Vec::new(), n_tracks: 0, link_p: Vec::new() });
     }
     let r = max_step;
-    let mut order: Vec<usize> = (0..n).collect();
-    order.sort_by_key(|&i| frame[i]);
-    let mut frames: Vec<Frame> = Vec::new();
-    let mut start = 0;
-    while start < n {
-        let t = frame[order[start]];
-        let end = start + order[start..].partition_point(|&i| frame[i] == t);
-        let rows = order[start..end].to_vec();
-        let cells = Cells::new(&rows, pos, r);
-        frames.push(Frame { t, rows, cells });
-        start = end;
-    }
+    let frames = frames_of(frame, pos, r);
 
-    let se2: Vec<f64> = (0..n).map(|i| 0.5 * (se[2 * i].powi(2) + se[2 * i + 1].powi(2))).collect();
+    let se2 = per_axis_se2(se);
     let se2_med = median(se2.clone());
     let d_lo = se2_med / 8.0;
     let d_hi = (r * r / 36.0 - se2_med).max(2.0 * d_lo);
@@ -698,7 +891,7 @@ pub fn link_with(frame: &[i64], pos: &[f64], se: &[f64], strength: Option<&[f64]
     let (class, k) = strength.map_or((Vec::new(), 0), classes);
     let stats = movie_stats(&frames, pos, r, se2_med, n, (!class.is_empty()).then_some((&class[..], k)));
     let (seen, occupied) = occupancy(&frames, pos, stats.r0, n);
-    let mut model = Model { pos, se2, se2_med, dk, r, stats, seen, occupied, class, base: [-(N_D as f64).ln(); N_D] };
+    let mut model = Model { pos, se2, se2_med, dk, r, stats, seen, occupied, class, base: [-(N_D as f64).ln(); N_D], switch_cost };
 
     let forward: Vec<usize> = (0..frames.len()).collect();
     let backward: Vec<usize> = forward.iter().rev().copied().collect();
@@ -918,7 +1111,7 @@ mod tests {
         let d: Vec<f64> = (0..150).map(|i| [0.0, 0.6, 4.0][i % 3]).collect();
         let (fr, pos, se, who) = movie(&mut rng, &d, 30, 110.0, 0.85, 0.25, 2.5);
         let z: Vec<f64> = (0..fr.len()).map(|_| 5.0 + 10.0 * rng.uniform()).collect();
-        let l = link_with(&fr, &pos, &se, Some(&z), 8.0).unwrap();
+        let l = link_with(&fr, &pos, &se, Some(&z), 8.0, SWITCH_COST).unwrap();
         let mut first = std::collections::HashMap::new();
         for i in 0..fr.len() {
             let e = first.entry(l.track[i]).or_insert(i);
@@ -945,13 +1138,42 @@ mod tests {
     }
 
     #[test]
+    fn the_search_radius_read_from_the_movie_covers_the_fastest_particles() {
+        // Immobile, slow and fast (rms 2-D step 4 px); the rule's radius is
+        // three of the fast particles' rms steps.
+        let mut rng = Rng(0x3c6e_f372_fe94_f82b);
+        let d: Vec<f64> = (0..600).map(|i| [0.0, 0.3, 4.0][i % 3]).collect();
+        let (fr, pos, se, _) = movie(&mut rng, &d, 30, 256.0, 0.8, 0.2, 2.0);
+        let rule = 3.0 * (4.0f64 * 4.0 + 4.0 * 0.04).sqrt();
+        let r = search_radius(&fr, &pos, &se).unwrap();
+        assert!(r > rule && r < 3.0 * rule, "radius {r} against the rule's {rule}");
+        // Nothing to read: still a radius the linker takes.
+        assert!(search_radius(&[], &[], &[]).unwrap() > 0.0);
+        assert!(search_radius(&[0], &[1.0, 2.0], &[0.1, 0.1]).unwrap() > 0.0);
+        assert!(search_radius(&[0], &[f64::NAN, 2.0], &[0.1, 0.1]).is_err());
+    }
+
+    #[test]
+    fn a_lower_switch_cost_links_more_and_a_higher_one_less() {
+        let mut rng = Rng(0x94d0_49bb_1331_11eb);
+        let d: Vec<f64> = (0..300).map(|i| [0.0, 0.6, 4.0][i % 3]).collect();
+        let (fr, pos, se, _) = movie(&mut rng, &d, 25, 140.0, 0.8, 0.25, 2.0);
+        let n = |c: f64| links(&fr, &link_with(&fr, &pos, &se, None, 10.0, c).unwrap().track).len();
+        let (low, mid, high) = (n(0.0), n(SWITCH_COST), n(6.0));
+        assert!(low > mid && mid > high, "links at 0, 2.5, 6: {low}, {mid}, {high}");
+        for bad in [-0.1, f64::NAN, f64::INFINITY] {
+            assert!(link_with(&fr, &pos, &se, None, 10.0, bad).is_err());
+        }
+    }
+
+    #[test]
     fn a_track_posterior_settles_on_its_coefficient() {
         let mut rng = Rng(0xdead_beef_cafe_f00d);
         let dk: [f64; N_D] = std::array::from_fn(|k| 0.01 * 2f64.powi(k as i32 * 2));
         let model = Model {
             pos: &[], se2: vec![0.01; 2], se2_med: 0.01, dk, r: 10.0,
             stats: Stats { r0: 1.0, rho: 0.01, log_lambda: -10.0, log_unseen: Vec::new(), log_new: Vec::new() },
-            seen: vec![0; 2], occupied: vec![0; 2], class: Vec::new(), base: [-(N_D as f64).ln(); N_D],
+            seen: vec![0; 2], occupied: vec![0; 2], class: Vec::new(), base: [-(N_D as f64).ln(); N_D], switch_cost: SWITCH_COST,
         };
         for truth in [0, 3, 6] {
             let mut w = [-(N_D as f64).ln(); N_D];
@@ -975,15 +1197,15 @@ mod tests {
         // With strengths, ties among them included: the classes, the pilot
         // passes and the links must not depend on row order or time's direction.
         let z: Vec<f64> = (0..fr.len()).map(|i| (i % 7) as f64).collect();
-        let base_z = links(&fr, &link_with(&fr, &pos, &se, Some(&z), 8.0).unwrap().track);
+        let base_z = links(&fr, &link_with(&fr, &pos, &se, Some(&z), 8.0, SWITCH_COST).unwrap().track);
         assert!(!base_z.is_empty());
 
         let rev: Vec<i64> = fr.iter().map(|&t| -t).collect();
         assert_eq!(links(&rev, &link(&rev, &pos, &se, 8.0).unwrap().track), base);
-        let l_rev = link_with(&rev, &pos, &se, Some(&z), 8.0).unwrap();
+        let l_rev = link_with(&rev, &pos, &se, Some(&z), 8.0, SWITCH_COST).unwrap();
         assert_eq!(links(&rev, &l_rev.track), base_z);
         // Each link's probability, held by its later row, is the same both ways.
-        let p = link_with(&fr, &pos, &se, Some(&z), 8.0).unwrap().link_p;
+        let p = link_with(&fr, &pos, &se, Some(&z), 8.0, SWITCH_COST).unwrap().link_p;
         for &(a, b) in &base_z {
             let (early, late) = if fr[a] < fr[b] { (a, b) } else { (b, a) };
             assert!((p[late] - l_rev.link_p[early]).abs() < 1e-9, "{} vs {}", p[late], l_rev.link_p[early]);
@@ -1003,7 +1225,7 @@ mod tests {
         };
         assert_eq!(unperm(link(&fr2, &pos2, &se2, 8.0).unwrap()), base);
         let z2: Vec<f64> = perm.iter().map(|&i| z[i]).collect();
-        assert_eq!(unperm(link_with(&fr2, &pos2, &se2, Some(&z2), 8.0).unwrap()), base_z);
+        assert_eq!(unperm(link_with(&fr2, &pos2, &se2, Some(&z2), 8.0, SWITCH_COST).unwrap()), base_z);
     }
 
     #[test]
@@ -1084,7 +1306,7 @@ mod tests {
             (kept, wrong / linked.len() as f64)
         };
         let (one_q, one_wrong) = score(&link(&fr, &pos, &se, 6.0).unwrap());
-        let (by_z, z_wrong) = score(&link_with(&fr, &pos, &se, Some(&strength), 6.0).unwrap());
+        let (by_z, z_wrong) = score(&link_with(&fr, &pos, &se, Some(&strength), 6.0, SWITCH_COST).unwrap());
         // Seed as written: 0.97 kept and 1.4% wrong with strengths, 0.68 and 6.9% without.
         assert!(by_z > 0.95, "with strengths, {by_z} of the bright particles' links kept");
         assert!(by_z > one_q + 0.1, "with strengths {by_z}, one continuation {one_q}");

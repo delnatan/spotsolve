@@ -2,7 +2,23 @@
 
 ## Unreleased
 
-Links are unchanged; one column is added.
+Linking no longer needs a radius. Links are unchanged where one is given, and
+one column is added.
+
+- `link(locs)` reads its search radius from the movie when none is given,
+  without links. Detections' next-frame pair distances, less their own-frame
+  ones, are fit as a mixture of diffusion coefficients, and the fastest sets
+  the radius, with a 1.5x margin. `search_radius=` overrides it;
+  `max_step=` is gone. `spotsolve.search_radius(locs)`
+  returns it. On 19 simulated movies, the links at the radius read this way
+  matched those at three rms steps of the fastest particles: recall within
+  1.5 points and wrong links within 0.6.
+  `spotsolve_rs.track_link`'s fourth argument is now `radius` and may be
+  `None`.
+- `link(..., switch_cost=SWITCH_COST)`: the log odds a link must reach,
+  until now fixed (`SWITCH_COST`, 2.5, is exported). Lower it for more links
+  and more identity swaps; docs/TRACKING.md tabulates its effect on simulated
+  movies.
 
 - `link` adds `link_p`, the probability that the link into each row joins
   one particle's detections (null where a track starts). It comes from
