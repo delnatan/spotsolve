@@ -1,9 +1,11 @@
 # Linking detections
 
 `spotsolve.link(locs, max_step)` reads a localization table (`frame`, `y`,
-`x`, `se_y`, `se_x`) and adds `track_id`, preserving row order and every
-other column. Every detection belongs to a track, including single-frame
-ones.
+`x`, `se_y`, `se_x`) and adds `track_id` and `link_p`, preserving row order
+and every other column. Every detection belongs to a track, including
+single-frame ones. `link_p` is the probability that the link into a row,
+from the previous row of its track, joins one particle's detections; it is
+null where a track starts (`link_p=False` leaves the column out).
 
 ```python
 tracks = spotsolve.link(locs, max_step=20.0)   # pixels
@@ -119,6 +121,34 @@ closing: a 2-D track that vanishes and reappears cannot be guaranteed to be
 the same particle. Diffusion, localization error and motion blur are
 measurements to make on the tracks afterwards.
 
+### How sure each link is
+
+Within a frame pair, each pass knows every candidate link's odds against
+"`a` went unseen and `b` is new": `p_a(d) / lambda_ab`, the gain before
+`SWITCH_COST`. Loopy belief propagation over the frame pair's one-to-one
+matchings (Williams & Lau 2014, *IEEE TAES* 50:2942) turns these odds into
+each link's marginal probability, summed over every way the pair's other
+detections could be matched. Both passes give a marginal for each kept link:
+one from the track's past, one from its future. `link_p` is their product,
+because a link must survive both passes to be kept. The two are not
+independent, so the product leans conservative. `link_p` annotates the
+links; it never changes which are made.
+
+Calibration on simulated movies with known identities, where links are
+right when their two detections share a particle:
+
+| Movie | Links | Mean `link_p` | Share right | Right at `link_p` < 0.5 | 0.95–0.99 | ≥ 0.999 |
+|---|---|---|---|---|---|---|
+| 2-D mixed mobility, ~460 /frame | 18,954 | 0.964 | 0.967 | 0.69 | 0.95 | 0.998 |
+| 2-D mixed mobility, ~720 /frame | 29,205 | 0.946 | 0.953 | 0.69 | 0.95 | 0.998 |
+| 3-D beads in a slab, 267 /frame | 8,968 | 0.972 | 0.964 | 0.65 | 0.94 | 0.997 |
+| same, 3× density | 27,599 | 0.917 | 0.918 | 0.61 | 0.93 | 0.997 |
+| confined discs, 0.030 /px² (tests) | 86,028 | 0.909 | 0.945 | 0.68 | 0.97 | – |
+
+Each direction's marginal alone, their mean or their minimum ran 1 to 3
+points overconfident on the first four movies. Use `link_p` to weight or
+filter steps downstream.
+
 ## Choosing `max_step`
 
 `max_step` is the largest step considered: the search radius, and three
@@ -141,6 +171,10 @@ matching. `track.rs` checks these properties:
 - That row order and the direction of time do not change the links.
 - That a fast particle passing an immobile one, which least squares swaps,
   keeps both identities.
+- That link marginals are exact where the candidate links form a tree, that
+  every link has a probability and every track start none, that their mean
+  matches the share of right links, and that a link's probability is the
+  same with the movie reversed.
 
 `tests/test_tracking.py` simulates particles confined to discs: 30% immobile,
 50% at 0.3 um²/s and 20% fast, or no immobile ones and 70% / 30%. The units are 104 nm per pixel and 22 ms per

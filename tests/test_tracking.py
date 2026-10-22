@@ -160,15 +160,41 @@ def frontier(points):
     return f
 
 
-def test_link_returns_the_table_plus_one_column():
+def test_link_returns_the_table_plus_track_id_and_link_p():
     locs, _, _ = movie(1, GEM_LIKE, 2.5, n_frames=15)
     tracks = spotsolve.link(locs, 13.6)
-    assert tracks.columns == locs.columns + ["track_id"]
+    assert tracks.columns == locs.columns + ["track_id", "link_p"]
     assert tracks["track_id"].dtype == pl.UInt32
-    assert tracks.drop("track_id").equals(locs)
+    assert tracks["link_p"].dtype == pl.Float64
+    assert tracks.drop("track_id", "link_p").equals(locs)
     relinked = spotsolve.link(tracks, 13.6)
     assert relinked.columns == tracks.columns
     assert relinked.equals(tracks)
+    bare = spotsolve.link(locs, 13.6, link_p=False)
+    assert bare.columns == locs.columns + ["track_id"]
+    assert bare["track_id"].equals(tracks["track_id"])
+
+
+def test_link_p_is_null_where_a_track_starts_and_matches_the_share_right():
+    """Each link's probability sits on its later row; over many links its
+    mean is near the share that join one particle, and never well above it,
+    and the share right rises with it."""
+    p_all, right_all = [], []
+    for seed in range(310, 314):
+        locs, _, members = movie(seed, DENSE, 1.0)
+        t = spotsolve.link(locs, rstep(1.0 * UM2S)).with_row_index("row")
+        t = t.sort("track_id", "frame")
+        tid, p, row = t["track_id"].to_numpy(), t["link_p"].to_numpy(), t["row"].to_numpy()
+        start = np.r_[True, tid[1:] != tid[:-1]]
+        assert np.all(np.isnan(p[start])) and np.all((p[~start] > 0) & (p[~start] <= 1))
+        p_all.append(p[~start])
+        right_all.append([not members[a].isdisjoint(members[b])
+                          for a, b, s in zip(row[:-1], row[1:], start[1:]) if not s])
+    p, right = np.concatenate(p_all), np.concatenate(right_all).astype(float)
+    # Conservative here: 0.909 against 0.945 as written.
+    assert -0.05 < p.mean() - right.mean() < 0.01, f"mean link_p {p.mean():.3f}, right {right.mean():.3f}"
+    share = [right[(p >= lo) & (p < hi)].mean() for lo, hi in ((0, 0.5), (0.5, 0.8), (0.8, 0.95), (0.95, 1.01))]
+    assert np.all(np.diff(share) > 0), f"share right by link_p: {np.round(share, 3)}"
 
 
 def test_row_order_does_not_change_the_linking():

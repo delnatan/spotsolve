@@ -33,8 +33,9 @@ def _frame_numbers(column):
     return np.ascontiguousarray(frame, dtype=np.int64)
 
 
-def link(locs, max_step, strength="detect_z"):
-    """Link a localization table into trajectories. -> the table + `track_id`.
+def link(locs, max_step, strength="detect_z", link_p=True):
+    """Link a localization table into trajectories. -> the table + `track_id`
+    (and `link_p`).
 
     `max_step` is the largest distance, in the table's position units
     (pixels for `loctable` output), a particle may move between consecutive
@@ -53,9 +54,17 @@ def link(locs, max_step, strength="detect_z"):
     detection bar often is not. `None`, or a table without the column, reads
     one continuation for the movie.
 
-    The result is the input with one `UInt32` column added, in the input's
-    row order; a `track_id` column already present is replaced. Every row
-    belongs to a track, including single-frame ones.
+    With `link_p`, each row also gets the probability that the link into
+    it, from the previous row of its track, joins one particle's
+    detections: null where a track starts. It annotates the links and never
+    changes them; filter or weight steps by it downstream. On simulated
+    movies its mean matches the share of links that are right to within a
+    point (docs/TRACKING.md).
+
+    The result is the input with a `UInt32` `track_id` column (and a
+    `Float64` `link_p` column) added, in the input's row order; columns of
+    those names already present are replaced. Every row belongs to a track,
+    including single-frame ones.
     """
     import polars as pl
 
@@ -77,6 +86,8 @@ def link(locs, max_step, strength="detect_z"):
     z = None
     if strength is not None and strength in locs.columns:
         z = np.ascontiguousarray(locs[strength].cast(pl.Float64).to_numpy(), dtype=float)
-    ids = _rs.track_link(frame, pos, err, max_step, z)
-    return locs.drop([c for c in ("track_id",) if c in locs.columns]).with_columns(
-        pl.Series("track_id", ids, dtype=pl.UInt32))
+    ids, p = _rs.track_link(frame, pos, err, max_step, z, link_p=True)
+    cols = [pl.Series("track_id", ids, dtype=pl.UInt32)]
+    if link_p:
+        cols.append(pl.Series("link_p", p, dtype=pl.Float64, nan_to_null=True))
+    return locs.drop([c for c in ("track_id", "link_p") if c in locs.columns]).with_columns(cols)
