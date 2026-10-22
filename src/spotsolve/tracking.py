@@ -17,10 +17,13 @@ except ImportError as error:          # pragma: no cover - build problem
         "spotsolve needs its bundled Rust extension; reinstall a compatible wheel "
         "or run `maturin develop --release` from the repository root") from error
 
-__all__ = ["link", "search_radius", "LINK_COLUMNS"]
+__all__ = ["link", "search_radius", "LINK_COLUMNS", "SWITCH_COST"]
 
 LINK_COLUMNS = ("frame", "y", "x", "se_y", "se_x")
 """Columns the linker reads."""
+
+SWITCH_COST = float(_rs.TRACK_SWITCH_COST)
+"""`link`'s default `switch_cost`."""
 
 
 def _frame_numbers(column):
@@ -67,7 +70,7 @@ def _radius(value, name):
     return value
 
 
-def link(locs, search_radius=None, strength="detect_z", link_p=True, switch_cost=2.5):
+def link(locs, search_radius=None, strength="detect_z", link_p=True, switch_cost=SWITCH_COST):
     """Link a localization table into trajectories. -> the table + `track_id`
     (and `link_p`).
 

@@ -88,5 +88,6 @@ fn track_search_radius(
 pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(track_link, m)?)?;
     m.add_function(wrap_pyfunction!(track_search_radius, m)?)?;
+    m.add("TRACK_SWITCH_COST", track::SWITCH_COST)?;
     Ok(())
 }
