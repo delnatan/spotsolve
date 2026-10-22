@@ -72,6 +72,26 @@
 //! and three times the rms 2-D step at the top of the `D` grid. A frame
 //! without a particle's detection ends its track: there is no gap closing.
 //! Units are the caller's (pixels).
+//!
+//! # How sure each link is
+//!
+//! Each kept link carries `link_p`, the probability that it joins one
+//! particle's detections. Within a frame pair a pass knows each candidate's
+//! odds against "`a` went unseen and `b` is new", `p_a(d) / lambda_ab` (the
+//! gain before `SWITCH_COST`). Loopy belief propagation over the frame pair's
+//! one-to-one matchings (Williams & Lau 2014, *IEEE TAES* 50:2942) turns
+//! those odds into each link's marginal probability, summed over every way
+//! the pair's other detections could be matched. Both passes give one, from
+//! the track's past and from its future, and `link_p` is their product: the
+//! link must survive both, as it must to be kept. The two are not
+//! independent, so the product leans conservative. On simulated movies (2-D
+//! mixed mobilities and 3-D beads in a slab, 3-8% of links wrong) the mean
+//! `link_p` is within a point of the share of links that are right: links at
+//! 0.999 and above are 99.7% right, at 0.95-0.99 93-95%, and below 0.5
+//! 61-69%. On particles confined to discs (the Python tests) it is 3 points
+//! below the share right. Each direction alone, their mean, or their
+//! minimum ran 1-3 points overconfident on the first movies. `link_p`
+//! annotates the links; it never changes which are made.
 
 use crate::lap;
 
@@ -97,12 +117,20 @@ const WINDOW: i64 = 10;
 /// occupancy prior.
 const N_P: usize = 16;
 
+/// Belief propagation's sweeps per frame pair at most, and the change in
+/// any message below which it stops.
+const BP_ITERS: usize = 200;
+const BP_TOL: f64 = 1e-9;
+
 const NONE: usize = usize::MAX;
 
-/// Track id per detection, in input order, numbered by first appearance.
+/// Track id per detection, in input order, numbered by first appearance,
+/// and the probability of the link into each detection from the one before
+/// it in its track (`NaN` where a track starts).
 pub struct Linking {
     pub track: Vec<u32>,
     pub n_tracks: u32,
+    pub link_p: Vec<f64>,
 }
 
 /// One frame's detections bucketed into square cells of side `side`, sorted
@@ -395,6 +423,46 @@ fn occupancy(frames: &[Frame], pos: &[f64], r0: f64, n: usize) -> (Vec<u32>, Vec
     (seen, occupied)
 }
 
+/// Marginal probability of each edge `(row, column, log odds)` of a partial
+/// one-to-one matching, in which a row or column left unmatched has odds 1,
+/// by loopy belief propagation (Williams & Lau 2014): messages `mu` from rows
+/// to columns and `nu` back, damped by half.
+fn bp_marginals(n_rows: usize, n_cols: usize, edges: &[(usize, usize, f64)]) -> Vec<f64> {
+    // Odds past e^30 are certain; the cap keeps a leave-one-out sum's
+    // cancellation (eps e^30, against the 1 of "unmatched") negligible.
+    let w: Vec<f64> = edges.iter().map(|e| e.2.clamp(-30.0, 30.0).exp()).collect();
+    let mut nu = vec![1.0; edges.len()];
+    let mut mu = vec![0.0; edges.len()];
+    let (mut s, mut t) = (vec![0.0; n_rows], vec![0.0; n_cols]);
+    let row_sums = |nu: &[f64], s: &mut [f64]| {
+        s.fill(1.0);
+        for (e, &(i, _, _)) in edges.iter().enumerate() {
+            s[i] += w[e] * nu[e];
+        }
+    };
+    for _ in 0..BP_ITERS {
+        row_sums(&nu, &mut s);
+        for (e, &(i, _, _)) in edges.iter().enumerate() {
+            mu[e] = w[e] / (s[i] - w[e] * nu[e]).max(1.0);
+        }
+        t.fill(1.0);
+        for (e, &(_, j, _)) in edges.iter().enumerate() {
+            t[j] += mu[e];
+        }
+        let mut change = 0.0f64;
+        for (e, &(_, j, _)) in edges.iter().enumerate() {
+            let new = 1.0 / (t[j] - mu[e]).max(1.0);
+            change = change.max((new - nu[e]).abs());
+            nu[e] = 0.5 * (nu[e] + new);
+        }
+        if change < BP_TOL {
+            break;
+        }
+    }
+    row_sums(&nu, &mut s);
+    edges.iter().enumerate().map(|(e, &(i, _, _))| w[e] * nu[e] / s[i]).collect()
+}
+
 /// The grid and everything a pass needs.
 struct Model<'a> {
     pos: &'a [f64],
@@ -471,11 +539,14 @@ impl Model<'_> {
 
     /// One causal pass over `frames` in the order given; `dir` is +1 forward
     /// in time, -1 backward. -> each detection's partner in the pass's next
-    /// frame, or `NONE`, and each track's posterior where it ends with the
-    /// number of steps behind it.
-    fn pass(&self, frames: &[Frame], order: &[usize], dir: i64) -> (Vec<usize>, Vec<([f64; N_D], usize)>) {
+    /// frame, or `NONE`; each track's posterior where it ends with the
+    /// number of steps behind it; and, if `marginals`, each link's marginal
+    /// probability, at the link's first detection (`NaN` elsewhere).
+    fn pass(&self, frames: &[Frame], order: &[usize], dir: i64, marginals: bool) -> Pass {
         let n = self.se2.len();
         let mut next = vec![NONE; n];
+        let mut prob = vec![f64::NAN; if marginals { n } else { 0 }];
+        let mut odds: Vec<(usize, usize, f64)> = Vec::new();
         let mut steps = vec![0usize; n];
         let mut w = vec![[0.0f64; N_D]; n];
         let mut matched = vec![false; n];
@@ -486,15 +557,19 @@ impl Model<'_> {
             if let Some(pf) = prev.filter(|pf| pf.t.checked_add(dir) == Some(cur.t)) {
                 let (mut row_ptr, mut cols, mut gain) = (vec![0usize], Vec::new(), Vec::new());
                 let mut edges: Vec<(usize, f64)> = Vec::new();
-                for &a in &pf.rows {
+                odds.clear();
+                for (i, &a) in pf.rows.iter().enumerate() {
                     edges.clear();
                     cur.cells.near([self.pos[2 * a], self.pos[2 * a + 1]], |k| {
                         let b = cur.rows[k];
                         let dd = d2(self.pos, a, b);
                         if dd < r2 {
-                            let g = self.log_pred(&w[a], a, b, dd) - self.log_lambda(a, b) - SWITCH_COST;
-                            if g > 0.0 {
-                                edges.push((k, g));
+                            let lo = self.log_pred(&w[a], a, b, dd) - self.log_lambda(a, b);
+                            if marginals {
+                                odds.push((i, k, lo));
+                            }
+                            if lo - SWITCH_COST > 0.0 {
+                                edges.push((k, lo - SWITCH_COST));
                             }
                         }
                     });
@@ -505,7 +580,16 @@ impl Model<'_> {
                     }
                     row_ptr.push(cols.len());
                 }
-                for (&a, m) in pf.rows.iter().zip(lap::max_gain_matching(cur.rows.len(), &row_ptr, &cols, &gain)) {
+                let matching = lap::max_gain_matching(cur.rows.len(), &row_ptr, &cols, &gain);
+                if marginals {
+                    let p = bp_marginals(pf.rows.len(), cur.rows.len(), &odds);
+                    for (&(i, k, _), p) in odds.iter().zip(p) {
+                        if matching[i] == Some(k) {
+                            prob[pf.rows[i]] = p;
+                        }
+                    }
+                }
+                for (&a, m) in pf.rows.iter().zip(matching) {
                     if let Some(k) = m {
                         let b = cur.rows[k];
                         next[a] = b;
@@ -523,8 +607,15 @@ impl Model<'_> {
             prev = Some(cur);
         }
         let ends = (0..n).filter(|&a| next[a] == NONE && steps[a] > 0).map(|a| (w[a], steps[a])).collect();
-        (next, ends)
+        Pass { next, ends, prob }
     }
+}
+
+/// What [`Model::pass`] returns.
+struct Pass {
+    next: Vec<usize>,
+    ends: Vec<([f64; N_D], usize)>,
+    prob: Vec<f64>,
 }
 
 /// The movie's population over `D_k` from a pass's track ends: each track's
@@ -583,7 +674,7 @@ pub fn link_with(frame: &[i64], pos: &[f64], se: &[f64], strength: Option<&[f64]
         return Err(format!("row {} has a localization error that is not positive and finite", i / 2));
     }
     if n == 0 {
-        return Ok(Linking { track: Vec::new(), n_tracks: 0 });
+        return Ok(Linking { track: Vec::new(), n_tracks: 0, link_p: Vec::new() });
     }
     let r = max_step;
     let mut order: Vec<usize> = (0..n).collect();
@@ -617,14 +708,15 @@ pub fn link_with(frame: &[i64], pos: &[f64], se: &[f64], strength: Option<&[f64]
         // steps are priced as the movie's particles move, not as the fastest
         // the search radius allows. Both directions, so that reversing the
         // movie's frames still gives the same links.
-        let mut ends = model.pass(&frames, &forward, 1).1;
-        ends.extend(model.pass(&frames, &backward, -1).1);
+        let mut ends = model.pass(&frames, &forward, 1, false).ends;
+        ends.extend(model.pass(&frames, &backward, -1, false).ends);
         model.base = population(&ends);
     }
-    let fwd = model.pass(&frames, &forward, 1).0;
-    let bwd = model.pass(&frames, &backward, -1).0;
+    let fwd = model.pass(&frames, &forward, 1, true);
+    let bwd = model.pass(&frames, &backward, -1, true);
 
     let mut track = vec![u32::MAX; n];
+    let mut link_p = vec![f64::NAN; n];
     let mut n_tracks = 0u32;
     for fr in &frames {
         for &a in &fr.rows {
@@ -632,13 +724,14 @@ pub fn link_with(frame: &[i64], pos: &[f64], se: &[f64], strength: Option<&[f64]
                 track[a] = n_tracks;
                 n_tracks += 1;
             }
-            let b = fwd[a];
-            if b != NONE && bwd[b] == a {
+            let b = fwd.next[a];
+            if b != NONE && bwd.next[b] == a {
                 track[b] = track[a];
+                link_p[b] = fwd.prob[a] * bwd.prob[b];
             }
         }
     }
-    Ok(Linking { track, n_tracks })
+    Ok(Linking { track, n_tracks, link_p })
 }
 
 #[cfg(test)]
@@ -803,6 +896,55 @@ mod tests {
     }
 
     #[test]
+    fn link_marginals_are_exact_where_the_candidates_form_a_tree() {
+        // a0 - b0, a0 - b1, a1 - b1: a path, on which belief propagation is
+        // exact. The matchings: none, {a0 b0}, {a0 b1}, {a1 b1}, {a0 b0, a1 b1}.
+        let (l00, l01, l11) = (1.3f64, -0.4f64, 2.1f64);
+        let edges = [(0, 0, l00), (0, 1, l01), (1, 1, l11)];
+        let (w00, w01, w11) = (l00.exp(), l01.exp(), l11.exp());
+        let z = 1.0 + w00 + w01 + w11 + w00 * w11;
+        let exact = [(w00 + w00 * w11) / z, w01 / z, (w11 + w00 * w11) / z];
+        for (p, q) in bp_marginals(2, 2, &edges).iter().zip(exact) {
+            assert!((p - q).abs() < 1e-9, "{p} vs {q}");
+        }
+        // Certain odds stay finite and certain.
+        let p = bp_marginals(1, 2, &[(0, 0, 400.0), (0, 1, 0.0)]);
+        assert!(p[0] > 1.0 - 1e-12 && p[1] < 1e-12, "{p:?}");
+    }
+
+    #[test]
+    fn every_link_has_a_probability_and_every_track_start_none() {
+        let mut rng = Rng(0x7a3c_91e2_55d0_b4f8);
+        let d: Vec<f64> = (0..150).map(|i| [0.0, 0.6, 4.0][i % 3]).collect();
+        let (fr, pos, se, who) = movie(&mut rng, &d, 30, 110.0, 0.85, 0.25, 2.5);
+        let z: Vec<f64> = (0..fr.len()).map(|_| 5.0 + 10.0 * rng.uniform()).collect();
+        let l = link_with(&fr, &pos, &se, Some(&z), 8.0).unwrap();
+        let mut first = std::collections::HashMap::new();
+        for i in 0..fr.len() {
+            let e = first.entry(l.track[i]).or_insert(i);
+            if fr[i] < fr[*e] {
+                *e = i;
+            }
+        }
+        let (mut sum, mut right, mut n) = (0.0, 0.0, 0.0);
+        for i in 0..fr.len() {
+            if first[&l.track[i]] == i {
+                assert!(l.link_p[i].is_nan(), "track start {i} has link_p {}", l.link_p[i]);
+            } else {
+                assert!(l.link_p[i] > 0.0 && l.link_p[i] <= 1.0, "row {i}: link_p {}", l.link_p[i]);
+            }
+        }
+        // Calibrated in the mean: the probabilities sum to about the links that are right.
+        for (a, b) in links(&fr, &l.track) {
+            let (a, b) = if fr[a] < fr[b] { (a, b) } else { (b, a) };
+            sum += l.link_p[b];
+            right += who[a].iter().any(|w| who[b].contains(w)) as u8 as f64;
+            n += 1.0;
+        }
+        assert!(((sum - right) / n).abs() < 0.02, "mean link_p {} vs share right {}", sum / n, right / n);
+    }
+
+    #[test]
     fn a_track_posterior_settles_on_its_coefficient() {
         let mut rng = Rng(0xdead_beef_cafe_f00d);
         let dk: [f64; N_D] = std::array::from_fn(|k| 0.01 * 2f64.powi(k as i32 * 2));
@@ -838,7 +980,14 @@ mod tests {
 
         let rev: Vec<i64> = fr.iter().map(|&t| -t).collect();
         assert_eq!(links(&rev, &link(&rev, &pos, &se, 8.0).unwrap().track), base);
-        assert_eq!(links(&rev, &link_with(&rev, &pos, &se, Some(&z), 8.0).unwrap().track), base_z);
+        let l_rev = link_with(&rev, &pos, &se, Some(&z), 8.0).unwrap();
+        assert_eq!(links(&rev, &l_rev.track), base_z);
+        // Each link's probability, held by its later row, is the same both ways.
+        let p = link_with(&fr, &pos, &se, Some(&z), 8.0).unwrap().link_p;
+        for &(a, b) in &base_z {
+            let (early, late) = if fr[a] < fr[b] { (a, b) } else { (b, a) };
+            assert!((p[late] - l_rev.link_p[early]).abs() < 1e-9, "{} vs {}", p[late], l_rev.link_p[early]);
+        }
 
         let n = fr.len();
         let perm: Vec<usize> = (0..n).map(|i| (i * 7919) % n).collect();

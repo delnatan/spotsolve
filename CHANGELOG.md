@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+Links are unchanged; one column is added.
+
+- `link` adds `link_p`, the probability that the link into each row joins
+  one particle's detections (null where a track starts). It comes from
+  belief-propagation marginals over each frame pair's matchings, from both
+  directions of time. On simulated movies its mean is within a few points of
+  the share of links that are right, and errs low. `link_p=False` leaves it
+  out. `spotsolve_rs.track_link(..., link_p=True)` returns `(track,
+  link_p)`.
+
 ## 0.6.0 (2026-10-17)
 
 The linker's links change wherever the table has `detect_z`.
