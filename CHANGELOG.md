@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.7.0 (2026-10-22)
 
 Linking no longer needs a radius. Links are unchanged where one is given, and
 one column is added.
